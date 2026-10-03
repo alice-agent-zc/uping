@@ -1909,6 +1909,7 @@ dependencies = [
  "async-trait",
  "env_logger",
  "log",
+ "openssl",
  "pingora",
  "serde",
  "toml",

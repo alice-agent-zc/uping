@@ -56,6 +56,28 @@ impl SniResolver {
             default_domain,
         })
     }
+
+    /// Pick the certificate key to use for a given SNI hostname.
+    ///
+    /// * exact (case-insensitive) match -> that domain
+    /// * unknown but non-empty SNI -> the default domain (with a warning)
+    /// * empty SNI -> `None`, i.e. no certificate is installed
+    fn resolve_key(&self, sni: &str) -> Option<String> {
+        let sni = sni.to_ascii_lowercase();
+
+        if self.certs.contains_key(&sni) {
+            return Some(sni);
+        }
+        if sni.is_empty() {
+            return None;
+        }
+        if self.certs.contains_key(&self.default_domain) {
+            warn!("no certificate configured for SNI `{sni}`, using default");
+            Some(self.default_domain.clone())
+        } else {
+            None
+        }
+    }
 }
 
 #[async_trait]
@@ -66,19 +88,12 @@ impl TlsAccept for SniResolver {
             .map(|s| s.to_ascii_lowercase())
             .unwrap_or_default();
 
-        let selected = self.certs.get(&sni).or_else(|| {
-            if sni.is_empty() {
-                None
-            } else {
-                warn!("no certificate configured for SNI `{sni}`, using default");
-                self.certs.get(&self.default_domain)
-            }
-        });
-
-        let Some((cert, key)) = selected else {
+        let Some(domain) = self.resolve_key(&sni) else {
             error!("no certificate available for SNI `{sni}`; TLS handshake will fail");
             return;
         };
+
+        let (cert, key) = &self.certs[&domain];
 
         if let Err(e) = ext::ssl_use_certificate(ssl_ref, cert) {
             error!("failed to set certificate for `{sni}`: {e}");
@@ -86,5 +101,125 @@ impl TlsAccept for SniResolver {
         if let Err(e) = ext::ssl_use_private_key(ssl_ref, key) {
             error!("failed to set private key for `{sni}`: {e}");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    /// A self-signed certificate for `test.local`, generated on first use.
+    ///
+    /// The repository ships no certificates (see CONTRIBUTING.md), so the tests
+    /// mint their own and write them to the temp directory.
+    fn pair() -> &'static (String, String) {
+        static PAIR: std::sync::OnceLock<(String, String)> = std::sync::OnceLock::new();
+
+        PAIR.get_or_init(|| {
+            use openssl::asn1::Asn1Time;
+            use openssl::hash::MessageDigest;
+            use openssl::rsa::Rsa;
+
+            let key = pkey::PKey::from_rsa(Rsa::generate(2048).unwrap()).unwrap();
+
+            let mut name = x509::X509NameBuilder::new().unwrap();
+            name.append_entry_by_text("CN", "test.local").unwrap();
+            let name = name.build();
+
+            let mut cert = x509::X509::builder().unwrap();
+            cert.set_version(2).unwrap();
+            cert.set_subject_name(&name).unwrap();
+            cert.set_issuer_name(&name).unwrap();
+            cert.set_pubkey(&key).unwrap();
+            cert.set_not_before(&Asn1Time::days_from_now(0).unwrap()).unwrap();
+            cert.set_not_after(&Asn1Time::days_from_now(365).unwrap()).unwrap();
+            cert.sign(&key, MessageDigest::sha256()).unwrap();
+            let cert = cert.build();
+
+            let dir = std::env::temp_dir().join(format!("uping-tls-{}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            let cert_path = dir.join("test.local.crt");
+            let key_path = dir.join("test.local.key");
+            std::fs::write(&cert_path, cert.to_pem().unwrap()).unwrap();
+            std::fs::write(&key_path, key.private_key_to_pem_pkcs8().unwrap()).unwrap();
+
+            (cert_path.display().to_string(), key_path.display().to_string())
+        })
+    }
+
+    fn test_server(domain: &str) -> Server {
+        let (cert, key) = pair();
+        Server {
+            domain: domain.to_string(),
+            pub_pem: cert.clone(),
+            priv_pem: key.clone(),
+            upstream: "127.0.0.1:8080".to_string(),
+        }
+    }
+
+    fn write_temp(name: &str, contents: &[u8]) -> std::path::PathBuf {
+        let mut path = std::env::temp_dir();
+        path.push(format!("uping-tls-{}-{}", std::process::id(), name));
+        let mut f = std::fs::File::create(&path).unwrap();
+        f.write_all(contents).unwrap();
+        path
+    }
+
+    #[test]
+    fn loads_the_test_certificate() {
+        let resolver = SniResolver::from_servers(&[test_server("test.local")]).unwrap();
+        assert!(resolver.certs.contains_key("test.local"));
+    }
+
+    #[test]
+    fn domain_keys_are_lowercased() {
+        let resolver = SniResolver::from_servers(&[test_server("TEST.Local")]).unwrap();
+        assert!(resolver.certs.contains_key("test.local"));
+        assert_eq!(resolver.default_domain, "test.local");
+    }
+
+    #[test]
+    fn resolve_key_matches_sni_case_insensitively() {
+        let resolver = SniResolver::from_servers(&[test_server("test.local")]).unwrap();
+        assert_eq!(resolver.resolve_key("test.local").as_deref(), Some("test.local"));
+        assert_eq!(resolver.resolve_key("TEST.LOCAL").as_deref(), Some("test.local"));
+    }
+
+    #[test]
+    fn resolve_key_falls_back_to_the_default_domain() {
+        let resolver = SniResolver::from_servers(&[
+            test_server("test.local"),
+            test_server("other.local"),
+        ])
+        .unwrap();
+        assert_eq!(
+            resolver.resolve_key("unknown.local").as_deref(),
+            Some("test.local")
+        );
+    }
+
+    #[test]
+    fn resolve_key_returns_none_for_empty_sni() {
+        let resolver = SniResolver::from_servers(&[test_server("test.local")]).unwrap();
+        assert_eq!(resolver.resolve_key(""), None);
+    }
+
+    #[test]
+    fn missing_cert_file_is_reported() {
+        let mut server = test_server("test.local");
+        server.pub_pem = "does-not-exist.pem".to_string();
+        let err = SniResolver::from_servers(&[server]).err().unwrap().to_string();
+        assert!(err.contains("reading cert"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn malformed_cert_pem_is_reported() {
+        let bad = write_temp("bad.pem", b"not a certificate");
+        let mut server = test_server("test.local");
+        server.pub_pem = bad.display().to_string();
+        let err = SniResolver::from_servers(&[server]).err().unwrap().to_string();
+        assert!(err.contains("parsing cert"), "unexpected error: {err}");
+        let _ = std::fs::remove_file(bad);
     }
 }

@@ -16,9 +16,18 @@ use pingora::listeners::tls::TlsSettings;
 use pingora::proxy::http_proxy_service;
 use pingora::server::Server;
 
-use crate::config::Config;
+use crate::config::{Config, Server as ConfigServer};
 use crate::proxy::{HttpsProxy, RedirectProxy};
 use crate::tls::SniResolver;
+
+/// Build the `domain -> upstream` routing table, lowercasing domains so that
+/// `EXAMPLE.com` and `example.com` hit the same upstream.
+fn build_routes(servers: &[ConfigServer]) -> HashMap<String, String> {
+    servers
+        .iter()
+        .map(|s| (s.domain.to_ascii_lowercase(), s.upstream.clone()))
+        .collect()
+}
 
 fn main() -> Result<()> {
     env_logger::init();
@@ -31,12 +40,7 @@ fn main() -> Result<()> {
         .with_context(|| format!("loading configuration from `{config_path}`"))?;
 
     // domain -> upstream
-    let routes: HashMap<String, String> = cfg
-        .servers
-        .iter()
-        .map(|s| (s.domain.to_ascii_lowercase(), s.upstream.clone()))
-        .collect();
-    let routes = Arc::new(routes);
+    let routes = Arc::new(build_routes(&cfg.servers));
 
     // Pre-load all cert/key pairs for SNI selection.
     let resolver = SniResolver::from_servers(&cfg.servers).context("loading TLS certificates")?;
@@ -70,4 +74,44 @@ fn main() -> Result<()> {
     }
 
     server.run_forever();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn server(domain: &str, upstream: &str) -> ConfigServer {
+        ConfigServer {
+            domain: domain.to_string(),
+            pub_pem: "certs/test.local.crt".to_string(),
+            priv_pem: "certs/test.local.key".to_string(),
+            upstream: upstream.to_string(),
+        }
+    }
+
+    #[test]
+    fn routes_are_keyed_by_lowercased_domain() {
+        let servers = vec![
+            server("Test.Local", "127.0.0.1:8080"),
+            server("API.Example.COM", "127.0.0.1:9000"),
+        ];
+        let routes = build_routes(&servers);
+
+        assert_eq!(routes.len(), 2);
+        assert_eq!(routes.get("test.local").map(String::as_str), Some("127.0.0.1:8080"));
+        assert_eq!(routes.get("api.example.com").map(String::as_str), Some("127.0.0.1:9000"));
+        assert!(!routes.contains_key("Test.Local"));
+    }
+
+    #[test]
+    fn later_entries_win_on_duplicate_domains() {
+        let servers = vec![
+            server("test.local", "127.0.0.1:8080"),
+            server("TEST.LOCAL", "127.0.0.1:9090"),
+        ];
+        let routes = build_routes(&servers);
+
+        assert_eq!(routes.len(), 1);
+        assert_eq!(routes["test.local"], "127.0.0.1:9090");
+    }
 }

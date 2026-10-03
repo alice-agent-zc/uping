@@ -10,21 +10,35 @@ use pingora::proxy::{ProxyHttp, Session};
 use pingora::upstreams::peer::HttpPeer;
 use pingora::Result;
 
-/// Extract the lowercased hostname from a request, preferring the `Host`
-/// header (origin-form requests) and falling back to the request URI
-/// authority (absolute-form / HTTP/2 `:authority`).
-fn request_host(session: &Session) -> Option<String> {
-    if let Some(host) = session.req_header().headers.get("host") {
-        if let Ok(host) = host.to_str() {
-            let host = host.split(':').next().unwrap_or(host);
-            return Some(host.to_ascii_lowercase());
-        }
+/// Lowercase a `host[:port]` value, dropping any port suffix.
+fn normalize_host(raw: &str) -> String {
+    let host = raw.split(':').next().unwrap_or(raw);
+    host.trim().to_ascii_lowercase()
+}
+
+/// Pick the effective hostname: the `Host` header wins, the request URI
+/// authority is the fallback (absolute-form requests / HTTP/2 `:authority`).
+fn select_host(header: Option<&str>, uri_host: Option<&str>) -> Option<String> {
+    match header {
+        Some(raw) => Some(normalize_host(raw)),
+        None => uri_host.map(|h| h.to_ascii_lowercase()),
     }
-    session
+}
+
+/// Extract the lowercased hostname from a request.
+fn request_host(session: &Session) -> Option<String> {
+    let header = session
         .req_header()
-        .uri
-        .host()
-        .map(|h| h.to_ascii_lowercase())
+        .headers
+        .get("host")
+        .and_then(|h| h.to_str().ok());
+    let uri_host = session.req_header().uri.host();
+    select_host(header, uri_host)
+}
+
+/// Build the HTTPS URL a plain-HTTP request is redirected to.
+fn redirect_location(host: &str, path: &str) -> String {
+    format!("https://{host}{path}")
 }
 
 /// Terminates TLS and forwards to the `upstream` of the matching domain.
@@ -89,7 +103,7 @@ impl ProxyHttp for RedirectProxy {
             .path_and_query()
             .map(|p| p.as_str())
             .unwrap_or("/");
-        let location = format!("https://{host}{path}");
+        let location = redirect_location(&host, path);
 
         debug!("redirecting http -> {location}");
 
@@ -100,5 +114,50 @@ impl ProxyHttp for RedirectProxy {
 
         // `true` = early return, the response is already written.
         Ok(true)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn normalize_host_lowercases_and_drops_port() {
+        assert_eq!(normalize_host("Example.COM:8443"), "example.com");
+        assert_eq!(normalize_host("example.com"), "example.com");
+        assert_eq!(normalize_host("  Example.com  "), "example.com");
+    }
+
+    #[test]
+    fn select_host_prefers_the_host_header() {
+        assert_eq!(
+            select_host(Some("WWW.Example.com:80"), Some("ignored.example")),
+            Some("www.example.com".to_string())
+        );
+    }
+
+    #[test]
+    fn select_host_falls_back_to_uri_authority() {
+        assert_eq!(
+            select_host(None, Some("API.Example.com")),
+            Some("api.example.com".to_string())
+        );
+        assert_eq!(select_host(None, None), None);
+    }
+
+    #[test]
+    fn select_host_preserves_empty_header_behaviour() {
+        // An empty Host header is passed through (matching the original code),
+        // rather than silently falling back to the URI authority.
+        assert_eq!(select_host(Some(""), Some("example.com")), Some(String::new()));
+    }
+
+    #[test]
+    fn redirect_location_builds_https_url() {
+        assert_eq!(
+            redirect_location("example.com", "/some/path?x=1"),
+            "https://example.com/some/path?x=1"
+        );
+        assert_eq!(redirect_location("example.com", "/"), "https://example.com/");
     }
 }
