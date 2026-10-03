@@ -1,0 +1,16 @@
+# uping v0.1.0 — example configuration
+#
+# Run:  uping config.toml
+#
+# Plain HTTP requests are automatically redirected (301) to HTTPS.
+
+# Optional. Defaults to 0.0.0.0:80 and 0.0.0.0:443.
+# [listen]
+# http  = "0.0.0.0:80"
+# https = "0.0.0.0:443"
+
+[[server]]
+domain   = "www.example.com"
+pub_pem  = "certs/www.example.com/fullchain.pem"
+priv_pem = "certs/www.example.com/privkey.pem"
+upstream = "127.0.0.1:8080"

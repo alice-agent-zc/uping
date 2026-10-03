@@ -1,0 +1,10 @@
+# Local test config (uses high ports so it runs without root).
+[listen]
+http  = "127.0.0.1:8088"
+https = "127.0.0.1:8443"
+
+[[server]]
+domain   = "test.local"
+pub_pem  = "certs/test.local.crt"
+priv_pem = "certs/test.local.key"
+upstream = "127.0.0.1:8080"
