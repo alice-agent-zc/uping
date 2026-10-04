@@ -1,12 +1,22 @@
 //! uping configuration model.
 //!
-//! The whole config is intentionally tiny for v0.1.0:
+//! The whole config stays small, but v0.1.1 adds two optional sections:
 //!
 //! ```toml
+//! # Optional. Abuse protection. Each limit can be disabled with 0.
+//! [limits]
+//! per_ip_rps         = 300        # sustained requests/sec from one client IP
+//! per_ip_conns_per_sec = 100      # new TCP connections/sec from one client IP
+//! max_body_bytes     = 10485760   # largest accepted request body (0 = unlimited)
+//!
+//! # Optional. TLS behaviour.
+//! [tls]
+//! fallback_cert = true            # serve the first cert when SNI is absent/unknown
+//!
 //! [[server]]
 //! domain   = "www.example.com"
-//! pub_pem  = "certs/www.example.com/fullchain.pem"
-//! priv_pem = "certs/www.example.com/privkey.pem"
+//! pub_key  = "certs/www.example.com/fullchain.pem"
+//! priv_key = "certs/www.example.com/privkey.pem"
 //! upstream = "127.0.0.1:8080"
 //! ```
 
@@ -21,6 +31,14 @@ pub struct Config {
     /// Listening addresses. Defaults to :80 / :443, so most users never set this.
     #[serde(default)]
     pub listen: Listen,
+
+    /// Abuse protection.
+    #[serde(default)]
+    pub limits: Limits,
+
+    /// TLS behaviour.
+    #[serde(default)]
+    pub tls: Tls,
 
     /// One entry per reverse-proxied domain.
     #[serde(rename = "server", default)]
@@ -53,6 +71,81 @@ fn default_https() -> String {
     "0.0.0.0:443".to_string()
 }
 
+/// Abuse protection.
+///
+/// Every limit counts a fixed one-second window per client IP, and every limit
+/// can be turned off by setting it to `0`.
+///
+/// The defaults are deliberately generous: they are sized to let a normal
+/// browser session (a page load pulls dozens of assets at once) and a chatty
+/// API through untouched, while still capping what a single source can do.
+/// A single-IP flood of tens of thousands of requests per second is stopped;
+/// a burst of a few hundred is not.
+#[derive(Debug, Clone, Deserialize)]
+pub struct Limits {
+    /// Sustained HTTP requests per second from one client IP, across all
+    /// domains. Above this the request is answered with `429 Too Many Requests`.
+    #[serde(default = "default_per_ip_rps")]
+    pub per_ip_rps: usize,
+
+    /// New TCP connections per second from one client IP. Above this the
+    /// connection is dropped at the socket level, before any TLS work happens.
+    #[serde(default = "default_per_ip_conns_per_sec")]
+    pub per_ip_conns_per_sec: usize,
+
+    /// Largest request body accepted, in bytes. Larger requests are answered
+    /// with `413 Payload Too Large`. `0` disables the check.
+    #[serde(default = "default_max_body_bytes")]
+    pub max_body_bytes: usize,
+}
+
+impl Default for Limits {
+    fn default() -> Self {
+        Limits {
+            per_ip_rps: default_per_ip_rps(),
+            per_ip_conns_per_sec: default_per_ip_conns_per_sec(),
+            max_body_bytes: default_max_body_bytes(),
+        }
+    }
+}
+
+fn default_per_ip_rps() -> usize {
+    300
+}
+
+fn default_per_ip_conns_per_sec() -> usize {
+    100
+}
+
+fn default_max_body_bytes() -> usize {
+    10 * 1024 * 1024
+}
+
+/// TLS behaviour.
+#[derive(Debug, Clone, Deserialize)]
+pub struct Tls {
+    /// When a client sends no SNI, or an SNI that matches no `[[server]]`, serve
+    /// the first configured certificate instead of failing the handshake.
+    ///
+    /// This is what keeps internet-wide scanners from filling the log with
+    /// `no certificate available for SNI` errors. Set to `false` for strict
+    /// behaviour: an unmatched SNI then fails the handshake outright.
+    #[serde(default = "default_true")]
+    pub fallback_cert: bool,
+}
+
+impl Default for Tls {
+    fn default() -> Self {
+        Tls {
+            fallback_cert: default_true(),
+        }
+    }
+}
+
+fn default_true() -> bool {
+    true
+}
+
 /// A single reverse-proxied domain.
 #[derive(Debug, Clone, Deserialize)]
 pub struct Server {
@@ -61,10 +154,10 @@ pub struct Server {
     pub domain: String,
 
     /// Path to the PEM certificate (leaf first, then any intermediates / fullchain).
-    pub pub_pem: String,
+    pub pub_key: String,
 
     /// Path to the PEM private key.
-    pub priv_pem: String,
+    pub priv_key: String,
 
     /// Where to forward traffic, e.g. `127.0.0.1:8080` or `localhost:3000`.
     pub upstream: String,
@@ -89,6 +182,12 @@ impl Config {
             if s.upstream.trim().is_empty() {
                 anyhow::bail!("`{}` has an empty `upstream`", s.domain);
             }
+            if s.pub_key.trim().is_empty() {
+                anyhow::bail!("`{}` has an empty `pub_key`", s.domain);
+            }
+            if s.priv_key.trim().is_empty() {
+                anyhow::bail!("`{}` has an empty `priv_key`", s.domain);
+            }
         }
         Ok(cfg)
     }
@@ -102,12 +201,14 @@ mod tests {
     const MINIMAL: &str = r#"
 [[server]]
 domain   = "test.local"
-pub_pem  = "certs/test.local.crt"
-priv_pem = "certs/test.local.key"
+pub_key  = "certs/test.local.crt"
+priv_key = "certs/test.local.key"
 upstream = "127.0.0.1:8080"
 "#;
 
     fn write_temp(name: &str, contents: &str) -> std::path::PathBuf {
+        // `std::env::temp_dir()` is fine on a normal machine; tests here only
+        // ever touch a local temp file and remove it again.
         let mut path = std::env::temp_dir();
         path.push(format!("uping-cfg-{}-{}", std::process::id(), name));
         let mut f = std::fs::File::create(&path).unwrap();
@@ -123,6 +224,8 @@ upstream = "127.0.0.1:8080"
         assert_eq!(cfg.servers.len(), 1);
         assert_eq!(cfg.servers[0].domain, "test.local");
         assert_eq!(cfg.servers[0].upstream, "127.0.0.1:8080");
+        assert_eq!(cfg.servers[0].pub_key, "certs/test.local.crt");
+        assert_eq!(cfg.servers[0].priv_key, "certs/test.local.key");
         let _ = std::fs::remove_file(path);
     }
 
@@ -137,10 +240,49 @@ upstream = "127.0.0.1:8080"
     }
 
     #[test]
+    fn limits_default_to_protection_on() {
+        let path = write_temp("limits-default.toml", MINIMAL);
+        let cfg = Config::load(&path).unwrap();
+
+        assert_eq!(cfg.limits.per_ip_rps, 300);
+        assert_eq!(cfg.limits.per_ip_conns_per_sec, 100);
+        assert_eq!(cfg.limits.max_body_bytes, 10 * 1024 * 1024);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn an_explicit_limits_section_wins() {
+        let path = write_temp(
+            "limits.toml",
+            &format!(
+                "[limits]\nper_ip_rps = 0\nper_ip_conns_per_sec = 7\nmax_body_bytes = 4096\n{MINIMAL}"
+            ),
+        );
+        let cfg = Config::load(&path).unwrap();
+
+        assert_eq!(cfg.limits.per_ip_rps, 0);
+        assert_eq!(cfg.limits.per_ip_conns_per_sec, 7);
+        assert_eq!(cfg.limits.max_body_bytes, 4096);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn tls_fallback_is_on_by_default_and_can_be_disabled() {
+        let path = write_temp("tls-default.toml", MINIMAL);
+        assert!(Config::load(&path).unwrap().tls.fallback_cert);
+        let _ = std::fs::remove_file(path);
+
+        let path = write_temp("tls-off.toml", &format!("[tls]\nfallback_cert = false\n{MINIMAL}"));
+        assert!(!Config::load(&path).unwrap().tls.fallback_cert);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
     fn honours_an_explicit_listen_section() {
-        let path = write_temp("listen.toml", &format!(
-            "[listen]\nhttp  = \"127.0.0.1:8088\"\nhttps = \"127.0.0.1:8443\"\n{MINIMAL}"
-        ));
+        let path = write_temp(
+            "listen.toml",
+            &format!("[listen]\nhttp  = \"127.0.0.1:8088\"\nhttps = \"127.0.0.1:8443\"\n{MINIMAL}"),
+        );
         let cfg = Config::load(&path).unwrap();
 
         assert_eq!(cfg.listen.http, "127.0.0.1:8088");
@@ -150,9 +292,12 @@ upstream = "127.0.0.1:8080"
 
     #[test]
     fn accepts_multiple_servers() {
-        let path = write_temp("multi.toml", &format!(
-            "{MINIMAL}\n[[server]]\ndomain = \"other.local\"\npub_pem = \"a.pem\"\npriv_pem = \"a.key\"\nupstream = \"127.0.0.1:9000\"\n"
-        ));
+        let path = write_temp(
+            "multi.toml",
+            &format!(
+                "{MINIMAL}\n[[server]]\ndomain = \"other.local\"\npub_key = \"a.pem\"\npriv_key = \"a.key\"\nupstream = \"127.0.0.1:9000\"\n"
+            ),
+        );
         let cfg = Config::load(&path).unwrap();
 
         assert_eq!(cfg.servers.len(), 2);
@@ -187,6 +332,42 @@ upstream = "127.0.0.1:8080"
         let err = Config::load(&path).unwrap_err().to_string();
 
         assert!(err.contains("empty `upstream`"), "unexpected error: {err}");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn rejects_an_empty_pub_key() {
+        let path = write_temp(
+            "bad-pubkey.toml",
+            &MINIMAL.replace("certs/test.local.crt", "  "),
+        );
+        let err = Config::load(&path).unwrap_err().to_string();
+
+        assert!(err.contains("empty `pub_key`"), "unexpected error: {err}");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn rejects_an_empty_priv_key() {
+        let path = write_temp(
+            "bad-privkey.toml",
+            &MINIMAL.replace("certs/test.local.key", "  "),
+        );
+        let err = Config::load(&path).unwrap_err().to_string();
+
+        assert!(err.contains("empty `priv_key`"), "unexpected error: {err}");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn the_old_pem_keys_are_no_longer_accepted() {
+        let legacy = MINIMAL
+            .replace("pub_key", "pub_pem")
+            .replace("priv_key", "priv_pem");
+        let path = write_temp("legacy.toml", &legacy);
+        let err = Config::load(&path).unwrap_err().to_string();
+
+        assert!(err.contains("parsing TOML"), "unexpected error: {err}");
         let _ = std::fs::remove_file(path);
     }
 

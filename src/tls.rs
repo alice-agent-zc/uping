@@ -5,13 +5,21 @@
 //! We pre-load every configured cert/key pair once at startup and look it up
 //! by the requested SNI hostname.
 //!
+//! The listener starts with **no** certificate installed at all: whatever the
+//! callback leaves behind is the only cert OpenSSL can use. If we install
+//! nothing, the handshake dies with `no suitable signature algorithm` /
+//! `no shared cipher`. That matters in the real world: internet-wide scanners
+//! connect to port 443 by raw IP, and an IP literal is forbidden in SNI
+//! (RFC 6066), so every such probe arrives with an empty SNI. See
+//! [`crate::config::Tls::fallback_cert`] for how we keep that quiet.
+//!
 //! NOTE: dynamic certificate callbacks are only supported on the OpenSSL /
 //! BoringSSL backends. The rustls backend logs a warning and ignores them.
 
 use std::collections::HashMap;
 
 use async_trait::async_trait;
-use log::{error, warn};
+use log::{debug, error};
 use pingora::listeners::TlsAccept;
 use pingora::protocols::tls::TlsRef;
 use pingora::tls::{ext, pkey, ssl, x509};
@@ -27,25 +35,27 @@ pub struct SniResolver {
     certs: HashMap<String, CertKey>,
     /// Certificate used when SNI matches nothing (first configured domain).
     default_domain: String,
+    /// Serve `default_domain` when SNI is absent or unknown.
+    fallback: bool,
 }
 
 impl SniResolver {
     /// Load every cert/key pair from the config up front.
-    pub fn from_servers(servers: &[Server]) -> anyhow::Result<Self> {
+    pub fn from_servers(servers: &[Server], fallback: bool) -> anyhow::Result<Self> {
         let mut certs = HashMap::new();
 
         for s in servers {
-            let cert_pem = std::fs::read(&s.pub_pem).map_err(|e| {
-                anyhow::anyhow!("reading cert `{}` for {}: {e}", s.pub_pem, s.domain)
+            let cert_pem = std::fs::read(&s.pub_key).map_err(|e| {
+                anyhow::anyhow!("reading cert `{}` for {}: {e}", s.pub_key, s.domain)
             })?;
-            let key_pem = std::fs::read(&s.priv_pem).map_err(|e| {
-                anyhow::anyhow!("reading key `{}` for {}: {e}", s.priv_pem, s.domain)
+            let key_pem = std::fs::read(&s.priv_key).map_err(|e| {
+                anyhow::anyhow!("reading key `{}` for {}: {e}", s.priv_key, s.domain)
             })?;
 
             let cert = x509::X509::from_pem(&cert_pem)
-                .map_err(|e| anyhow::anyhow!("parsing cert `{}`: {e}", s.pub_pem))?;
+                .map_err(|e| anyhow::anyhow!("parsing cert `{}`: {e}", s.pub_key))?;
             let key = pkey::PKey::private_key_from_pem(&key_pem)
-                .map_err(|e| anyhow::anyhow!("parsing key `{}`: {e}", s.priv_pem))?;
+                .map_err(|e| anyhow::anyhow!("parsing key `{}`: {e}", s.priv_key))?;
 
             certs.insert(s.domain.to_ascii_lowercase(), (cert, key));
         }
@@ -54,29 +64,27 @@ impl SniResolver {
         Ok(Self {
             certs,
             default_domain,
+            fallback,
         })
     }
 
     /// Pick the certificate key to use for a given SNI hostname.
     ///
     /// * exact (case-insensitive) match -> that domain
-    /// * unknown but non-empty SNI -> the default domain (with a warning)
-    /// * empty SNI -> `None`, i.e. no certificate is installed
+    /// * empty or unknown SNI -> the default domain, when `fallback_cert` is on
+    /// * otherwise -> `None`, i.e. no certificate is installed and the
+    ///   handshake is expected to fail
     fn resolve_key(&self, sni: &str) -> Option<String> {
         let sni = sni.to_ascii_lowercase();
 
         if self.certs.contains_key(&sni) {
             return Some(sni);
         }
-        if sni.is_empty() {
-            return None;
+        if self.fallback && self.certs.contains_key(&self.default_domain) {
+            debug!("no certificate configured for SNI `{sni}`, using default");
+            return Some(self.default_domain.clone());
         }
-        if self.certs.contains_key(&self.default_domain) {
-            warn!("no certificate configured for SNI `{sni}`, using default");
-            Some(self.default_domain.clone())
-        } else {
-            None
-        }
+        None
     }
 }
 
@@ -152,8 +160,8 @@ mod tests {
         let (cert, key) = pair();
         Server {
             domain: domain.to_string(),
-            pub_pem: cert.clone(),
-            priv_pem: key.clone(),
+            pub_key: cert.clone(),
+            priv_key: key.clone(),
             upstream: "127.0.0.1:8080".to_string(),
         }
     }
@@ -168,30 +176,30 @@ mod tests {
 
     #[test]
     fn loads_the_test_certificate() {
-        let resolver = SniResolver::from_servers(&[test_server("test.local")]).unwrap();
+        let resolver = SniResolver::from_servers(&[test_server("test.local")], true).unwrap();
         assert!(resolver.certs.contains_key("test.local"));
     }
 
     #[test]
     fn domain_keys_are_lowercased() {
-        let resolver = SniResolver::from_servers(&[test_server("TEST.Local")]).unwrap();
+        let resolver = SniResolver::from_servers(&[test_server("TEST.Local")], true).unwrap();
         assert!(resolver.certs.contains_key("test.local"));
         assert_eq!(resolver.default_domain, "test.local");
     }
 
     #[test]
     fn resolve_key_matches_sni_case_insensitively() {
-        let resolver = SniResolver::from_servers(&[test_server("test.local")]).unwrap();
+        let resolver = SniResolver::from_servers(&[test_server("test.local")], true).unwrap();
         assert_eq!(resolver.resolve_key("test.local").as_deref(), Some("test.local"));
         assert_eq!(resolver.resolve_key("TEST.LOCAL").as_deref(), Some("test.local"));
     }
 
     #[test]
     fn resolve_key_falls_back_to_the_default_domain() {
-        let resolver = SniResolver::from_servers(&[
-            test_server("test.local"),
-            test_server("other.local"),
-        ])
+        let resolver = SniResolver::from_servers(
+            &[test_server("test.local"), test_server("other.local")],
+            true,
+        )
         .unwrap();
         assert_eq!(
             resolver.resolve_key("unknown.local").as_deref(),
@@ -199,26 +207,65 @@ mod tests {
         );
     }
 
+    /// The v0.1.0 bug: a scanner connecting by raw IP sends no SNI, and we
+    /// failed the handshake loudly. Now we hand it the default certificate.
     #[test]
-    fn resolve_key_returns_none_for_empty_sni() {
-        let resolver = SniResolver::from_servers(&[test_server("test.local")]).unwrap();
+    fn resolve_key_uses_the_default_for_empty_sni_when_fallback_is_on() {
+        let resolver = SniResolver::from_servers(&[test_server("test.local")], true).unwrap();
+        assert_eq!(resolver.resolve_key("").as_deref(), Some("test.local"));
+    }
+
+    #[test]
+    fn resolve_key_returns_none_for_empty_sni_when_fallback_is_off() {
+        let resolver = SniResolver::from_servers(&[test_server("test.local")], false).unwrap();
         assert_eq!(resolver.resolve_key(""), None);
+    }
+
+    #[test]
+    fn resolve_key_returns_none_for_unknown_sni_when_fallback_is_off() {
+        let resolver = SniResolver::from_servers(&[test_server("test.local")], false).unwrap();
+        assert_eq!(resolver.resolve_key("unknown.local"), None);
+    }
+
+    #[test]
+    fn fallback_never_overrides_an_exact_match() {
+        let resolver =
+            SniResolver::from_servers(&[test_server("test.local"), test_server("other.local")], true)
+                .unwrap();
+        assert_eq!(resolver.resolve_key("other.local").as_deref(), Some("other.local"));
     }
 
     #[test]
     fn missing_cert_file_is_reported() {
         let mut server = test_server("test.local");
-        server.pub_pem = "does-not-exist.pem".to_string();
-        let err = SniResolver::from_servers(&[server]).err().unwrap().to_string();
+        server.pub_key = "does-not-exist.pem".to_string();
+        let err = SniResolver::from_servers(&[server], true)
+            .err()
+            .unwrap()
+            .to_string();
         assert!(err.contains("reading cert"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn missing_key_file_is_reported() {
+        let mut server = test_server("test.local");
+        server.priv_key = "does-not-exist.key".to_string();
+        let err = SniResolver::from_servers(&[server], true)
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(err.contains("reading key"), "unexpected error: {err}");
     }
 
     #[test]
     fn malformed_cert_pem_is_reported() {
         let bad = write_temp("bad.pem", b"not a certificate");
         let mut server = test_server("test.local");
-        server.pub_pem = bad.display().to_string();
-        let err = SniResolver::from_servers(&[server]).err().unwrap().to_string();
+        server.pub_key = bad.display().to_string();
+        let err = SniResolver::from_servers(&[server], true)
+            .err()
+            .unwrap()
+            .to_string();
         assert!(err.contains("parsing cert"), "unexpected error: {err}");
         let _ = std::fs::remove_file(bad);
     }

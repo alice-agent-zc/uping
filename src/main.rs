@@ -1,9 +1,10 @@
 //! uping — a tiny TOML-configured reverse proxy on Cloudflare Pingora.
 //!
-//! v0.1.0: read a config, load certs, serve HTTPS (SNI) on :443 and redirect
-//! plain HTTP to HTTPS on :80.
+//! v0.1.1: read a config, load certs, serve HTTPS (SNI) on :443, redirect plain
+//! HTTP to HTTPS on :80, and keep a lid on abusive clients.
 
 mod config;
+mod limits;
 mod proxy;
 mod tls;
 
@@ -12,11 +13,13 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use log::{info, warn};
+use pingora::listeners::ConnectionFilter;
 use pingora::listeners::tls::TlsSettings;
 use pingora::proxy::http_proxy_service;
 use pingora::server::Server;
 
 use crate::config::{Config, Server as ConfigServer};
+use crate::limits::{ConnLimiter, RequestLimiter};
 use crate::proxy::{HttpsProxy, RedirectProxy};
 use crate::tls::SniResolver;
 
@@ -43,13 +46,27 @@ fn main() -> Result<()> {
     let routes = Arc::new(build_routes(&cfg.servers));
 
     // Pre-load all cert/key pairs for SNI selection.
-    let resolver = SniResolver::from_servers(&cfg.servers).context("loading TLS certificates")?;
+    let resolver = SniResolver::from_servers(&cfg.servers, cfg.tls.fallback_cert)
+        .context("loading TLS certificates")?;
 
     let mut server = Server::new(None).context("creating Pingora server")?;
     server.bootstrap();
 
+    // Shared between the :80 and :443 listeners, so one client cannot use two
+    // ports to get two connection budgets.
+    let conn_filter: Arc<dyn ConnectionFilter> =
+        Arc::new(ConnLimiter::new(cfg.limits.per_ip_conns_per_sec));
+
     // --- HTTPS (TLS termination + reverse proxy) ---
-    let mut https_service = http_proxy_service(&server.configuration, HttpsProxy::new(routes));
+    let mut https_service = http_proxy_service(
+        &server.configuration,
+        HttpsProxy::new(
+            routes,
+            RequestLimiter::new(cfg.limits.per_ip_rps),
+            cfg.limits.max_body_bytes,
+        ),
+    );
+    https_service.set_connection_filter(conn_filter.clone());
     let tls_settings =
         TlsSettings::with_callbacks(Box::new(resolver)).context("building TLS settings")?;
     https_service.add_tls_with_settings(&cfg.listen.https, None, tls_settings);
@@ -58,6 +75,7 @@ fn main() -> Result<()> {
 
     // --- HTTP (redirect to HTTPS) ---
     let mut http_service = http_proxy_service(&server.configuration, RedirectProxy);
+    http_service.set_connection_filter(conn_filter);
     http_service.add_tcp(&cfg.listen.http);
     server.add_service(http_service);
     info!(
@@ -67,6 +85,25 @@ fn main() -> Result<()> {
 
     for s in &cfg.servers {
         info!("  {} -> {}", s.domain, s.upstream);
+    }
+
+    if cfg.limits.per_ip_conns_per_sec == 0 {
+        warn!("per-IP connection limiting is disabled (per_ip_conns_per_sec = 0)");
+    } else {
+        info!(
+            "limits: {} conn/s and {} req/s per IP",
+            cfg.limits.per_ip_conns_per_sec, cfg.limits.per_ip_rps
+        );
+    }
+    if cfg.limits.per_ip_rps == 0 {
+        warn!("per-IP request limiting is disabled (per_ip_rps = 0)");
+    }
+    match cfg.limits.max_body_bytes {
+        0 => warn!("request body size limiting is disabled (max_body_bytes = 0)"),
+        n => info!("limits: request bodies capped at {n} bytes"),
+    }
+    if !cfg.tls.fallback_cert {
+        info!("TLS: no fallback certificate; unknown or missing SNI will fail the handshake");
     }
 
     if cfg.listen.http.ends_with(":80") || cfg.listen.https.ends_with(":443") {
@@ -83,8 +120,8 @@ mod tests {
     fn server(domain: &str, upstream: &str) -> ConfigServer {
         ConfigServer {
             domain: domain.to_string(),
-            pub_pem: "certs/test.local.crt".to_string(),
-            priv_pem: "certs/test.local.key".to_string(),
+            pub_key: "certs/test.local.crt".to_string(),
+            priv_key: "certs/test.local.key".to_string(),
             upstream: upstream.to_string(),
         }
     }
