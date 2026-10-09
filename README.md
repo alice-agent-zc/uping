@@ -1,7 +1,7 @@
 # uping
 
-A tiny, TOML-configured reverse proxy for the 90% of cases where nginx is overkill.
-Built on Cloudflare's [Pingora](https://github.com/cloudflare/pingora).
+A tiny, TOML-configured reverse proxy for the 90% of cases where nginx is
+overkill. Built on Cloudflare's [Pingora](https://github.com/cloudflare/pingora).
 
 Point a domain at a local service, hand it a cert, done. Plain HTTP is
 automatically redirected to HTTPS, and clients that misbehave are capped.
@@ -67,6 +67,9 @@ upstream = "127.0.0.1:8080"
 Add one `[[server]]` block per domain. All domains share the single `:443`
 listener; the right certificate is chosen per-connection via SNI.
 
+`config.toml` in the current directory is the built-in default; pass another
+path as the first argument to override it.
+
 ## Abuse protection
 
 Two layers, both counted per client IP over a fixed one-second window, both
@@ -112,39 +115,26 @@ So a backend that needs to know the request arrived over HTTPS can read
 `X-Forwarded-Proto`, and one that builds absolute URLs should honour
 `X-Forwarded-Host`.
 
-## Build & run
+## Running it
+
+uping is distributed as source. It wants a certificate + key per domain, and
+the right to bind `:80` and `:443` (root or `CAP_NET_BIND_SERVICE`):
 
 ```sh
 cargo build --release
 sudo ./target/release/uping config.toml
 ```
 
-Binding `:80`/`:443` needs root or `CAP_NET_BIND_SERVICE`:
-
-```sh
-sudo setcap 'cap_net_bind_service=+ep' ./target/release/uping
-```
-
-Reading Let's Encrypt keys needs root anyway (`privkey.pem` is mode 0600), so
-running uping as root is the expected deployment. Set custom ports under
-`[listen]` to run unprivileged (see `test.config.toml`).
+Building has a few prerequisites that are not part of a default Rust install —
+CMake in particular. **[CONTRIBUTING.md](CONTRIBUTING.md)** covers those, the
+systemd unit, and how to try uping out without root.
 
 ## Notes
 
-- TLS uses the **OpenSSL** backend. (Dynamic per-SNI certificate selection —
-  i.e. multiple domains — is only supported on OpenSSL/BoringSSL in Pingora;
-  the rustls backend ignores it.)
 - Certificates are loaded **once at startup**. Restart to pick up new certs.
 - Upstream connections are plain HTTP. A per-server `upstream_tls` toggle is a
   natural v0.2 addition.
 
-## Project layout
+## License
 
-```
-src/
-  main.rs    # bootstrap, wiring, run
-  config.rs  # TOML schema + validation
-  tls.rs     # SNI certificate resolver
-  limits.rs  # per-IP rate + connection limiters
-  proxy.rs   # HTTPS proxy + HTTP redirect
-```
+Apache-2.0 — see [LICENSE](LICENSE).

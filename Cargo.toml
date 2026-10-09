@@ -4,6 +4,8 @@ version = "0.1.1"
 edition = "2021"
 description = "A tiny TOML-configured reverse proxy with automatic HTTP->HTTPS redirects, built on Cloudflare Pingora."
 license = "Apache-2.0"
+authors = ["tetuaoro <65575727+tetuaoro@users.noreply.github.com>"]
+repository = "https://github.com/raonagos/uping"
 
 [dependencies]
 pingora = { version = "0.9", features = ["proxy", "openssl", "connection_filter"] }
