@@ -17,7 +17,17 @@
 //! domain   = "www.example.com"
 //! pub_key  = "certs/www.example.com/fullchain.pem"
 //! priv_key = "certs/www.example.com/privkey.pem"
-//! upstream = "127.0.0.1:8080"
+//! upstream = "127.0.0.1:8080"          # catch-all
+//!
+//! # Optional. One upstream per path prefix; the longest prefix wins.
+//! [[server.route]]
+//! path     = "/mcp"                    # segment prefix: /mcp, /mcp/…
+//! upstream = "127.0.0.1:8081"
+//!
+//! [[server.route]]
+//! path         = "/assets/"
+//! upstream     = "127.0.0.1:8085"
+//! strip_prefix = true                  # backend sees /app.css, not /assets/app.css
 //! ```
 
 use std::path::Path;
@@ -161,6 +171,38 @@ pub struct Server {
 
     /// Where to forward traffic, e.g. `127.0.0.1:8080` or `localhost:3000`.
     pub upstream: String,
+
+    /// Optional path routes (`[[server.route]]`). The longest matching `path`
+    /// wins; everything else falls through to `upstream`.
+    #[serde(rename = "route", default)]
+    pub routes: Vec<Route>,
+}
+
+/// One path-prefix route belonging to a [`Server`].
+#[derive(Debug, Clone, Deserialize)]
+pub struct Route {
+    /// Path prefix, e.g. `/mcp` or `/assets/`.
+    pub path: String,
+
+    /// Where requests matching `path` are forwarded.
+    pub upstream: String,
+
+    /// Remove `path` from the request path before forwarding it.
+    #[serde(default)]
+    pub strip_prefix: bool,
+}
+
+impl Route {
+    /// The prefix with a trailing `/` removed, so `/assets/` and `/assets`
+    /// match the same requests.
+    pub fn prefix(&self) -> &str {
+        let trimmed = self.path.trim_end_matches('/');
+        if trimmed.is_empty() {
+            "/"
+        } else {
+            trimmed
+        }
+    }
 }
 
 impl Config {
@@ -188,9 +230,40 @@ impl Config {
             if s.priv_key.trim().is_empty() {
                 anyhow::bail!("`{}` has an empty `priv_key`", s.domain);
             }
+            validate_routes(s)?;
         }
         Ok(cfg)
     }
+}
+
+/// Reject route tables that would be ambiguous or unusable at request time.
+fn validate_routes(s: &Server) -> Result<()> {
+    let mut seen = std::collections::HashSet::new();
+
+    for r in &s.routes {
+        let path = r.path.trim();
+        let where_ = format!("`{}` route `{path}`", s.domain);
+
+        if r.upstream.trim().is_empty() {
+            anyhow::bail!("{where_} has an empty `upstream`");
+        }
+        if !path.starts_with('/') {
+            anyhow::bail!("{where_}: `path` must start with `/`");
+        }
+        if path.contains('?') || path.contains('#') {
+            anyhow::bail!("{where_}: `path` is a path prefix, not a URI");
+        }
+        if r.prefix() == "/" {
+            anyhow::bail!(
+                "`{}` route `{path}`: `/` is the catch-all, use the server's `upstream`",
+                s.domain
+            );
+        }
+        if !seen.insert(r.prefix().to_string()) {
+            anyhow::bail!("`{}` has two routes for `{}`", s.domain, r.prefix());
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -272,7 +345,10 @@ upstream = "127.0.0.1:8080"
         assert!(Config::load(&path).unwrap().tls.fallback_cert);
         let _ = std::fs::remove_file(path);
 
-        let path = write_temp("tls-off.toml", &format!("[tls]\nfallback_cert = false\n{MINIMAL}"));
+        let path = write_temp(
+            "tls-off.toml",
+            &format!("[tls]\nfallback_cert = false\n{MINIMAL}"),
+        );
         assert!(!Config::load(&path).unwrap().tls.fallback_cert);
         let _ = std::fs::remove_file(path);
     }
@@ -310,7 +386,10 @@ upstream = "127.0.0.1:8080"
         let path = write_temp("empty.toml", "[listen]\nhttp = \"127.0.0.1:8088\"\n");
         let err = Config::load(&path).unwrap_err().to_string();
 
-        assert!(err.contains("no [[server]] entries"), "unexpected error: {err}");
+        assert!(
+            err.contains("no [[server]] entries"),
+            "unexpected error: {err}"
+        );
         let _ = std::fs::remove_file(path);
     }
 
@@ -371,13 +450,127 @@ upstream = "127.0.0.1:8080"
         let _ = std::fs::remove_file(path);
     }
 
+    const WITH_ROUTES: &str = r#"
+[[server]]
+domain   = "aaa.local"
+pub_key  = "certs/test.local.crt"
+priv_key = "certs/test.local.key"
+upstream = "127.0.0.1:8080"
+
+[[server.route]]
+path     = "/mcp"
+upstream = "127.0.0.1:8081"
+
+[[server.route]]
+path         = "/assets/"
+upstream     = "127.0.0.1:8085"
+strip_prefix = true
+"#;
+
+    #[test]
+    fn parses_path_routes() {
+        let path = write_temp("routes.toml", WITH_ROUTES);
+        let cfg = Config::load(&path).unwrap();
+        let routes = &cfg.servers[0].routes;
+
+        assert_eq!(routes.len(), 2);
+        assert_eq!(routes[0].path, "/mcp");
+        assert_eq!(routes[0].upstream, "127.0.0.1:8081");
+        assert!(!routes[0].strip_prefix);
+        assert_eq!(routes[1].prefix(), "/assets");
+        assert!(routes[1].strip_prefix);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn a_server_without_routes_has_an_empty_list() {
+        let path = write_temp("no-routes.toml", MINIMAL);
+        assert!(Config::load(&path).unwrap().servers[0].routes.is_empty());
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn rejects_a_route_path_without_a_leading_slash() {
+        let path = write_temp(
+            "route-noslash.toml",
+            &format!(
+                "{MINIMAL}\n[[server.route]]\npath = \"mcp\"\nupstream = \"127.0.0.1:8081\"\n"
+            ),
+        );
+        let err = Config::load(&path).unwrap_err().to_string();
+
+        assert!(
+            err.contains("must start with `/`"),
+            "unexpected error: {err}"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn rejects_the_root_path_as_a_route() {
+        let path = write_temp(
+            "route-root.toml",
+            &format!("{MINIMAL}\n[[server.route]]\npath = \"/\"\nupstream = \"127.0.0.1:8081\"\n"),
+        );
+        let err = Config::load(&path).unwrap_err().to_string();
+
+        assert!(err.contains("the catch-all"), "unexpected error: {err}");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn rejects_two_routes_for_the_same_prefix() {
+        let path = write_temp(
+            "route-dup.toml",
+            &format!(
+                "{MINIMAL}\n[[server.route]]\npath = \"/assets\"\nupstream = \"127.0.0.1:8085\"\n                 \n[[server.route]]\npath = \"/assets/\"\nupstream = \"127.0.0.1:8086\"\n"
+            ),
+        );
+        let err = Config::load(&path).unwrap_err().to_string();
+
+        assert!(
+            err.contains("two routes for `/assets`"),
+            "unexpected error: {err}"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn rejects_a_route_with_an_empty_upstream() {
+        let path = write_temp(
+            "route-empty.toml",
+            &format!("{MINIMAL}\n[[server.route]]\npath = \"/mcp\"\nupstream = \"  \"\n"),
+        );
+        let err = Config::load(&path).unwrap_err().to_string();
+
+        assert!(err.contains("empty `upstream`"), "unexpected error: {err}");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn rejects_a_route_path_that_carries_a_query() {
+        let path = write_temp(
+            "route-query.toml",
+            &format!(
+                "{MINIMAL}\n[[server.route]]\npath = \"/mcp?x=1\"\nupstream = \"127.0.0.1:8081\"\n"
+            ),
+        );
+        let err = Config::load(&path).unwrap_err().to_string();
+
+        assert!(err.contains("not a URI"), "unexpected error: {err}");
+        let _ = std::fs::remove_file(path);
+    }
+
     #[test]
     fn reports_a_missing_file() {
         let err = Config::load("/nonexistent/uping.toml")
             .unwrap_err()
             .to_string();
 
-        assert!(err.contains("reading config file"), "unexpected error: {err}");
+        assert!(
+            err.contains("reading config file"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
