@@ -24,4 +24,16 @@
 domain   = "www.example.com"
 pub_key  = "certs/www.example.com/fullchain.pem"
 priv_key = "certs/www.example.com/privkey.pem"
-upstream = "127.0.0.1:8080"
+upstream = "127.0.0.1:8080"          # catch-all: every path without its own route
+
+# Optional. One upstream per path prefix. The longest prefix wins, and a prefix
+# only matches whole segments: /mcp covers /mcp and /mcp/sse, not /mcpx.
+#
+# [[server.route]]
+# path     = "/mcp"
+# upstream = "127.0.0.1:8081"
+#
+# [[server.route]]
+# path         = "/assets/"
+# upstream     = "127.0.0.1:8085"
+# strip_prefix = true                # backend sees /app.css, not /assets/app.css
