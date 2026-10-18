@@ -13,23 +13,29 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use log::{info, warn};
-use pingora::listeners::ConnectionFilter;
 use pingora::listeners::tls::TlsSettings;
+use pingora::listeners::ConnectionFilter;
 use pingora::proxy::http_proxy_service;
 use pingora::server::Server;
 
 use crate::config::{Config, Server as ConfigServer};
 use crate::limits::{ConnLimiter, RequestLimiter};
-use crate::proxy::{HttpsProxy, RedirectProxy};
+use crate::proxy::{HttpsProxy, PathRoute, RedirectProxy, RouteTable, SiteRoutes};
 use crate::tls::SniResolver;
 
-/// Build the `domain -> upstream` routing table, lowercasing domains so that
-/// `EXAMPLE.com` and `example.com` hit the same upstream.
-fn build_routes(servers: &[ConfigServer]) -> HashMap<String, String> {
-    servers
-        .iter()
-        .map(|s| (s.domain.to_ascii_lowercase(), s.upstream.clone()))
-        .collect()
+/// Build the `domain -> routes` table, lowercasing domains so that
+/// `EXAMPLE.com` and `example.com` hit the same upstream. A later `[[server]]`
+/// for a domain replaces an earlier one wholesale, routes included.
+fn build_routes(servers: &[ConfigServer]) -> RouteTable {
+    let mut sites = HashMap::new();
+    for s in servers {
+        let routes = s.routes.iter().map(PathRoute::from_config);
+        sites.insert(
+            s.domain.to_ascii_lowercase(),
+            SiteRoutes::new(s.upstream.clone(), routes),
+        );
+    }
+    RouteTable::new(sites)
 }
 
 fn main() -> Result<()> {
@@ -42,8 +48,13 @@ fn main() -> Result<()> {
     let cfg = Config::load(&config_path)
         .with_context(|| format!("loading configuration from `{config_path}`"))?;
 
-    // domain -> upstream
+    // domain -> upstreams
     let routes = Arc::new(build_routes(&cfg.servers));
+    info!(
+        "{} path route(s) across {} domain(s)",
+        routes.route_count(),
+        cfg.servers.len()
+    );
 
     // Pre-load all cert/key pairs for SNI selection.
     let resolver = SniResolver::from_servers(&cfg.servers, cfg.tls.fallback_cert)
@@ -85,6 +96,19 @@ fn main() -> Result<()> {
 
     for s in &cfg.servers {
         info!("  {} -> {}", s.domain, s.upstream);
+        for r in &s.routes {
+            info!(
+                "  {}{} -> {}{}",
+                s.domain,
+                r.prefix(),
+                r.upstream,
+                if r.strip_prefix {
+                    " (prefix stripped)"
+                } else {
+                    ""
+                }
+            );
+        }
     }
 
     if cfg.limits.per_ip_conns_per_sec == 0 {
@@ -123,6 +147,7 @@ mod tests {
             pub_key: "certs/test.local.crt".to_string(),
             priv_key: "certs/test.local.key".to_string(),
             upstream: upstream.to_string(),
+            routes: Vec::new(),
         }
     }
 
@@ -134,10 +159,31 @@ mod tests {
         ];
         let routes = build_routes(&servers);
 
-        assert_eq!(routes.len(), 2);
-        assert_eq!(routes.get("test.local").map(String::as_str), Some("127.0.0.1:8080"));
-        assert_eq!(routes.get("api.example.com").map(String::as_str), Some("127.0.0.1:9000"));
-        assert!(!routes.contains_key("Test.Local"));
+        assert_eq!(
+            routes.get("test.local").unwrap().resolve("/").upstream,
+            "127.0.0.1:8080"
+        );
+        assert_eq!(
+            routes.get("api.example.com").unwrap().resolve("/").upstream,
+            "127.0.0.1:9000"
+        );
+        assert!(routes.get("Test.Local").is_none());
+    }
+
+    #[test]
+    fn routes_from_the_config_reach_the_table() {
+        let mut s = server("aaa.local", "127.0.0.1:8080");
+        s.routes = vec![crate::config::Route {
+            path: "/assets/".to_string(),
+            upstream: "127.0.0.1:8085".to_string(),
+            strip_prefix: true,
+        }];
+        let routes = build_routes(&[s]);
+
+        assert_eq!(routes.route_count(), 1);
+        let hit = routes.get("aaa.local").unwrap().resolve("/assets/app.css");
+        assert_eq!(hit.upstream, "127.0.0.1:8085");
+        assert_eq!(hit.strip, Some("/assets"));
     }
 
     #[test]
@@ -148,7 +194,9 @@ mod tests {
         ];
         let routes = build_routes(&servers);
 
-        assert_eq!(routes.len(), 1);
-        assert_eq!(routes["test.local"], "127.0.0.1:9090");
+        assert_eq!(
+            routes.get("test.local").unwrap().resolve("/").upstream,
+            "127.0.0.1:9090"
+        );
     }
 }
