@@ -107,7 +107,10 @@ fn main() -> Result<()> {
     }
 
     if cfg.listen.http.ends_with(":80") || cfg.listen.https.ends_with(":443") {
-        warn!("binding to ports 80/443 usually requires root or CAP_NET_BIND_SERVICE");
+        warn!(
+            "a port below 1024 needs CAP_NET_BIND_SERVICE, not root: systemd units \
+             declare `AmbientCapabilities=CAP_NET_BIND_SERVICE` (see deploy/uping.service)"
+        );
     }
 
     server.run_forever();
