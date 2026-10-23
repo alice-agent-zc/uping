@@ -70,7 +70,6 @@ if id -u "$GROUP" >/dev/null 2>&1; then
         bad "config $CONFIG is not readable by $GROUP (root-only config is what keeps the proxy root)"
     fi
 
-    cfg_dir=$(dirname "$CONFIG")
     # Paths are relative to the process's working directory; under systemd that is /
     workdir=$(systemctl show -p WorkingDirectory --value "$UNIT_NAME" 2>/dev/null)
     [ -n "$workdir" ] || workdir=/
@@ -118,6 +117,7 @@ else
 fi
 
 # --- 5. who owns the sockets -----------------------------------------------------
+# ss names the process, not its uid: read the uid from /proc of the pid it names.
 if command -v ss >/dev/null 2>&1; then
     for port in 80 443; do
         line=$(ss -ltnpH "sport = :$port" 2>/dev/null | head -1)
@@ -125,11 +125,15 @@ if command -v ss >/dev/null 2>&1; then
             info "nothing listening on :$port"
             continue
         fi
-        owner=$(printf '%s' "$line" | sed -n 's/.*uid:\([0-9]*\).*/\1/p')
+        pid_on_port=$(printf '%s' "$line" | sed -n 's/.*pid=\([0-9]*\).*/\1/p')
+        if [ -z "$pid_on_port" ] || [ ! -r "/proc/$pid_on_port/status" ]; then
+            info ":$port is held by a process this shell cannot name"
+            continue
+        fi
+        owner=$(awk '/^Uid:/{print $2}' "/proc/$pid_on_port/status")
         case "$owner" in
-            0)       bad ":$port is held by uid 0" ;;
-            "")      info ":$port is held by a process this shell cannot name" ;;
-            *)       ok ":$port is held by uid $owner" ;;
+            0)  bad ":$port is held by uid 0 (pid $pid_on_port)" ;;
+            *)  ok ":$port is held by uid $owner (pid $pid_on_port)" ;;
         esac
     done
 fi
