@@ -69,88 +69,84 @@ a certificate for.
 
 ## Deploying as a service
 
-The expected deployment is root on a small VPS, in front of a local service:
+uping does **not** run as root. The only root-level thing it does is bind `:80`
+and `:443`, and that is one capability — `CAP_NET_BIND_SERVICE` — not an
+identity. The unit in [`deploy/uping.service`](deploy/uping.service) declares it
+and runs as the dedicated `uping` user; the process holds no other privilege and
+cannot regain any (`NoNewPrivileges=yes`, `CapabilityBoundingSet=` one bit wide).
 
 ```sh
 cargo build --release
 sudo install -m 0755 target/release/uping /usr/local/bin/uping
-sudo install -d -m 0755 /etc/uping
-sudo install -m 0644 config.toml /etc/uping/config.toml   # your real config
+sudo useradd --system --no-create-home --shell /usr/sbin/nologin uping
+sudo install -d -o root -g uping -m 0750 /etc/uping /etc/uping/certs
+sudo install -o root -g uping -m 0640 config.toml /etc/uping/config.toml
+sudo install -m 0644 deploy/uping.service /etc/systemd/system/uping.service
+sudo install -m 0755 deploy/install-cert.sh /usr/local/lib/uping/install-cert.sh
+sudo systemctl daemon-reload && sudo systemctl enable --now uping
 ```
 
-Save the unit below as `/etc/systemd/system/uping.service`, then:
+Two things the unit does not give the user, because it must not:
+
+- **The config** is `root:uping 0640` — readable, not writable, by the proxy.
+- **The certificates.** `/etc/letsencrypt/live/*/privkey.pem` is mode `0600`
+  root-owned and reissued underneath you, so the proxy never reads it: a
+  certbot deploy hook copies the two files it needs into
+  `/etc/uping/certs/<lineage>/` as `root:uping 0640` and restarts the service.
+  Point `pub_key`/`priv_key` at that copy.
 
 ```sh
-sudo systemctl daemon-reload
-sudo systemctl enable --now uping
-journalctl -u uping -f
+sudo certbot renew --deploy-hook /usr/local/lib/uping/install-cert.sh
+# and once by hand for the lineage that already exists:
+sudo RENEWED_LINEAGE=/etc/letsencrypt/live/example.com /usr/local/lib/uping/install-cert.sh
 ```
 
-It runs as root deliberately: it must bind `:80`/`:443` and read mode-`0600`
-private keys such as `privkey.pem`. To avoid that, bind high ports under
-`[listen]` and grant the binary just the one capability it needs:
+```toml
+[[server]]
+domain   = "example.com"
+pub_key  = "/etc/uping/certs/example.com/fullchain.pem"
+priv_key = "/etc/uping/certs/example.com/privkey.pem"
+upstream = "127.0.0.1:8080"
+```
+
+### Moving an existing root install
+
+The service can be re-pointed without a window longer than a restart:
+
+```sh
+sudo cp -a /etc/uping/config.toml /etc/uping/config.toml.pre-unprivileged
+sudo useradd --system --no-create-home --shell /usr/sbin/nologin uping
+sudo install -m 0644 deploy/uping.service /etc/systemd/system/uping.service
+# copy each domain's certs where the hook would put them, then edit the two
+# paths per [[server]] block as above
+sudo systemctl daemon-reload && sudo systemctl restart uping
+```
+
+`deploy/check-privileges.sh` is the acceptance: run it as root before and after
+and it names every remaining thing that needs root — the unit's user, the
+ambient capability, the config and every certificate's readability *as the
+service user*, the live process's uid and capability mask, and who holds the
+`:80`/`:443` sockets. It changes nothing.
+
+```sh
+sudo ./deploy/check-privileges.sh
+curl -skI --resolve example.com:443:127.0.0.1 https://example.com/
+```
+
+Rollback is the old unit and a `daemon-reload`: `config.toml.pre-unprivileged`
+plus the unit as it was. Nothing else on the host was changed.
+
+### Not using systemd
+
+`AmbientCapabilities` needs systemd. Without it, grant the binary the one
+capability directly (`libcap2-bin`), and run it as `uping`:
 
 ```sh
 sudo setcap 'cap_net_bind_service=+ep' /usr/local/bin/uping
 ```
 
-(Reading the certificate is then your problem — `privkey.pem` from Let's
-Encrypt is mode 0600 and root-owned.)
-
-<details>
-<summary><code>/etc/systemd/system/uping.service</code></summary>
-
-```ini
-[Unit]
-Description=uping reverse proxy
-Documentation=https://github.com/raonagos/uping
-# We need a working DNS/network before resolving upstreams like "localhost:42617".
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=simple
-ExecStart=/usr/local/bin/uping /etc/uping/config.toml
-
-# Pingora runs its own worker threads; the main process stays in the foreground
-# and handles SIGTERM cleanly, so on-failure restarts are enough.
-Restart=on-failure
-RestartSec=2
-KillSignal=SIGTERM
-TimeoutStopSec=10
-
-# uping must bind :80/:443 and read /etc/letsencrypt/live/.../privkey.pem
-# (mode 0600, root-only), so it runs as root. This is the intended deployment.
-User=root
-Group=root
-
-# Logs go to the journal:  journalctl -u uping -f
-StandardOutput=journal
-StandardError=journal
-SyslogIdentifier=uping
-
-# Uncomment for verbose per-request logging:
-#Environment=RUST_LOG=info
-
-# --- Hardening (safe for uping) ---
-NoNewPrivileges=yes
-PrivateTmp=yes
-ProtectSystem=strict
-ProtectHome=yes
-ProtectKernelTunables=yes
-ProtectKernelModules=yes
-ProtectControlGroups=yes
-RestrictSUIDSGID=yes
-LockPersonality=yes
-# ProtectSystem=strict makes / read-only; these two give back exactly what we need.
-ReadWritePaths=/var/log
-ReadOnlyPaths=/etc/letsencrypt /etc/uping
-
-[Install]
-WantedBy=multi-user.target
-```
-
-</details>
+The capability lives on the file and is **lost on every rebuild** — re-apply it
+after each `install`, or prefer the unit.
 
 ## Project layout
 

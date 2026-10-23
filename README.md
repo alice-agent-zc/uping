@@ -118,16 +118,21 @@ So a backend that needs to know the request arrived over HTTPS can read
 ## Running it
 
 uping is distributed as source. It wants a certificate + key per domain, and
-the right to bind `:80` and `:443` (root or `CAP_NET_BIND_SERVICE`):
+the right to bind `:80` and `:443` — one capability, `CAP_NET_BIND_SERVICE`,
+**not** root:
 
 ```sh
 cargo build --release
-sudo ./target/release/uping config.toml
+./target/release/uping config.toml      # try it on high ports: test.config.toml
 ```
+
+As a service it runs as a dedicated `uping` user;
+[`deploy/uping.service`](deploy/uping.service) is the unit, and
+`deploy/check-privileges.sh` says what still needs root.
 
 Building has a few prerequisites that are not part of a default Rust install —
 CMake in particular. **[CONTRIBUTING.md](CONTRIBUTING.md)** covers those, the
-systemd unit, and how to try uping out without root.
+deployment step by step, and how to try uping out without root.
 
 ## Notes
 
