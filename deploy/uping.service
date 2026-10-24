@@ -1,0 +1,60 @@
+[Unit]
+Description=uping reverse proxy
+Documentation=https://github.com/raonagos/uping
+# A working network before upstream names are resolved at boot.
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Not root. The one thing root used to buy is the right to bind :80 and :443,
+# and that is one capability, not an identity: see AmbientCapabilities below.
+User=uping
+Group=uping
+ExecStart=/usr/local/bin/uping /etc/uping/config.toml
+
+# Pingora keeps the main process in the foreground and stops cleanly on SIGTERM.
+Restart=on-failure
+RestartSec=2
+KillSignal=SIGTERM
+TimeoutStopSec=10
+
+# The whole of uping's privilege: ports below 1024. Nothing else in the process
+# is elevated, and the capability cannot be added back after exec (NoNewPrivileges).
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+NoNewPrivileges=yes
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=uping
+# Uncomment for verbose per-request logging:
+#Environment=RUST_LOG=info
+
+# --- Hardening ---
+# The config and the certificates are the only files it opens, and it opens them
+# read-only. Nothing in the unit needs a writable path: logs go to the journal.
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictSUIDSGID=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+# No SystemCallFilter here on purpose: pingora's syscall surface (epoll, io_uring
+# on some builds, TLS) has not been measured under a filter, and a filter that
+# is one call short takes the proxy down at runtime. Add it after a load test.
+#
+# AF_UNIX stays: glibc resolves names through the resolver's socket.
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+ReadOnlyPaths=/etc/uping
+
+[Install]
+WantedBy=multi-user.target

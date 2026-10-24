@@ -5,3 +5,8 @@ target/
 
 # Local test certificates, generated per CONTRIBUTING.md.
 certs/
+
+# A real deployment config carries hostnames and cert paths; examples are
+# committed as *.example.toml
+deploy/*.toml
+!deploy/*.example.toml
