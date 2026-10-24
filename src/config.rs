@@ -53,6 +53,11 @@ pub struct Config {
     /// One entry per reverse-proxied domain.
     #[serde(rename = "server", default)]
     pub servers: Vec<Server>,
+
+    /// Path routes shared by several domains (`[[route]]`). A route with an
+    /// empty `hosts` list serves every `[[server]]`.
+    #[serde(rename = "route", default)]
+    pub routes: Vec<Route>,
 }
 
 /// Where uping binds. Defaults to the standard HTTP/HTTPS ports.
@@ -178,7 +183,11 @@ pub struct Server {
     pub routes: Vec<Route>,
 }
 
-/// One path-prefix route belonging to a [`Server`].
+/// One path-prefix route.
+///
+/// Declared as `[[server.route]]` it belongs to that one domain; declared as a
+/// top-level `[[route]]` it serves every domain named in `hosts` — or every
+/// `[[server]]` when `hosts` is empty.
 #[derive(Debug, Clone, Deserialize)]
 pub struct Route {
     /// Path prefix, e.g. `/mcp` or `/assets/`.
@@ -190,9 +199,24 @@ pub struct Route {
     /// Remove `path` from the request path before forwarding it.
     #[serde(default)]
     pub strip_prefix: bool,
+
+    /// Domains this route applies to. Empty, or a `"*"` entry, means every
+    /// `[[server]]`. Only meaningful on a top-level `[[route]]`.
+    #[serde(default)]
+    pub hosts: Vec<String>,
 }
 
 impl Route {
+    /// Does this route apply to `domain`? Case-insensitive; an empty `hosts`
+    /// list or a `"*"` entry matches every domain.
+    pub fn applies_to(&self, domain: &str) -> bool {
+        self.hosts.is_empty()
+            || self.hosts.iter().any(|h| {
+                let h = h.trim();
+                h == "*" || h.eq_ignore_ascii_case(domain.trim())
+            })
+    }
+
     /// The prefix with a trailing `/` removed, so `/assets/` and `/assets`
     /// match the same requests.
     pub fn prefix(&self) -> &str {
@@ -206,6 +230,20 @@ impl Route {
 }
 
 impl Config {
+    /// The effective route table for one server: its own `[[server.route]]`
+    /// first, then every top-level `[[route]]` that applies and whose prefix
+    /// the server does not already define. On an identical prefix the server's
+    /// own route wins — explicit beats shared.
+    pub fn routes_for<'a>(&'a self, server: &'a Server) -> Vec<&'a Route> {
+        let mut effective: Vec<&Route> = server.routes.iter().collect();
+        for r in &self.routes {
+            if r.applies_to(&server.domain) && !effective.iter().any(|e| e.prefix() == r.prefix()) {
+                effective.push(r);
+            }
+        }
+        effective
+    }
+
     /// Read and parse a TOML config file.
     pub fn load(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
@@ -230,19 +268,21 @@ impl Config {
             if s.priv_key.trim().is_empty() {
                 anyhow::bail!("`{}` has an empty `priv_key`", s.domain);
             }
-            validate_routes(s)?;
+            validate_routes(&s.routes, &format!("`{}`", s.domain))?;
         }
+        validate_routes(&cfg.routes, "global")?;
+        validate_global_hosts(&cfg)?;
         Ok(cfg)
     }
 }
 
 /// Reject route tables that would be ambiguous or unusable at request time.
-fn validate_routes(s: &Server) -> Result<()> {
+fn validate_routes(routes: &[Route], owner: &str) -> Result<()> {
     let mut seen = std::collections::HashSet::new();
 
-    for r in &s.routes {
+    for r in routes {
         let path = r.path.trim();
-        let where_ = format!("`{}` route `{path}`", s.domain);
+        let where_ = format!("{owner} route `{path}`");
 
         if r.upstream.trim().is_empty() {
             anyhow::bail!("{where_} has an empty `upstream`");
@@ -254,16 +294,59 @@ fn validate_routes(s: &Server) -> Result<()> {
             anyhow::bail!("{where_}: `path` is a path prefix, not a URI");
         }
         if r.prefix() == "/" {
-            anyhow::bail!(
-                "`{}` route `{path}`: `/` is the catch-all, use the server's `upstream`",
-                s.domain
-            );
+            anyhow::bail!("{where_}: `/` is the catch-all, use the server's `upstream`");
         }
         if !seen.insert(r.prefix().to_string()) {
-            anyhow::bail!("`{}` has two routes for `{}`", s.domain, r.prefix());
+            anyhow::bail!("{owner} has two routes for `{}`", r.prefix());
         }
     }
     Ok(())
+}
+
+/// A top-level route may only name domains that exist, and two global routes
+/// for the same prefix must address disjoint domains.
+fn validate_global_hosts(cfg: &Config) -> Result<()> {
+    for r in &cfg.routes {
+        for h in &r.hosts {
+            let h = h.trim();
+            if h.is_empty() {
+                anyhow::bail!("global route `{}` has an empty `hosts` entry", r.path);
+            }
+            if h == "*" {
+                continue;
+            }
+            if !cfg.servers.iter().any(|s| s.domain.eq_ignore_ascii_case(h)) {
+                anyhow::bail!(
+                    "global route `{}` names host `{h}`, which is not a configured [[server]] domain",
+                    r.path
+                );
+            }
+        }
+    }
+
+    for (i, a) in cfg.routes.iter().enumerate() {
+        for b in &cfg.routes[i + 1..] {
+            if a.prefix() == b.prefix() && hosts_overlap(a, b) {
+                anyhow::bail!(
+                    "global routes for `{}` overlap; give them disjoint `hosts`",
+                    a.prefix()
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Whether two global routes can apply to the same domain.
+fn hosts_overlap(a: &Route, b: &Route) -> bool {
+    let all = |r: &Route| r.hosts.is_empty() || r.hosts.iter().any(|h| h.trim() == "*");
+    all(a)
+        || all(b)
+        || a.hosts.iter().any(|x| {
+            b.hosts
+                .iter()
+                .any(|y| x.trim().eq_ignore_ascii_case(y.trim()))
+        })
 }
 
 #[cfg(test)]
@@ -579,6 +662,111 @@ strip_prefix = true
         let err = Config::load(&path).unwrap_err().to_string();
 
         assert!(err.contains("parsing TOML"), "unexpected error: {err}");
+        let _ = std::fs::remove_file(path);
+    }
+
+    const TWO_SERVERS: &str = r#"
+[[server]]
+domain   = "a.example"
+pub_key  = "certs/a.pem"
+priv_key = "certs/a.key"
+upstream = "127.0.0.1:8080"
+
+[[server]]
+domain   = "b.example"
+pub_key  = "certs/b.pem"
+priv_key = "certs/b.key"
+upstream = "127.0.0.1:8090"
+"#;
+
+    #[test]
+    fn a_global_route_answers_on_two_servers() {
+        let path = write_temp(
+            "global-all.toml",
+            &format!("{TWO_SERVERS}\n[[route]]\npath = \"/mcp\"\nupstream = \"127.0.0.1:9000\"\n"),
+        );
+        let cfg = Config::load(&path).unwrap();
+
+        for server in &cfg.servers {
+            let routes = cfg.routes_for(server);
+            assert_eq!(routes.len(), 1, "{}", server.domain);
+            assert_eq!(routes[0].path, "/mcp");
+            assert_eq!(routes[0].upstream, "127.0.0.1:9000");
+        }
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn a_scoped_global_route_applies_only_to_its_hosts() {
+        let path = write_temp(
+            "global-scoped.toml",
+            &format!(
+                "{TWO_SERVERS}\n[[route]]\npath = \"/api\"\nupstream = \"127.0.0.1:9001\"\nhosts = [\"A.example\"]\n"
+            ),
+        );
+        let cfg = Config::load(&path).unwrap();
+
+        let a = cfg.routes_for(&cfg.servers[0]);
+        assert_eq!(a.len(), 1);
+        assert_eq!(a[0].prefix(), "/api");
+
+        // `b.example` falls through to its own upstream.
+        let b = cfg.routes_for(&cfg.servers[1]);
+        assert!(b.is_empty(), "unexpected routes on b: {b:?}");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn a_server_route_wins_over_a_global_route_on_the_same_prefix() {
+        let path = write_temp(
+            "global-precedence.toml",
+            &format!(
+                "{TWO_SERVERS}\n[[route]]\npath = \"/mcp\"\nupstream = \"127.0.0.1:9000\"\n\n[[server.route]]\npath = \"/mcp/\"\nupstream = \"127.0.0.1:9002\"\n"
+            ),
+        );
+        let cfg = Config::load(&path).unwrap();
+
+        // The server-local route on `b.example` beats the shared one.
+        let b = cfg.routes_for(&cfg.servers[1]);
+        assert_eq!(b.len(), 1);
+        assert_eq!(b[0].upstream, "127.0.0.1:9002");
+
+        // `a.example` has no local route, so the global one still applies.
+        let a = cfg.routes_for(&cfg.servers[0]);
+        assert_eq!(a.len(), 1);
+        assert_eq!(a[0].upstream, "127.0.0.1:9000");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn rejects_a_global_route_naming_an_unknown_host() {
+        let path = write_temp(
+            "global-badhost.toml",
+            &format!(
+                "{TWO_SERVERS}\n[[route]]\npath = \"/api\"\nupstream = \"127.0.0.1:9001\"\nhosts = [\"nope.example\"]\n"
+            ),
+        );
+        let err = Config::load(&path).unwrap_err().to_string();
+
+        assert!(
+            err.contains("not a configured [[server]] domain"),
+            "unexpected error: {err}"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn a_config_without_global_routes_behaves_as_before() {
+        let path = write_temp("no-global.toml", WITH_ROUTES);
+        let cfg = Config::load(&path).unwrap();
+
+        assert!(cfg.routes.is_empty());
+        let effective = cfg.routes_for(&cfg.servers[0]);
+        assert_eq!(effective.len(), cfg.servers[0].routes.len());
+        for (got, own) in effective.iter().zip(&cfg.servers[0].routes) {
+            assert_eq!(got.prefix(), own.prefix());
+            assert_eq!(got.upstream, own.upstream);
+        }
         let _ = std::fs::remove_file(path);
     }
 }

@@ -37,3 +37,12 @@ upstream = "127.0.0.1:8080"          # catch-all: every path without its own rou
 # path         = "/assets/"
 # upstream     = "127.0.0.1:8085"
 # strip_prefix = true                # backend sees /app.css, not /assets/app.css
+
+# Optional. One route for several domains at once. `hosts` empty (or ["*"])
+# means every [[server]]; a named list must match configured domains.
+# On an identical path the domain's own [[server.route]] wins.
+#
+# [[route]]
+# path     = "/mcp"
+# upstream = "127.0.0.1:8081"
+# hosts    = ["www.example.com", "api.example.com"]   # optional
