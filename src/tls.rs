@@ -163,6 +163,7 @@ mod tests {
             pub_key: cert.clone(),
             priv_key: key.clone(),
             upstream: "127.0.0.1:8080".to_string(),
+            routes: Vec::new(),
         }
     }
 
