@@ -6,7 +6,14 @@
 #
 #   curl --proto '=https' --tlsv1.2 -sSf \
 #     https://raw.githubusercontent.com/raonagos/uping/main/deploy/install.sh \
-#     | sudo sh -s -- --binary ./uping
+#     | sudo sh -s -- --config ./config.toml
+#
+# No arguments installs the latest release from
+# github.com/raonagos/uping/releases: the binary is downloaded, its published
+# sha256 is checked, and an unverified download is refused rather than installed.
+# `--version v0.1.2` pins a tag; `--binary PATH` installs a local build instead;
+# `--fetch-only DIR` does just the download, needs no root, and is how CI proves
+# a release is installable.
 #
 # It is re-runnable: it upgrades the binary and the unit, leaves
 # /etc/uping/config.toml alone, and finishes by proving the result. Read-only
@@ -32,6 +39,12 @@ HOOK=$HOOK_DIR/install-cert.sh
 HOOK_LINK=/etc/letsencrypt/renewal-hooks/deploy/uping-cert.sh
 USER_NAME=uping
 
+# Where release assets come from. The layout is fixed by
+# .github/workflows/release.yml: <base>/{latest/download,download/<tag>}/<file>.
+# UPING_BASE_URL exists for a mirror or an air-gapped check, not for the normal path.
+BASE_URL=${UPING_BASE_URL:-https://github.com/raonagos/uping/releases}
+VERSION=latest
+
 step() { printf '\n==> %s\n' "$*"; }
 ok()   { printf '  ok    %s\n' "$*"; }
 bad()  { printf '  FAIL  %s\n' "$*"; FAILS=$((FAILS + 1)); }
@@ -39,41 +52,139 @@ info() { printf '        %s\n' "$*"; }
 die()  { printf 'install.sh: %s\n' "$*" >&2; exit 1; }
 FAILS=0
 
+# --- the release asset ------------------------------------------------------------
+# Name a target triple for this machine. Only Linux: the unit is systemd and the
+# whole point is binding :80/:443.
+release_target() {
+    case $(uname -s) in
+        Linux) ;;
+        *) die "uping installs as a systemd service on Linux; $(uname -s) is not supported" ;;
+    esac
+    case $(uname -m) in
+        x86_64|amd64)  echo x86_64-unknown-linux-gnu ;;
+        aarch64|arm64) echo aarch64-unknown-linux-gnu ;;
+        *)             die "no release asset is published for machine type $(uname -m)" ;;
+    esac
+}
+
+release_url() { # release_url <asset-file> -> url
+    if [ "$VERSION" = latest ]; then
+        printf '%s/latest/download/%s\n' "$BASE_URL" "$1"
+    else
+        printf '%s/download/%s/%s\n' "$BASE_URL" "$VERSION" "$1"
+    fi
+}
+
+download() { # download <url> <dest>
+    # TLS is pinned to https for a real fetch. Anything else (a file:// mirror in
+    # the release workflow) drops the restriction rather than pretending to have it.
+    case $1 in
+        https://*) proto="--proto =https" ;;
+        *)         proto="" ;;
+    esac
+    if command -v curl >/dev/null 2>&1; then
+        # shellcheck disable=SC2086
+        curl $proto -fsSL --retry 3 -o "$2" "$1"
+    elif command -v wget >/dev/null 2>&1; then
+        wget -q -O "$2" "$1"
+    else
+        die "curl or wget is required to download the release; use --binary PATH"
+    fi
+}
+
+sha256_of() { # sha256_of <file> -> hex
+    if command -v sha256sum >/dev/null 2>&1; then
+        sha256sum "$1" | cut -d' ' -f1
+    else
+        shasum -a 256 "$1" | cut -d' ' -f1
+    fi
+}
+
+# Download, verify and unpack the release into a directory. Sets FETCHED to the
+# extracted binary and EXAMPLE_CONF when the archive ships one. Nothing is
+# returned on stdout — info/ok write there, and a caller must not capture them.
+# No checksum means no install: an unverified binary that will hold :443 is
+# worse than a failed install.
+fetch_release() {
+    target=$(release_target)
+    name="uping-$target.tar.gz"
+    dir=$1
+    command -v tar >/dev/null 2>&1 || die "tar is required to unpack the release"
+    mkdir -p "$dir" || die "cannot create $dir"
+    info "release ${VERSION} for $target"
+    download "$(release_url "$name")" "$dir/$name" \
+        || die "cannot download $(release_url "$name") — is $VERSION published?"
+    download "$(release_url "$name.sha256")" "$dir/$name.sha256" \
+        || die "no published checksum for $name: refusing an unverified binary (use --binary PATH for a local build)"
+    want=$(cut -d' ' -f1 < "$dir/$name.sha256")
+    got=$(sha256_of "$dir/$name")
+    [ -n "$want" ] && [ "$want" = "$got" ] \
+        || die "sha256 mismatch for $name: published '${want}', downloaded '${got}'"
+    ok "sha256 $got"
+    tar -xzf "$dir/$name" -C "$dir" || die "cannot unpack $dir/$name"
+    [ -f "$dir/uping" ] || die "$name does not contain an uping binary"
+    FETCHED=$dir/uping
+    if [ -f "$dir/config.toml.example" ]; then EXAMPLE_CONF=$dir/config.toml.example; fi
+}
+
+elf_or_die() { # elf_or_die <file>
+    [ -r "$1" ] || die "cannot read $1"
+    magic=$(head -c 4 "$1" | od -An -tx1 | tr -d ' \n')
+    [ "$magic" = 7f454c46 ] || die "$1 is not an ELF binary"
+}
+
 usage() {
     cat <<'USAGE'
 usage: install.sh [options]
 
-  --binary PATH    install this file as the uping binary (checked to be ELF).
-                   Omit on an upgrade where /usr/local/bin/uping already exists.
+  --version TAG    download the release asset for TAG (e.g. v0.1.2).
+                   Default: the latest release.
+  --binary PATH    install this file instead of downloading a release
+                   (checked to be ELF).
   --config PATH    install this file as /etc/uping/config.toml
                    (root:uping 0640). Omit to keep the existing one.
+  --fetch-only DIR download and verify the release asset into DIR, install
+                   nothing, exit 0. Needs no root; used by CI.
   --no-start       install everything, do not enable or start the service.
   --verify-only    change nothing; run the checks and exit non-zero on failure.
   -h, --help       this text.
 
+Environment
+  UPING_BASE_URL   release base URL, default
+                   https://github.com/raonagos/uping/releases
+
 Examples
   curl --proto '=https' --tlsv1.2 -sSf <url>/deploy/install.sh \
-    | sudo sh -s -- --binary ./uping --config ./config.toml
+    | sudo sh -s -- --config ./config.toml
 
+  sudo sh install.sh --version v0.1.2 --config ./config.toml
+  sh install.sh --fetch-only ./fetched          # no root, no install
   sudo sh install.sh --verify-only
 USAGE
 }
 
 BINARY_SRC=""
 CONFIG_SRC=""
+FETCH_DIR=""
 DO_START=1
 VERIFY_ONLY=0
 
 while [ $# -gt 0 ]; do
     case $1 in
+        --version)     [ $# -ge 2 ] || die "--version needs a tag"; VERSION=$2; shift 2 ;;
         --binary)      [ $# -ge 2 ] || die "--binary needs a path"; BINARY_SRC=$2; shift 2 ;;
         --config)      [ $# -ge 2 ] || die "--config needs a path"; CONFIG_SRC=$2; shift 2 ;;
+        --fetch-only)  [ $# -ge 2 ] || die "--fetch-only needs a directory"; FETCH_DIR=$2; shift 2 ;;
         --no-start)    DO_START=0; shift ;;
         --verify-only) VERIFY_ONLY=1; shift ;;
         -h|--help)     usage; exit 0 ;;
         *)             usage >&2; die "unknown argument: $1" ;;
     esac
 done
+
+if [ -n "$BINARY_SRC" ] && [ "$VERSION" != latest ]; then
+    die "--binary and --version are exclusive: a local file or a release, not both"
+fi
 
 # --- 1. verify -------------------------------------------------------------------
 # Reading a unit, another user's files and /proc is a root-only read. It changes
@@ -175,8 +286,19 @@ EOF
     return 1
 }
 
+# Download-only: the one mode a non-root shell can run, which is the whole point
+# — CI proves the published asset is installable before anyone is root.
+if [ -n "$FETCH_DIR" ]; then
+    fetch_release "$FETCH_DIR"
+    elf_or_die "$FETCHED"
+    ok "binary $FETCHED"
+    if [ -n "${EXAMPLE_CONF:-}" ]; then ok "example config $EXAMPLE_CONF"; fi
+    printf '\n%s\n' "$FETCHED"
+    exit 0
+fi
+
 if [ "$(id -u)" != 0 ]; then
-    die "run as root: curl … | sudo sh -s -- --binary ./uping"
+    die "run as root: curl … | sudo sh -s -- --config ./config.toml"
 fi
 command -v systemctl >/dev/null 2>&1 \
     || die "this installer needs systemd; the manual steps are in CONTRIBUTING.md"
@@ -188,15 +310,17 @@ fi
 
 # --- 2. what it needs before it writes anything -----------------------------------
 step "preflight"
+DOWN_DIR=""
 if [ -n "$BINARY_SRC" ]; then
-    [ -r "$BINARY_SRC" ] || die "cannot read $BINARY_SRC"
-    magic=$(head -c 4 "$BINARY_SRC" | od -An -tx1 | tr -d ' \n')
-    [ "$magic" = 7f454c46 ] || die "$BINARY_SRC is not an ELF binary"
+    elf_or_die "$BINARY_SRC"
     ok "binary $BINARY_SRC"
-elif [ -x "$BIN" ]; then
-    info "no --binary: keeping the installed $BIN"
 else
-    die "no binary: pass --binary PATH. There is no release asset to download yet."
+    DOWN_DIR=$(mktemp -d) || die "cannot create a temporary directory"
+    trap 'rm -rf "$DOWN_DIR"' EXIT INT TERM
+    fetch_release "$DOWN_DIR"
+    BINARY_SRC=$FETCHED
+    elf_or_die "$BINARY_SRC"
+    ok "binary $BINARY_SRC"
 fi
 
 if [ -n "$CONFIG_SRC" ]; then
@@ -205,7 +329,7 @@ if [ -n "$CONFIG_SRC" ]; then
 elif [ -r "$CONF" ]; then
     info "no --config: keeping $CONF"
 else
-    die "no config at $CONF: pass --config PATH (see README.md for the format)"
+    die "no config at $CONF: pass --config PATH, or start from $CONF.example (see README.md)"
 fi
 
 # --- 3. the binary, the user, the directories ------------------------------------
@@ -231,6 +355,11 @@ ok "$CONF_DIR and $CERT_DIR are root:$USER_NAME 0750"
 if [ -n "$CONFIG_SRC" ]; then
     install -o root -g "$USER_NAME" -m 0640 "$CONFIG_SRC" "$CONF"
     ok "installed $CONF (root:$USER_NAME 0640)"
+fi
+# The example the release ships, next to the real config and never in its place.
+if [ -n "${EXAMPLE_CONF:-}" ] && [ -r "$EXAMPLE_CONF" ]; then
+    install -o root -g "$USER_NAME" -m 0640 "$EXAMPLE_CONF" "$CONF.example"
+    ok "example config at $CONF.example"
 fi
 
 # --- 4. the unit and the certbot hook --------------------------------------------
