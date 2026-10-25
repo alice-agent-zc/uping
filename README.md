@@ -149,9 +149,18 @@ cargo build --release
 ./target/release/uping config.toml      # try it on high ports: test.config.toml
 ```
 
-As a service it runs as a dedicated `uping` user;
-[`deploy/uping.service`](deploy/uping.service) is the unit, and
-`deploy/check-privileges.sh` says what still needs root.
+As a service it runs as a dedicated `uping` user. One script installs it and
+then proves the result:
+
+```sh
+curl --proto '=https' --tlsv1.2 -sSf \
+  https://raw.githubusercontent.com/raonagos/uping/main/deploy/install.sh \
+  | sudo sh -s -- --binary ./uping --config ./config.toml
+```
+
+It embeds the unit and the certbot hook, keeps an existing `/etc/uping/config.toml`,
+and ends by naming anything that still needs root. `--verify-only` re-runs just
+the checks.
 
 Building has a few prerequisites that are not part of a default Rust install —
 CMake in particular. **[CONTRIBUTING.md](CONTRIBUTING.md)** covers those, the
