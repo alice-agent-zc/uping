@@ -71,20 +71,27 @@ a certificate for.
 
 uping does **not** run as root. The only root-level thing it does is bind `:80`
 and `:443`, and that is one capability — `CAP_NET_BIND_SERVICE` — not an
-identity. The unit in [`deploy/uping.service`](deploy/uping.service) declares it
-and runs as the dedicated `uping` user; the process holds no other privilege and
-cannot regain any (`NoNewPrivileges=yes`, `CapabilityBoundingSet=` one bit wide).
+identity. The unit runs as the dedicated `uping` user; the process holds no
+other privilege and cannot regain any (`NoNewPrivileges=yes`,
+`CapabilityBoundingSet=` one bit wide).
+
+The deployment is one script. It carries the unit and the certbot hook, creates
+the user and the directories, installs binary and config, starts the service,
+and then checks what it did:
 
 ```sh
 cargo build --release
-sudo install -m 0755 target/release/uping /usr/local/bin/uping
-sudo useradd --system --no-create-home --shell /usr/sbin/nologin uping
-sudo install -d -o root -g uping -m 0750 /etc/uping /etc/uping/certs
-sudo install -o root -g uping -m 0640 config.toml /etc/uping/config.toml
-sudo install -m 0644 deploy/uping.service /etc/systemd/system/uping.service
-sudo install -m 0755 deploy/install-cert.sh /usr/local/lib/uping/install-cert.sh
-sudo systemctl daemon-reload && sudo systemctl enable --now uping
+curl --proto '=https' --tlsv1.2 -sSf \
+  https://raw.githubusercontent.com/raonagos/uping/main/deploy/install.sh \
+  | sudo sh -s -- --binary target/release/uping --config config.toml
 ```
+
+Re-run it to upgrade: it keeps `/etc/uping/config.toml` unless `--config` says
+otherwise, and saves the unit it replaces as `uping.service.bak.<timestamp>`.
+`sudo sh deploy/install.sh --verify-only` re-runs just the checks, changes
+nothing, and exits non-zero on anything that still needs root — the unit's user,
+the ambient capability, the config and every certificate read *as the service
+user*, the live process's uid and capability mask, and who holds `:80`/`:443`.
 
 Two things the unit does not give the user, because it must not:
 
@@ -95,9 +102,12 @@ Two things the unit does not give the user, because it must not:
   `/etc/uping/certs/<lineage>/` as `root:uping 0640` and restarts the service.
   Point `pub_key`/`priv_key` at that copy.
 
+The installer drops that hook at `/usr/local/lib/uping/install-cert.sh` and
+links it into `/etc/letsencrypt/renewal-hooks/deploy/`, where certbot runs it
+after any renewal — including the ones its own timer starts. For a lineage that
+already exists, run it once by hand:
+
 ```sh
-sudo certbot renew --deploy-hook /usr/local/lib/uping/install-cert.sh
-# and once by hand for the lineage that already exists:
 sudo RENEWED_LINEAGE=/etc/letsencrypt/live/example.com /usr/local/lib/uping/install-cert.sh
 ```
 
@@ -111,30 +121,20 @@ upstream = "127.0.0.1:8080"
 
 ### Moving an existing root install
 
-The service can be re-pointed without a window longer than a restart:
+The same script is the migration. Publish the certificates the unprivileged
+user will read, point the config at those copies, keep a copy of the old one,
+then run the installer:
 
 ```sh
-sudo cp -a /etc/uping/config.toml /etc/uping/config.toml.pre-unprivileged
-sudo useradd --system --no-create-home --shell /usr/sbin/nologin uping
-sudo install -m 0644 deploy/uping.service /etc/systemd/system/uping.service
-# copy each domain's certs where the hook would put them, then edit the two
-# paths per [[server]] block as above
-sudo systemctl daemon-reload && sudo systemctl restart uping
-```
-
-`deploy/check-privileges.sh` is the acceptance: run it as root before and after
-and it names every remaining thing that needs root — the unit's user, the
-ambient capability, the config and every certificate's readability *as the
-service user*, the live process's uid and capability mask, and who holds the
-`:80`/`:443` sockets. It changes nothing.
-
-```sh
-sudo ./deploy/check-privileges.sh
+sudo cp -a /etc/uping/config.toml /etc/uping/config.toml.before-unprivileged
+sudo RENEWED_LINEAGE=/etc/letsencrypt/live/example.com /usr/local/lib/uping/install-cert.sh
+# edit pub_key/priv_key per [[server]] to /etc/uping/certs/<domain>/…
+curl --proto '=https' --tlsv1.2 -sSf <install.sh url> | sudo sh -s -- --binary ./uping
 curl -skI --resolve example.com:443:127.0.0.1 https://example.com/
 ```
 
-Rollback is the old unit and a `daemon-reload`: `config.toml.pre-unprivileged`
-plus the unit as it was. Nothing else on the host was changed.
+Rollback is the saved unit and a `daemon-reload`, plus
+`config.toml.before-unprivileged`. Nothing else on the host is changed.
 
 ### Not using systemd
 
