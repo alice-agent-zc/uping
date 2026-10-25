@@ -18,7 +18,7 @@ use pingora::listeners::ConnectionFilter;
 use pingora::proxy::http_proxy_service;
 use pingora::server::Server;
 
-use crate::config::{Config, Server as ConfigServer};
+use crate::config::Config;
 use crate::limits::{ConnLimiter, RequestLimiter};
 use crate::proxy::{HttpsProxy, PathRoute, RedirectProxy, RouteTable, SiteRoutes};
 use crate::tls::SniResolver;
@@ -26,10 +26,13 @@ use crate::tls::SniResolver;
 /// Build the `domain -> routes` table, lowercasing domains so that
 /// `EXAMPLE.com` and `example.com` hit the same upstream. A later `[[server]]`
 /// for a domain replaces an earlier one wholesale, routes included.
-fn build_routes(servers: &[ConfigServer]) -> RouteTable {
+///
+/// Each server gets its own routes plus the top-level `[[route]]` entries whose
+/// `hosts` cover it, resolved by [`Config::routes_for`].
+fn build_routes(cfg: &Config) -> RouteTable {
     let mut sites = HashMap::new();
-    for s in servers {
-        let routes = s.routes.iter().map(PathRoute::from_config);
+    for s in &cfg.servers {
+        let routes = cfg.routes_for(s).into_iter().map(PathRoute::from_config);
         sites.insert(
             s.domain.to_ascii_lowercase(),
             SiteRoutes::new(s.upstream.clone(), routes),
@@ -49,7 +52,7 @@ fn main() -> Result<()> {
         .with_context(|| format!("loading configuration from `{config_path}`"))?;
 
     // domain -> upstreams
-    let routes = Arc::new(build_routes(&cfg.servers));
+    let routes = Arc::new(build_routes(&cfg));
     info!(
         "{} path route(s) across {} domain(s)",
         routes.route_count(),
@@ -96,7 +99,7 @@ fn main() -> Result<()> {
 
     for s in &cfg.servers {
         info!("  {} -> {}", s.domain, s.upstream);
-        for r in &s.routes {
+        for r in cfg.routes_for(s) {
             info!(
                 "  {}{} -> {}{}",
                 s.domain,
@@ -143,6 +146,7 @@ fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::Server as ConfigServer;
 
     fn server(domain: &str, upstream: &str) -> ConfigServer {
         ConfigServer {
@@ -154,13 +158,24 @@ mod tests {
         }
     }
 
+    /// A config holding only the parts `build_routes` reads.
+    fn config(servers: Vec<ConfigServer>, routes: Vec<crate::config::Route>) -> Config {
+        Config {
+            listen: Default::default(),
+            limits: Default::default(),
+            tls: Default::default(),
+            servers,
+            routes,
+        }
+    }
+
     #[test]
     fn routes_are_keyed_by_lowercased_domain() {
         let servers = vec![
             server("Test.Local", "127.0.0.1:8080"),
             server("API.Example.COM", "127.0.0.1:9000"),
         ];
-        let routes = build_routes(&servers);
+        let routes = build_routes(&config(servers, Vec::new()));
 
         assert_eq!(
             routes.get("test.local").unwrap().resolve("/").upstream,
@@ -180,8 +195,9 @@ mod tests {
             path: "/assets/".to_string(),
             upstream: "127.0.0.1:8085".to_string(),
             strip_prefix: true,
+            hosts: Vec::new(),
         }];
-        let routes = build_routes(&[s]);
+        let routes = build_routes(&config(vec![s], Vec::new()));
 
         assert_eq!(routes.route_count(), 1);
         let hit = routes.get("aaa.local").unwrap().resolve("/assets/app.css");
@@ -190,12 +206,33 @@ mod tests {
     }
 
     #[test]
+    fn a_global_route_reaches_every_server_in_the_table() {
+        let servers = vec![
+            server("a.example", "127.0.0.1:8080"),
+            server("b.example", "127.0.0.1:8090"),
+        ];
+        let global = crate::config::Route {
+            path: "/mcp".to_string(),
+            upstream: "127.0.0.1:9000".to_string(),
+            strip_prefix: false,
+            hosts: Vec::new(),
+        };
+        let routes = build_routes(&config(servers, vec![global]));
+
+        assert_eq!(routes.route_count(), 2);
+        for domain in ["a.example", "b.example"] {
+            let hit = routes.get(domain).unwrap().resolve("/mcp/v1");
+            assert_eq!(hit.upstream, "127.0.0.1:9000", "{domain}");
+        }
+    }
+
+    #[test]
     fn later_entries_win_on_duplicate_domains() {
         let servers = vec![
             server("test.local", "127.0.0.1:8080"),
             server("TEST.LOCAL", "127.0.0.1:9090"),
         ];
-        let routes = build_routes(&servers);
+        let routes = build_routes(&config(servers, Vec::new()));
 
         assert_eq!(
             routes.get("test.local").unwrap().resolve("/").upstream,

@@ -70,6 +70,29 @@ listener; the right certificate is chosen per-connection via SNI.
 `config.toml` in the current directory is the built-in default; pass another
 path as the first argument to override it.
 
+## Path routing
+
+A `[[server.route]]` sends one path prefix of that domain to another backend;
+the server's own `upstream` stays the catch-all. A top-level `[[route]]` says
+the same thing once for several domains.
+
+| Field          | On            | Meaning                                                        |
+|----------------|---------------|----------------------------------------------------------------|
+| `path`         | both          | Prefix to match, e.g. `/mcp`. Never `/` — that is the catch-all. |
+| `upstream`     | both          | `host:port` for requests under `path`.                          |
+| `strip_prefix` | both          | Remove `path` before forwarding (default `false`).              |
+| `hosts`        | `[[route]]` only | Domains it serves. Empty or `["*"]` = every `[[server]]`.     |
+
+```toml
+[[route]]
+path     = "/mcp"
+upstream = "127.0.0.1:8081"
+hosts    = ["www.example.com", "api.example.com"]   # omit for all domains
+```
+
+On an identical prefix the domain's own `[[server.route]]` wins over a
+top-level one; a `hosts` entry naming no configured domain is a startup error.
+
 ## Abuse protection
 
 Two layers, both counted per client IP over a fixed one-second window, both
