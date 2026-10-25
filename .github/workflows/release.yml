@@ -84,8 +84,11 @@ jobs:
           cp target/"$TARGET"/release/uping dist/uping
           strip dist/uping
           cp config.toml dist/config.toml.example
+          # tar -C dist writes the archive beside the workflow's cwd, so the
+          # checksum is taken there too. install.sh reads only field 1 of this
+          # file; the filename is for a human opening the release.
           tar -C dist -czf "uping-$TARGET.tar.gz" uping config.toml.example
-          ( cd dist && sha256sum "uping-$TARGET.tar.gz" > "../uping-$TARGET.tar.gz.sha256" )
+          sha256sum "uping-$TARGET.tar.gz" > "uping-$TARGET.tar.gz.sha256"
           ls -l uping-"$TARGET".tar.gz*
           cat uping-"$TARGET".tar.gz.sha256
 
