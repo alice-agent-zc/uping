@@ -45,9 +45,10 @@ hot-reload, load balancing, health checks.
 
 ```toml
 # Optional. Defaults to 0.0.0.0:80 / 0.0.0.0:443.
+# `*:port` works as shorthand for `0.0.0.0:port`.
 # [listen]
-# http  = "0.0.0.0:80"
-# https = "0.0.0.0:443"
+# http  = "*:80"
+# https = "*:443"
 
 # Optional. Abuse protection. Any limit set to 0 is switched off.
 # [limits]
@@ -112,12 +113,13 @@ should be reachable from outside without a second firewall hole.
 ```toml
 [[stream]]
 name     = "smtp"                 # log label, optional, falls back to `listen`
-listen   = "0.0.0.0:25"
+listen   = "*:25"                 # `*:port` = every IPv4 interface
 upstream = "127.0.0.1:10025"      # the port the service really listens on
 connect_timeout_ms = 5000         # default 5000, clamped to 100..=30000
 ```
 
-- One listener per entry; two entries on the same address are a config error.
+- One listener per entry; two entries on the same address are a config error,
+  and `*:25` counts as the same address as `0.0.0.0:25`.
 - A client that half-closes still gets the upstream's drain — SMTP and IMAP
   both rely on this.
 - Upstream refused or slow → the client is closed and exactly one line is

@@ -5,9 +5,10 @@
 # Plain HTTP requests are automatically redirected (301) to HTTPS.
 
 # Optional. Defaults to 0.0.0.0:80 and 0.0.0.0:443.
+# `*:port` is accepted as shorthand for `0.0.0.0:port`.
 # [listen]
-# http  = "0.0.0.0:80"
-# https = "0.0.0.0:443"
+# http  = "*:80"
+# https = "*:443"
 
 # Optional. Abuse protection, counted per client IP over a 1-second window.
 # Set any of them to 0 to switch that limit off.
@@ -46,3 +47,13 @@ upstream = "127.0.0.1:8080"          # catch-all: every path without its own rou
 # path     = "/mcp"
 # upstream = "127.0.0.1:8081"
 # hosts    = ["www.example.com", "api.example.com"]   # optional
+
+# Optional. Raw TCP forwarding: one listener per entry, no TLS termination
+# (v0.2.0). `listen` accepts `*:port` as shorthand for `0.0.0.0:port`; an
+# `upstream` must name a real peer.
+#
+# [[stream]]
+# name     = "smtp"
+# listen   = "*:25"
+# upstream = "127.0.0.1:10025"
+# connect_timeout_ms = 5000        # optional, default 5000, clamped 100..30000

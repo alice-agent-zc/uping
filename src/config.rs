@@ -32,7 +32,7 @@
 //! # Optional. Raw TCP forwarding, one listener per entry (v0.2.0).
 //! [[stream]]
 //! name     = "smtp"                    # log label, optional
-//! listen   = "0.0.0.0:25"
+//! listen   = "*:25"                    # `*` = every IPv4 interface = 0.0.0.0
 //! upstream = "127.0.0.1:10025"         # the port the service really listens on
 //! connect_timeout_ms = 5000            # default 5000, clamped to 100..30000
 //! ```
@@ -73,6 +73,9 @@ pub struct Config {
 }
 
 /// Where uping binds. Defaults to the standard HTTP/HTTPS ports.
+///
+/// Both fields accept `*:port` as shorthand for `0.0.0.0:port`; the wildcard is
+/// canonicalised at load time.
 #[derive(Debug, Deserialize)]
 pub struct Listen {
     #[serde(default = "default_http")]
@@ -252,7 +255,8 @@ pub struct Stream {
     #[serde(default)]
     pub name: String,
 
-    /// Local address to bind, e.g. `0.0.0.0:25` or `127.0.0.1:8080`.
+    /// Local address to bind, e.g. `0.0.0.0:25`, `*:25` or `127.0.0.1:8080`.
+    /// `*:port` is canonicalised to `0.0.0.0:port` at load time.
     pub listen: String,
 
     /// Where to forward, e.g. `127.0.0.1:10025` — usually a daemon on this
@@ -418,6 +422,11 @@ fn hosts_overlap(a: &Route, b: &Route) -> bool {
 /// refusal at startup: one of the two ports would keep working and the operator
 /// would have no way to know which.
 fn validate_streams(cfg: &mut Config) -> Result<()> {
+    // Canonicalise first, so everything below — conflict checks, the
+    // privileged-port warning, the log line, the actual bind — sees one form.
+    cfg.listen.http = canonical_bind(&cfg.listen.http, "`[listen] http`")?;
+    cfg.listen.https = canonical_bind(&cfg.listen.https, "`[listen] https`")?;
+
     let http = parse_addr(&cfg.listen.http, "`[listen] http`")?;
     let https = parse_addr(&cfg.listen.https, "`[listen] https`")?;
     let http_bound = !cfg.servers.is_empty();
@@ -434,6 +443,8 @@ fn validate_streams(cfg: &mut Config) -> Result<()> {
         if s.upstream.trim().is_empty() {
             anyhow::bail!("{where_} has an empty `upstream`");
         }
+
+        s.listen = canonical_bind(&s.listen, &format!("{where_} `listen`"))?;
 
         let listen = parse_addr(&s.listen, &format!("{where_} `listen`"))?;
         let _ = parse_addr(&s.upstream, &format!("{where_} `upstream`"))?;
@@ -473,6 +484,27 @@ fn parse_addr(raw: &str, what: &str) -> Result<std::net::SocketAddr> {
     raw.trim()
         .parse::<std::net::SocketAddr>()
         .map_err(|e| anyhow::anyhow!("{what} `{}` is not a `IP:port` address: {e}", raw.trim()))
+}
+
+/// Canonical form of a *bind* address: `*:port` means every IPv4 interface.
+///
+/// Only listening addresses may carry the wildcard — an upstream must name a
+/// peer, so `*` there stays an error. The canonical string is written back into
+/// the config, so the value that gets validated, the one the log prints and the
+/// one pingora binds are the same bytes.
+fn canonical_bind(raw: &str, what: &str) -> Result<String> {
+    let raw = raw.trim();
+    let canon = match raw.strip_prefix('*') {
+        Some(rest) if rest.starts_with(':') => format!("0.0.0.0{rest}"),
+        Some(_) => anyhow::bail!(
+            "{what} `{raw}`: a wildcard address is written `*:port`, e.g. `*:25`"
+        ),
+        None => raw.to_string(),
+    };
+    canon
+        .parse::<std::net::SocketAddr>()
+        .map_err(|e| anyhow::anyhow!("{what} `{raw}` is not a `IP:port` address: {e}"))?;
+    Ok(canon)
 }
 
 /// Two listen addresses clash when they name the same port and their IPs can be
@@ -1003,6 +1035,82 @@ upstream = "127.0.0.1:10025"
         assert!(
             err.contains("clashes with [[stream]]"),
             "unexpected error: {err}"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn a_wildcard_stream_listen_is_canonicalised() {
+        let path = write_temp(
+            "stream-star.toml",
+            &format!("{MINIMAL}\n[[stream]]\nlisten = \"*:2525\"\nupstream = \"127.0.0.1:10025\"\n"),
+        );
+        let cfg = Config::load(&path).unwrap();
+
+        assert_eq!(
+            cfg.streams[0].listen, "0.0.0.0:2525",
+            "`*:2525` must reach the binder as `0.0.0.0:2525`"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn a_wildcard_stream_listen_clashes_with_a_loopback_one() {
+        let path = write_temp(
+            "stream-star-clash.toml",
+            &format!(
+                "{MINIMAL}[[stream]]\nlisten = \"*:2525\"\nupstream = \"127.0.0.1:10025\"\n\
+                 \n[[stream]]\nlisten = \"127.0.0.1:2525\"\nupstream = \"127.0.0.1:10026\"\n"
+            ),
+        );
+        let err = Config::load(&path).unwrap_err().to_string();
+
+        assert!(
+            err.contains("clashes with [[stream]]"),
+            "unexpected error: {err}"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn a_wildcard_http_listen_is_canonicalised() {
+        let path = write_temp(
+            "listen-star.toml",
+            &format!("[listen]\nhttp = \"*:8088\"\nhttps = \"127.0.0.1:8443\"\n{MINIMAL}"),
+        );
+        let cfg = Config::load(&path).unwrap();
+
+        assert_eq!(cfg.listen.http, "0.0.0.0:8088");
+        assert_eq!(cfg.listen.https, "127.0.0.1:8443");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn a_wildcard_upstream_is_refused() {
+        let path = write_temp(
+            "upstream-star.toml",
+            &format!("{MINIMAL}[[stream]]\nlisten = \"*:2525\"\nupstream = \"*:10025\"\n"),
+        );
+        let err = Config::load(&path).unwrap_err().to_string();
+
+        assert!(
+            err.contains("is not a `IP:port` address"),
+            "an upstream must name a real peer, got: {err}"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn a_bare_asterisk_says_how_to_write_it() {
+        let path = write_temp(
+            "stream-bare-star.toml",
+            &format!("{MINIMAL}[[stream]]\nlisten = \"*\"\nupstream = \"127.0.0.1:10025\"\n"),
+        );
+        let err = Config::load(&path).unwrap_err().to_string();
+
+        assert!(
+            err.contains("`*:port`"),
+            "the error must show the accepted form, got: {err}"
         );
         let _ = std::fs::remove_file(path);
     }

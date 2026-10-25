@@ -215,3 +215,49 @@ fn a_dead_upstream_releases_the_client_with_one_log_line() {
     let _ = std::fs::remove_file(&cfg_path);
     let _ = std::fs::remove_file(&log);
 }
+
+/// `listen = "*:port"` must bind every interface, and the log must name the
+/// address that was actually bound — the two come from the same string.
+#[test]
+fn a_wildcard_listen_binds_every_interface() {
+    let echo = TcpListener::bind("127.0.0.1:0").unwrap();
+    let echo_addr = echo.local_addr().unwrap();
+    let upstream = echo_with_drain(echo);
+
+    let front = TcpListener::bind("127.0.0.1:0").unwrap();
+    let front_port = front.local_addr().unwrap().port();
+    drop(front);
+
+    let cfg_path = temp_path("wildcard.toml");
+    std::fs::write(
+        &cfg_path,
+        format!(
+            "[[stream]]\nname = \"star\"\nlisten = \"*:{front_port}\"\nupstream = \"{echo_addr}\"\n\
+             connect_timeout_ms = 2000\n"
+        ),
+    )
+    .unwrap();
+    let log = temp_path("wildcard.log");
+
+    let _server = start(&cfg_path, &log);
+
+    let text = wait_for_line(&log, "listening on");
+    let expected = format!("listening on 0.0.0.0:{front_port}");
+    assert!(
+        text.contains(&expected),
+        "the wildcard must be logged as the address bound (`{expected}`):\n{text}"
+    );
+
+    let mut c = client(SocketAddr::from(([127, 0, 0, 1], front_port)));
+    c.write_all(b"wildcard").unwrap();
+    let mut back = [0u8; 8];
+    c.read_exact(&mut back).unwrap();
+    assert_eq!(&back, b"wildcard");
+
+    // Close the client first: the echo thread only returns on EOF.
+    drop(c);
+
+    let _ = std::fs::remove_file(&cfg_path);
+    let _ = std::fs::remove_file(&log);
+    upstream.join().unwrap();
+}
