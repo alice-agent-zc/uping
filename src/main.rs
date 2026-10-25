@@ -166,6 +166,7 @@ mod tests {
             tls: Default::default(),
             servers,
             routes,
+            streams: Vec::new(),
         }
     }
 

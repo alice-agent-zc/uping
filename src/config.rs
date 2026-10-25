@@ -28,6 +28,13 @@
 //! path         = "/assets/"
 //! upstream     = "127.0.0.1:8085"
 //! strip_prefix = true                  # backend sees /app.css, not /assets/app.css
+//!
+//! # Optional. Raw TCP forwarding, one listener per entry (v0.2.0).
+//! [[stream]]
+//! name     = "smtp"                    # log label, optional
+//! listen   = "0.0.0.0:25"
+//! upstream = "127.0.0.1:10025"         # whatever the ssh tunnel publishes
+//! connect_timeout_ms = 5000            # default 5000, clamped to 100..30000
 //! ```
 
 use std::path::Path;
@@ -58,6 +65,11 @@ pub struct Config {
     /// empty `hosts` list serves every `[[server]]`.
     #[serde(rename = "route", default)]
     pub routes: Vec<Route>,
+
+    /// Raw TCP forwarders (`[[stream]]`). Each entry binds one port and pipes
+    /// every byte to `upstream` — no HTTP, no TLS termination.
+    #[serde(rename = "stream", default)]
+    pub streams: Vec<Stream>,
 }
 
 /// Where uping binds. Defaults to the standard HTTP/HTTPS ports.
@@ -229,6 +241,48 @@ impl Route {
     }
 }
 
+/// One raw TCP forwarder (`[[stream]]`).
+///
+/// Bound once at startup and never re-resolved: whatever the client sends is
+/// copied to `upstream` and back, byte for byte. This is what a mail port needs
+/// — the TLS inside the stream belongs to the mail server, not to uping.
+#[derive(Debug, Clone, Deserialize)]
+pub struct Stream {
+    /// Log label. Falls back to the `listen` address when empty.
+    #[serde(default)]
+    pub name: String,
+
+    /// Local address to bind, e.g. `0.0.0.0:25` or `127.0.0.1:8080`.
+    pub listen: String,
+
+    /// Where to forward, e.g. `127.0.0.1:10025` — in production usually a port
+    /// published by `ssh -L`, not a local service.
+    pub upstream: String,
+
+    /// How long to wait for the upstream TCP handshake before giving up.
+    /// Default 5000 ms, clamped to 100..=30000.
+    #[serde(default = "default_connect_timeout_ms")]
+    pub connect_timeout_ms: u64,
+}
+
+pub const MIN_STREAM_TIMEOUT_MS: u64 = 100;
+pub const MAX_STREAM_TIMEOUT_MS: u64 = 30_000;
+
+fn default_connect_timeout_ms() -> u64 {
+    5000
+}
+
+impl Stream {
+    /// The label used in every log line about this forwarder.
+    pub fn label(&self) -> &str {
+        if self.name.trim().is_empty() {
+            self.listen.trim()
+        } else {
+            self.name.trim()
+        }
+    }
+}
+
 impl Config {
     /// The effective route table for one server: its own `[[server.route]]`
     /// first, then every top-level `[[route]]` that applies and whose prefix
@@ -244,16 +298,25 @@ impl Config {
         effective
     }
 
+    /// True when nothing would be served: no domain to terminate TLS for and no
+    /// raw stream to forward. Uping refuses to start in that state.
+    pub fn is_empty(&self) -> bool {
+        self.servers.is_empty() && self.streams.is_empty()
+    }
+
     /// Read and parse a TOML config file.
     pub fn load(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
         let raw = std::fs::read_to_string(path)
             .with_context(|| format!("reading config file `{}`", path.display()))?;
-        let cfg: Config = toml::from_str(&raw)
+        let mut cfg: Config = toml::from_str(&raw)
             .with_context(|| format!("parsing TOML in `{}`", path.display()))?;
 
-        if cfg.servers.is_empty() {
-            anyhow::bail!("no [[server]] entries found in `{}`", path.display());
+        if cfg.is_empty() {
+            anyhow::bail!(
+                "no [[server]] or [[stream]] entries found in `{}`",
+                path.display()
+            );
         }
         for s in &cfg.servers {
             if s.domain.trim().is_empty() {
@@ -272,6 +335,7 @@ impl Config {
         }
         validate_routes(&cfg.routes, "global")?;
         validate_global_hosts(&cfg)?;
+        validate_streams(&mut cfg)?;
         Ok(cfg)
     }
 }
@@ -347,6 +411,75 @@ fn hosts_overlap(a: &Route, b: &Route) -> bool {
                 .iter()
                 .any(|y| x.trim().eq_ignore_ascii_case(y.trim()))
         })
+}
+
+/// Reject `[[stream]]` entries that cannot bind, and refuse two listeners that
+/// would fight over the same socket. A silent second bind is worse than a
+/// refusal at startup: one of the two ports would keep working and the operator
+/// would have no way to know which.
+fn validate_streams(cfg: &mut Config) -> Result<()> {
+    let http = parse_addr(&cfg.listen.http, "`[listen] http`")?;
+    let https = parse_addr(&cfg.listen.https, "`[listen] https`")?;
+    let http_bound = !cfg.servers.is_empty();
+    let https_bound = !cfg.servers.is_empty();
+
+    let mut seen: Vec<(std::net::SocketAddr, String)> = Vec::new();
+
+    for s in &mut cfg.streams {
+        let where_ = format!("[[stream]] `{}`", s.label());
+
+        if s.listen.trim().is_empty() {
+            anyhow::bail!("{where_} has an empty `listen`");
+        }
+        if s.upstream.trim().is_empty() {
+            anyhow::bail!("{where_} has an empty `upstream`");
+        }
+
+        let listen = parse_addr(&s.listen, &format!("{where_} `listen`"))?;
+        let _ = parse_addr(&s.upstream, &format!("{where_} `upstream`"))?;
+
+        if http_bound && addrs_conflict(&listen, &http) {
+            anyhow::bail!(
+                "{where_}: `listen` {} clashes with `[listen] http` {}",
+                s.listen.trim(),
+                cfg.listen.http.trim()
+            );
+        }
+        if https_bound && addrs_conflict(&listen, &https) {
+            anyhow::bail!(
+                "{where_}: `listen` {} clashes with `[listen] https` {}",
+                s.listen.trim(),
+                cfg.listen.https.trim()
+            );
+        }
+        for (other, other_label) in &seen {
+            if addrs_conflict(&listen, other) {
+                anyhow::bail!(
+                    "{where_}: `listen` {} clashes with [[stream]] `{other_label}`",
+                    s.listen.trim()
+                );
+            }
+        }
+        seen.push((listen, s.label().to_string()));
+
+        s.connect_timeout_ms = s
+            .connect_timeout_ms
+            .clamp(MIN_STREAM_TIMEOUT_MS, MAX_STREAM_TIMEOUT_MS);
+    }
+    Ok(())
+}
+
+fn parse_addr(raw: &str, what: &str) -> Result<std::net::SocketAddr> {
+    raw.trim()
+        .parse::<std::net::SocketAddr>()
+        .map_err(|e| anyhow::anyhow!("{what} `{}` is not a `IP:port` address: {e}", raw.trim()))
+}
+
+/// Two listen addresses clash when they name the same port and their IPs can be
+/// the same socket — the same address, or one side unspecified (`0.0.0.0`).
+/// Different concrete IPs on one port are legal and are left alone.
+fn addrs_conflict(a: &std::net::SocketAddr, b: &std::net::SocketAddr) -> bool {
+    a.port() == b.port() && (a.ip() == b.ip() || a.ip().is_unspecified() || b.ip().is_unspecified())
 }
 
 #[cfg(test)]
@@ -470,7 +603,7 @@ upstream = "127.0.0.1:8080"
         let err = Config::load(&path).unwrap_err().to_string();
 
         assert!(
-            err.contains("no [[server]] entries"),
+            err.contains("no [[server]] or [[stream]] entries"),
             "unexpected error: {err}"
         );
         let _ = std::fs::remove_file(path);
@@ -767,6 +900,192 @@ upstream = "127.0.0.1:8090"
             assert_eq!(got.prefix(), own.prefix());
             assert_eq!(got.upstream, own.upstream);
         }
+        let _ = std::fs::remove_file(path);
+    }
+
+    const STREAM: &str = r#"
+[[stream]]
+name     = "smtp"
+listen   = "0.0.0.0:2525"
+upstream = "127.0.0.1:10025"
+"#;
+
+    #[test]
+    fn parses_a_stream_and_defaults_its_timeout() {
+        let path = write_temp("stream.toml", &format!("{MINIMAL}{STREAM}"));
+        let cfg = Config::load(&path).unwrap();
+
+        assert_eq!(cfg.streams.len(), 1);
+        let s = &cfg.streams[0];
+        assert_eq!(s.name, "smtp");
+        assert_eq!(s.listen, "0.0.0.0:2525");
+        assert_eq!(s.upstream, "127.0.0.1:10025");
+        assert_eq!(s.connect_timeout_ms, 5000);
+        assert_eq!(s.label(), "smtp");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn a_stream_only_config_is_accepted() {
+        // No TLS to terminate, nothing to redirect: a pure pipe is a valid uping.
+        let path = write_temp("stream-only.toml", STREAM);
+        let cfg = Config::load(&path).unwrap();
+
+        assert!(cfg.servers.is_empty());
+        assert_eq!(cfg.streams.len(), 1);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn a_stream_without_a_name_labels_itself_by_listen_address() {
+        let path = write_temp(
+            "stream-noname.toml",
+            "[[stream]]\nlisten = \"127.0.0.1:2526\"\nupstream = \"127.0.0.1:10026\"\n",
+        );
+        let cfg = Config::load(&path).unwrap();
+
+        assert_eq!(cfg.streams[0].name, "");
+        assert_eq!(cfg.streams[0].label(), "127.0.0.1:2526");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn a_stream_connect_timeout_is_clamped_from_below() {
+        let path = write_temp(
+            "stream-clamp-low.toml",
+            &format!("{STREAM}connect_timeout_ms = 5\n"),
+        );
+        let cfg = Config::load(&path).unwrap();
+
+        assert_eq!(cfg.streams[0].connect_timeout_ms, MIN_STREAM_TIMEOUT_MS);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn a_stream_connect_timeout_is_clamped_from_above() {
+        let path = write_temp(
+            "stream-clamp-high.toml",
+            &format!("{STREAM}connect_timeout_ms = 999999\n"),
+        );
+        let cfg = Config::load(&path).unwrap();
+
+        assert_eq!(cfg.streams[0].connect_timeout_ms, MAX_STREAM_TIMEOUT_MS);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn rejects_two_streams_on_the_same_socket() {
+        let path = write_temp(
+            "stream-dup.toml",
+            &format!(
+                "{MINIMAL}{STREAM}\n[[stream]]\nlisten = \"0.0.0.0:2525\"\nupstream = \"127.0.0.1:10026\"\n"
+            ),
+        );
+        let err = Config::load(&path).unwrap_err().to_string();
+
+        assert!(
+            err.contains("clashes with [[stream]]"),
+            "unexpected error: {err}"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn a_wildcard_stream_listener_clashes_with_a_specific_one() {
+        let path = write_temp(
+            "stream-wildcard.toml",
+            &format!(
+                "{MINIMAL}{STREAM}\n[[stream]]\nlisten = \"127.0.0.1:2525\"\nupstream = \"127.0.0.1:10026\"\n"
+            ),
+        );
+        let err = Config::load(&path).unwrap_err().to_string();
+
+        assert!(
+            err.contains("clashes with [[stream]]"),
+            "unexpected error: {err}"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn two_concrete_ips_on_one_port_do_not_clash() {
+        let path = write_temp(
+            "stream-two-ips.toml",
+            &format!(
+                "{MINIMAL}{STREAM}\n[[stream]]\nlisten = \"127.0.0.1:2525\"\nupstream = \"127.0.0.1:10026\"\n"
+            )
+            .replace("0.0.0.0:2525", "127.0.0.2:2525"),
+        );
+        let cfg = Config::load(&path).unwrap();
+
+        assert_eq!(cfg.streams.len(), 2);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn a_stream_may_not_steal_a_listened_http_port() {
+        let path = write_temp(
+            "stream-vs-https.toml",
+            &format!(
+                "{MINIMAL}[[stream]]\nlisten = \"0.0.0.0:443\"\nupstream = \"127.0.0.1:10025\"\n"
+            ),
+        );
+        let err = Config::load(&path).unwrap_err().to_string();
+
+        assert!(err.contains("`[listen] https`"), "unexpected error: {err}");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn a_stream_only_config_may_use_the_default_http_ports() {
+        // Nothing is listening on :80/:443 without a [[server]], so a pipe on
+        // one of them is not a clash. The runtime skips those listeners too.
+        let path = write_temp(
+            "stream-on-443.toml",
+            "[[stream]]\nlisten = \"127.0.0.1:443\"\nupstream = \"127.0.0.1:10025\"\n",
+        );
+        let cfg = Config::load(&path).unwrap();
+
+        assert_eq!(cfg.streams.len(), 1);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn rejects_a_stream_listen_that_is_not_an_address() {
+        let path = write_temp(
+            "stream-badaddr.toml",
+            &format!("{MINIMAL}[[stream]]\nlisten = \"smtp\"\nupstream = \"127.0.0.1:10025\"\n"),
+        );
+        let err = Config::load(&path).unwrap_err().to_string();
+
+        assert!(
+            err.contains("is not a `IP:port` address"),
+            "unexpected error: {err}"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn rejects_a_stream_with_an_empty_upstream() {
+        let path = write_temp(
+            "stream-emptyup.toml",
+            &format!("{MINIMAL}[[stream]]\nlisten = \"127.0.0.1:2525\"\nupstream = \"  \"\n"),
+        );
+        let err = Config::load(&path).unwrap_err().to_string();
+
+        assert!(err.contains("empty `upstream`"), "unexpected error: {err}");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn rejects_a_config_with_neither_server_nor_stream() {
+        let path = write_temp("nothing.toml", "[limits]\nper_ip_rps = 1\n");
+        let err = Config::load(&path).unwrap_err().to_string();
+
+        assert!(
+            err.contains("no [[server]] or [[stream]] entries"),
+            "unexpected error: {err}"
+        );
         let _ = std::fs::remove_file(path);
     }
 }
