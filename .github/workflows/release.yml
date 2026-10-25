@@ -1,0 +1,114 @@
+name: release
+
+# A tag is the only thing that publishes, so the asset a user's `curl | sh`
+# gets is always the code the tag names. `workflow_dispatch` rebuilds an
+# existing tag in place — that is the repair path for a runner or toolchain
+# problem, and it is deliberate: it can replace a published asset.
+#
+# Asset layout is a contract with deploy/install.sh:
+#   uping-<target>.tar.gz         contains uping + config.toml.example
+#   uping-<target>.tar.gz.sha256  bare "<hash>  <file>" from sha256sum
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to publish (e.g. v0.1.2)"
+        required: true
+
+permissions:
+  contents: write
+
+env:
+  TARGET: x86_64-unknown-linux-gnu
+
+jobs:
+  release:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+          fetch-depth: 0
+
+      - name: tag
+        id: tag
+        run: echo "name=${{ inputs.tag || github.ref_name }}" >> "$GITHUB_OUTPUT"
+
+      # pingora builds zlib-ng through cmake, and the openssl backend needs the
+      # headers; neither is on a bare runner.
+      - name: build deps
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends \
+            cmake pkg-config libssl-dev
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ env.TARGET }}
+
+      - name: build
+        run: cargo build --release --locked --target "$TARGET"
+
+      # An ELF that links but does not reach main is not a release. uping has no
+      # --help, so the cheapest proof it executes is the config error it must
+      # print for a path that does not exist.
+      - name: the binary runs
+        run: |
+          out=$(./target/"$TARGET"/release/uping /nonexistent.toml 2>&1 || true)
+          printf '%s\n' "$out"
+          case $out in
+            *"loading configuration"*) ;;
+            *) echo "the binary did not reach config loading" >&2; exit 1 ;;
+          esac
+
+      - name: package
+        run: |
+          mkdir -p dist
+          cp target/"$TARGET"/release/uping dist/uping
+          strip dist/uping
+          cp config.toml dist/config.toml.example
+          tar -C dist -czf "uping-$TARGET.tar.gz" uping config.toml.example
+          ( cd dist && sha256sum "uping-$TARGET.tar.gz" > "../uping-$TARGET.tar.gz.sha256" )
+          ls -l uping-"$TARGET".tar.gz*
+          cat uping-"$TARGET".tar.gz.sha256
+
+      - name: installer is valid shell
+        run: sh -n deploy/install.sh
+
+      # The refusals too, not just a download: a tampered checksum, a missing
+      # checksum, a non-ELF payload. Runs before publish, so a broken installer
+      # cannot ship beside a good binary.
+      - name: installer test, no root, file:// mirror
+        run: sh deploy/install-test.sh target/"$TARGET"/release/uping
+
+      - name: publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.tag.outputs.name }}
+        run: |
+          gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 \
+            || gh release create "$TAG" --repo "$GITHUB_REPOSITORY" \
+                 --title "uping $TAG" --generate-notes
+          gh release upload "$TAG" --repo "$GITHUB_REPOSITORY" --clobber \
+            uping-"$TARGET".tar.gz uping-"$TARGET".tar.gz.sha256
+
+      # The point of the whole exercise: the published asset, fetched and
+      # checksum-verified by the published installer, with no local build in
+      # reach. Pinned to the tag so a stale `latest` cannot mask a broken upload.
+      - name: the installer can fetch it
+        env:
+          TAG: ${{ steps.tag.outputs.name }}
+        run: |
+          fetched=""
+          for i in 1 2 3 4 5; do
+            if sh deploy/install.sh --version "$TAG" --fetch-only "$RUNNER_TEMP/fetch"; then
+              fetched=1
+              break
+            fi
+            echo "attempt $i failed, retrying in 10s" >&2
+            sleep 10
+          done
+          [ -n "$fetched" ] || { echo "the published asset never downloaded" >&2; exit 1; }
+          "$RUNNER_TEMP/fetch/uping" /nonexistent.toml 2>&1 | grep -q "loading configuration"
