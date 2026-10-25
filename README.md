@@ -10,7 +10,7 @@ automatically redirected to HTTPS, and clients that misbehave are capped.
 
 - ✅ Reverse proxy: `domain` → `upstream` over HTTPS (TLS termination)
 - ✅ **Raw TCP forwarding** (`[[stream]]`): one port in, one upstream out —
-  for mail or database ports reached through an ssh tunnel
+  for mail, database and other ports that are not HTTP
 - ✅ **Automatic HTTP → HTTPS redirect** (301)
 - ✅ TLS with **SNI**: one listener, one cert per domain
 - ✅ **Abuse protection**: per-IP connection rate (TCP level), per-IP request
@@ -106,15 +106,14 @@ top-level one; a `hosts` entry naming no configured domain is a startup error.
 
 HTTPS is not the only thing worth proxying. `[[stream]]` binds a port and copies
 every byte to one upstream — SMTP, IMAP, MySQL, anything that is not HTTP. The
-usual reason to want it: the service lives on another machine and `ssh -L`
-already publishes it on loopback, so `[[stream]]` makes that tunnel reachable
-from the outside without a second firewall hole.
+usual reason to want it: the service already listens on a loopback port, and it
+should be reachable from outside without a second firewall hole.
 
 ```toml
 [[stream]]
 name     = "smtp"                 # log label, optional, falls back to `listen`
 listen   = "0.0.0.0:25"
-upstream = "127.0.0.1:10025"      # whatever the ssh tunnel publishes
+upstream = "127.0.0.1:10025"      # the port the service really listens on
 connect_timeout_ms = 5000         # default 5000, clamped to 100..=30000
 ```
 
@@ -125,7 +124,7 @@ connect_timeout_ms = 5000         # default 5000, clamped to 100..=30000
   logged. No retry, no hang past `connect_timeout_ms`.
 - **No idle timeout**, on purpose: IMAP IDLE and idle database sessions are long
   by design.
-- `[[stream]]` does not read TLS. Terminate it in the upstream, or tunnel it.
+- `[[stream]]` does not read TLS. Terminate it in the upstream.
 
 ## Abuse protection
 

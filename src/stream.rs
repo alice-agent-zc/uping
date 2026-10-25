@@ -5,8 +5,8 @@
 //! or JMAP port needs: the TLS inside the stream belongs to the mail server, and
 //! an IMAP IDLE session is legitimately silent for half an hour.
 //!
-//! Uping does **not** own the tunnel that publishes these upstreams. If it is
-//! down, the only duty here is to fail fast, say so once, and release the client
+//! Uping does **not** own the service behind these upstreams. If it is down,
+//! the only duty here is to fail fast, say so once, and release the client
 //! — the process stays up and every other listener keeps working.
 
 use std::sync::Arc;

@@ -105,8 +105,8 @@ fn main() -> Result<()> {
     }
 
     // --- Raw TCP streams ---
-    // One listener per [[stream]]. The upstream is usually a port published by
-    // the ssh tunnel, which systemd owns; uping neither starts nor watches it.
+    // One listener per [[stream]]. The upstream is whatever holds the port on
+    // loopback; uping neither starts nor watches it.
     for s in &cfg.streams {
         let forwarder = StreamForwarder::new(s);
         info!(

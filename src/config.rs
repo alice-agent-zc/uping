@@ -33,7 +33,7 @@
 //! [[stream]]
 //! name     = "smtp"                    # log label, optional
 //! listen   = "0.0.0.0:25"
-//! upstream = "127.0.0.1:10025"         # whatever the ssh tunnel publishes
+//! upstream = "127.0.0.1:10025"         # the port the service really listens on
 //! connect_timeout_ms = 5000            # default 5000, clamped to 100..30000
 //! ```
 
@@ -255,8 +255,8 @@ pub struct Stream {
     /// Local address to bind, e.g. `0.0.0.0:25` or `127.0.0.1:8080`.
     pub listen: String,
 
-    /// Where to forward, e.g. `127.0.0.1:10025` — in production usually a port
-    /// published by `ssh -L`, not a local service.
+    /// Where to forward, e.g. `127.0.0.1:10025` — usually a daemon on this
+    /// host's loopback, not a service uping knows anything about.
     pub upstream: String,
 
     /// How long to wait for the upstream TCP handshake before giving up.
