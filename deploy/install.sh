@@ -362,7 +362,7 @@ if [ -n "${EXAMPLE_CONF:-}" ] && [ -r "$EXAMPLE_CONF" ]; then
     ok "example config at $CONF.example"
 fi
 
-# --- 4. the unit and the certbot hook --------------------------------------------
+# --- 4. the unit -----------------------------------------------------------------
 step "unit"
 tmp_unit=$(mktemp)
 cat > "$tmp_unit" <<'UNIT'
@@ -445,6 +445,7 @@ if command -v systemd-analyze >/dev/null 2>&1; then
     fi
 fi
 
+# --- 5. the certbot hook ----------------------------------------------------------
 step "certificate hook"
 install -d -o root -g root -m 0755 "$HOOK_DIR"
 tmp_hook=$(mktemp)
@@ -490,7 +491,7 @@ else
     info "no $(dirname "$HOOK_LINK") (certbot absent?): run $HOOK by hand after a renewal"
 fi
 
-# --- 5. start --------------------------------------------------------------------
+# --- 6. start --------------------------------------------------------------------
 if [ "$DO_START" = 1 ]; then
     step "service"
     systemctl daemon-reload
@@ -509,7 +510,7 @@ if [ "$DO_START" = 1 ]; then
     fi
 fi
 
-# --- 6. prove it -----------------------------------------------------------------
+# --- 7. prove it -----------------------------------------------------------------
 step "check"
 verify || true
 

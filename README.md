@@ -6,9 +6,11 @@ overkill. Built on Cloudflare's [Pingora](https://github.com/cloudflare/pingora)
 Point a domain at a local service, hand it a cert, done. Plain HTTP is
 automatically redirected to HTTPS, and clients that misbehave are capped.
 
-## Status — v0.1.1
+## Status — v0.2.0
 
 - ✅ Reverse proxy: `domain` → `upstream` over HTTPS (TLS termination)
+- ✅ **Raw TCP forwarding** (`[[stream]]`): one port in, one upstream out —
+  for mail, database and other ports that are not HTTP
 - ✅ **Automatic HTTP → HTTPS redirect** (301)
 - ✅ TLS with **SNI**: one listener, one cert per domain
 - ✅ **Abuse protection**: per-IP connection rate (TCP level), per-IP request
@@ -18,6 +20,13 @@ automatically redirected to HTTPS, and clients that misbehave are capped.
 
 Deliberately *not* here (candidates for later): ACME/Let's Encrypt, config
 hot-reload, load balancing, health checks.
+
+### What changed in v0.2.0
+
+- **`[[stream]]`: raw TCP forwarding.** A second listener type that pipes bytes
+  to one upstream, no HTTP parsing involved. See below.
+- Two `[[stream]]` entries on the same listener address are refused at config
+  load, before anything binds.
 
 ### What changed in v0.1.1
 
@@ -92,6 +101,30 @@ hosts    = ["www.example.com", "api.example.com"]   # omit for all domains
 
 On an identical prefix the domain's own `[[server.route]]` wins over a
 top-level one; a `hosts` entry naming no configured domain is a startup error.
+
+## Raw TCP forwarding
+
+HTTPS is not the only thing worth proxying. `[[stream]]` binds a port and copies
+every byte to one upstream — SMTP, IMAP, MySQL, anything that is not HTTP. The
+usual reason to want it: the service already listens on a loopback port, and it
+should be reachable from outside without a second firewall hole.
+
+```toml
+[[stream]]
+name     = "smtp"                 # log label, optional, falls back to `listen`
+listen   = "0.0.0.0:25"
+upstream = "127.0.0.1:10025"      # the port the service really listens on
+connect_timeout_ms = 5000         # default 5000, clamped to 100..=30000
+```
+
+- One listener per entry; two entries on the same address are a config error.
+- A client that half-closes still gets the upstream's drain — SMTP and IMAP
+  both rely on this.
+- Upstream refused or slow → the client is closed and exactly one line is
+  logged. No retry, no hang past `connect_timeout_ms`.
+- **No idle timeout**, on purpose: IMAP IDLE and idle database sessions are long
+  by design.
+- `[[stream]]` does not read TLS. Terminate it in the upstream.
 
 ## Abuse protection
 
@@ -177,7 +210,7 @@ deployment step by step, and how to try uping out without root.
 
 - Certificates are loaded **once at startup**. Restart to pick up new certs.
 - Upstream connections are plain HTTP. A per-server `upstream_tls` toggle is a
-  natural v0.2 addition.
+  natural v0.3 addition.
 
 ## License
 
