@@ -38,12 +38,6 @@ HOOK_DIR=/usr/local/lib/uping
 HOOK=$HOOK_DIR/install-cert.sh
 HOOK_LINK=/etc/letsencrypt/renewal-hooks/deploy/uping-cert.sh
 USER_NAME=uping
-# The tunnel is systemd's, not uping's: an ssh child that publishes the remote
-# mail host on loopback. uping only ever dials 127.0.0.1.
-TUNNEL_UNIT=/etc/systemd/system/uping-tunnel.service
-TUNNEL_CONF=$CONF_DIR/tunnel.ssh_config
-TUNNEL_EXAMPLE=$TUNNEL_CONF.example
-TUNNEL_KEY=$CONF_DIR/tunnel_ed25519
 
 # Where release assets come from. The layout is fixed by
 # .github/workflows/release.yml: <base>/{latest/download,download/<tag>}/<file>.
@@ -375,11 +369,8 @@ cat > "$tmp_unit" <<'UNIT'
 [Unit]
 Description=uping reverse proxy
 Documentation=https://github.com/raonagos/uping
-# The tunnel that publishes the remote mail host on loopback is ordered before
-# the proxy, and only Wanted: a down tunnel must never stop uping from serving
-# its own routes. Never Requires= here.
-After=network-online.target uping-tunnel.service
-Wants=network-online.target uping-tunnel.service
+After=network-online.target
+Wants=network-online.target
 
 [Service]
 Type=simple
@@ -454,150 +445,7 @@ if command -v systemd-analyze >/dev/null 2>&1; then
     fi
 fi
 
-# --- 5. the tunnel (installed disabled) ------------------------------------------
-step "tunnel (installed disabled)"
-# Every byte uping forwards to the remote mail host crosses this tunnel, so the
-# tunnel is part of the deployment. It is still not uping's code: one ssh child,
-# one systemd unit, installed disabled and inert. Two things are deliberately
-# missing, because guessing them is worse than leaving them absent: the remote
-# address, and the key. A guessed address in a unit that holds mail ports is a
-# configuration that silently forwards to somebody else's host.
-tmp_tunnel_conf=$(mktemp)
-cat > "$tmp_tunnel_conf" <<'TUNNEL_CONF'
-# tunnel.ssh_config.example — the ssh client config that publishes the remote
-# mail host on 127.0.0.1. Installed by deploy/install.sh, disabled and unused.
-#
-# The remote address is the operator's, not the installer's: that is why this
-# file is an example. To go live, as root:
-#
-#   cp /etc/uping/tunnel.ssh_config.example /etc/uping/tunnel.ssh_config
-#   chown root:uping /etc/uping/tunnel.ssh_config && chmod 0640 /etc/uping/tunnel.ssh_config
-#   # fill in HostName and User, then uncomment one LocalForward per port
-#   systemctl enable --now uping-tunnel
-#
-# The alias must stay `uping-tunnel`: it is what uping-tunnel.service execs.
-
-Host uping-tunnel
-    # Not invented here on purpose. CHANGE-ME.invalid cannot resolve, so a
-    # forgotten edit fails loudly instead of tunnelling to a wrong host.
-    HostName CHANGE-ME.invalid
-    User CHANGE-ME
-
-    IdentityFile /etc/uping/tunnel_ed25519
-    IdentitiesOnly yes
-    BatchMode yes
-
-    # A forward that fails half-way is worse than a tunnel that does not start.
-    ExitOnForwardFailure yes
-
-    # Half-open TCP is the normal failure here; ssh must notice and exit so
-    # systemd restarts it.
-    ServerAliveInterval 15
-    ServerAliveCountMax 3
-    TCPKeepAlive yes
-
-    # Pin the host key. The tunnel carries mail, so an unverified host is not
-    # acceptable; seed this file once with `ssh-keyscan -H <host>` as root.
-    UserKnownHostsFile /etc/uping/tunnel_known_hosts
-    StrictHostKeyChecking yes
-
-    # One per port, loopback on BOTH ends: the ssh side must never publish a
-    # port of its own. The live list is a routing decision (80/443/25/143/587/
-    # 993/465 …) and belongs to the operator, so these stay commented. The
-    # middle port is what uping dials in config.toml as 127.0.0.1:<lport>.
-    #LocalForward 127.0.0.1:10025 127.0.0.1:25
-    #LocalForward 127.0.0.1:10143 127.0.0.1:143
-    #LocalForward 127.0.0.1:10587 127.0.0.1:587
-    #LocalForward 127.0.0.1:10993 127.0.0.1:993
-    #LocalForward 127.0.0.1:10465 127.0.0.1:465
-TUNNEL_CONF
-install -o root -g "$USER_NAME" -m 0640 "$tmp_tunnel_conf" "$TUNNEL_EXAMPLE"
-rm -f "$tmp_tunnel_conf"
-ok "example tunnel config at $TUNNEL_EXAMPLE"
-
-tmp_tunnel_unit=$(mktemp)
-cat > "$tmp_tunnel_unit" <<'TUNNEL_UNIT'
-[Unit]
-Description=uping tunnel to the remote mail host
-Documentation=https://github.com/raonagos/uping
-After=network-online.target
-Wants=network-online.target
-# Nothing to do until the operator has written the address and the key. A failed
-# condition skips the unit; uping still starts, because it only Wants this.
-ConditionPathExists=/etc/uping/tunnel.ssh_config
-ConditionPathExists=/etc/uping/tunnel_ed25519
-
-[Service]
-Type=simple
-User=uping
-Group=uping
-ExecStart=/usr/bin/ssh -F /etc/uping/tunnel.ssh_config uping-tunnel
-
-# always, not on-failure: ssh exits 0 when the far end closes the session, and
-# a tunnel that is gone is still a tunnel that must come back.
-Restart=always
-RestartSec=5
-KillSignal=SIGTERM
-TimeoutStopSec=10
-
-# ssh needs nothing but its config, its key and a socket.
-NoNewPrivileges=yes
-ProtectSystem=strict
-ProtectHome=yes
-PrivateTmp=yes
-PrivateDevices=yes
-ProtectKernelTunables=yes
-ProtectKernelModules=yes
-ProtectControlGroups=yes
-ProtectClock=yes
-RestrictSUIDSGID=yes
-RestrictNamespaces=yes
-LockPersonality=yes
-RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
-ReadOnlyPaths=/etc/uping
-
-StandardOutput=journal
-StandardError=journal
-SyslogIdentifier=uping-tunnel
-
-[Install]
-WantedBy=multi-user.target
-TUNNEL_UNIT
-
-if [ -r "$TUNNEL_UNIT" ] && ! cmp -s "$tmp_tunnel_unit" "$TUNNEL_UNIT"; then
-    bak="$TUNNEL_UNIT.bak.$(date +%Y%m%d%H%M%S)"
-    cp -p "$TUNNEL_UNIT" "$bak"
-    info "the previous tunnel unit is saved as $bak"
-fi
-install -o root -g root -m 0644 "$tmp_tunnel_unit" "$TUNNEL_UNIT"
-rm -f "$tmp_tunnel_unit"
-ok "installed $TUNNEL_UNIT (disabled: not enabled, not started)"
-if command -v systemd-analyze >/dev/null 2>&1; then
-    out=$(systemd-analyze verify "$TUNNEL_UNIT" 2>&1 || true)
-    if [ -n "$out" ]; then
-        printf '%s\n' "$out"
-        bad "systemd-analyze has something to say about $TUNNEL_UNIT (above)"
-    else
-        ok "systemd-analyze verify"
-    fi
-fi
-
-# The key and the address are printed, never generated: this installer has no
-# business making a private key or dialling a host it was not told about.
-if [ -r "$TUNNEL_KEY" ]; then
-    info "key present: $TUNNEL_KEY"
-else
-    info "no key at $TUNNEL_KEY — the tunnel stays down until it exists. As root:"
-    info "  ssh-keygen -t ed25519 -N '' -C uping-tunnel -f $TUNNEL_KEY"
-    info "  chown $USER_NAME:$USER_NAME $TUNNEL_KEY $TUNNEL_KEY.pub && chmod 0600 $TUNNEL_KEY"
-    info "  ssh-copy-id -i $TUNNEL_KEY.pub <user>@<host>   # or append the .pub to that account's authorized_keys"
-    info "  ssh-keyscan -H <host> > $CONF_DIR/tunnel_known_hosts"
-    info "  cp $TUNNEL_EXAMPLE $TUNNEL_CONF && chown root:$USER_NAME $TUNNEL_CONF && chmod 0640 $TUNNEL_CONF"
-    info "  # then set HostName/User and one LocalForward per port in $TUNNEL_CONF"
-    info "  systemctl enable --now uping-tunnel"
-fi
-
-# --- 6. the certbot hook ----------------------------------------------------------
+# --- 5. the certbot hook ----------------------------------------------------------
 step "certificate hook"
 install -d -o root -g root -m 0755 "$HOOK_DIR"
 tmp_hook=$(mktemp)
@@ -643,7 +491,7 @@ else
     info "no $(dirname "$HOOK_LINK") (certbot absent?): run $HOOK by hand after a renewal"
 fi
 
-# --- 7. start --------------------------------------------------------------------
+# --- 6. start --------------------------------------------------------------------
 if [ "$DO_START" = 1 ]; then
     step "service"
     systemctl daemon-reload
@@ -662,7 +510,7 @@ if [ "$DO_START" = 1 ]; then
     fi
 fi
 
-# --- 8. prove it -----------------------------------------------------------------
+# --- 7. prove it -----------------------------------------------------------------
 step "check"
 verify || true
 
