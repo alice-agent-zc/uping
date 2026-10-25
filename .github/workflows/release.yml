@@ -1,5 +1,10 @@
 name: release
 
+# A release is identified by its tag, so the run is named for the tag rather
+# than for whatever commit subject happened to be merged. `github.event.inputs`
+# is the form that stays empty instead of erroring when no dispatch ran.
+run-name: release ${{ github.event.inputs.tag || github.ref_name }}
+
 # A tag is the only thing that publishes, so the asset a user's `curl | sh`
 # gets is always the code the tag names. `workflow_dispatch` rebuilds an
 # existing tag in place — that is the repair path for a runner or toolchain
