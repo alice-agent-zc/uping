@@ -484,11 +484,24 @@ rm -f "$tmp_hook"
 ok "installed $HOOK"
 # certbot runs everything in renewal-hooks/deploy after a renewal: a drop-in
 # there survives renewals started by the timer, which --deploy-hook does not.
-if [ -d "$(dirname "$HOOK_LINK")" ]; then
-    ln -sfn "$HOOK" "$HOOK_LINK"
-    ok "linked into $(dirname "$HOOK_LINK")"
-else
-    info "no $(dirname "$HOOK_LINK") (certbot absent?): run $HOOK by hand after a renewal"
+# The directory is created, not probed: certbot makes it only when it first
+# runs, so "missing" says nothing about whether certbot is installed — the
+# old check told operators with certbot 2.x that certbot was absent.
+link_dir=$(dirname "$HOOK_LINK")
+install -d -o root -g root -m 0755 "$link_dir"
+ln -sfn "$HOOK" "$HOOK_LINK"
+ok "linked into $link_dir"
+command -v certbot >/dev/null 2>&1 ||
+    info "certbot not on PATH: the link is in place and fires on the first renewal once it is"
+
+# A certificate issued before this hook existed is not picked up by the next
+# renewal alone — publish what is already on disk so the install converges now.
+if [ -d /etc/letsencrypt/live ]; then
+    for lineage in /etc/letsencrypt/live/*/; do
+        [ -f "$lineage/fullchain.pem" ] || continue
+        RENEWED_LINEAGE=${lineage%/} "$HOOK" || bad "hook failed for ${lineage%/}"
+        ok "published $(basename "$lineage")"
+    done
 fi
 
 # --- 6. start --------------------------------------------------------------------
