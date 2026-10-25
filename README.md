@@ -140,27 +140,34 @@ So a backend that needs to know the request arrived over HTTPS can read
 
 ## Running it
 
-uping is distributed as source. It wants a certificate + key per domain, and
-the right to bind `:80` and `:443` — one capability, `CAP_NET_BIND_SERVICE`,
-**not** root:
+uping is distributed as a release binary and as source. It wants a certificate +
+key per domain, and the right to bind `:80` and `:443` — one capability,
+`CAP_NET_BIND_SERVICE`, **not** root.
 
-```sh
-cargo build --release
-./target/release/uping config.toml      # try it on high ports: test.config.toml
-```
-
-As a service it runs as a dedicated `uping` user. One script installs it and
+The installer downloads the latest release, verifies the sha256 published beside
+it, installs it as a systemd service running as a dedicated `uping` user, and
 then proves the result:
 
 ```sh
 curl --proto '=https' --tlsv1.2 -sSf \
   https://raw.githubusercontent.com/raonagos/uping/main/deploy/install.sh \
-  | sudo sh -s -- --binary ./uping --config ./config.toml
+  | sudo sh -s -- --config ./config.toml
 ```
 
-It embeds the unit and the certbot hook, keeps an existing `/etc/uping/config.toml`,
-and ends by naming anything that still needs root. `--verify-only` re-runs just
-the checks.
+`--version v0.1.2` pins a tag instead of taking the latest release, and
+`--binary ./uping` installs a local build offline. A release with no published
+checksum is refused rather than installed. The script embeds the unit and the
+certbot hook, keeps an existing `/etc/uping/config.toml`, and ends by naming
+anything that still needs root; `--verify-only` re-runs just those checks.
+`--fetch-only DIR` does nothing but download and verify — no root — which is how
+CI checks that a published release is actually installable.
+
+To build it yourself:
+
+```sh
+cargo build --release
+./target/release/uping config.toml      # try it on high ports: test.config.toml
+```
 
 Building has a few prerequisites that are not part of a default Rust install —
 CMake in particular. **[CONTRIBUTING.md](CONTRIBUTING.md)** covers those, the
