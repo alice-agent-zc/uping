@@ -17,6 +17,8 @@ async-trait = "0.1"
 bytes = "1"
 log = "0.4"
 env_logger = "0.11"
+# Already in the tree through pingora; named here for the [[stream]] forwarder.
+tokio = { version = "1", features = ["io-util", "net", "time", "rt", "macros"] }
 
 [dev-dependencies]
 # The TLS tests mint a throwaway self-signed certificate at run time.

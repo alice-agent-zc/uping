@@ -6,6 +6,7 @@
 mod config;
 mod limits;
 mod proxy;
+mod stream;
 mod tls;
 
 use std::collections::HashMap;
@@ -17,10 +18,12 @@ use pingora::listeners::tls::TlsSettings;
 use pingora::listeners::ConnectionFilter;
 use pingora::proxy::http_proxy_service;
 use pingora::server::Server;
+use pingora::services::listening::Service;
 
 use crate::config::Config;
 use crate::limits::{ConnLimiter, RequestLimiter};
 use crate::proxy::{HttpsProxy, PathRoute, RedirectProxy, RouteTable, SiteRoutes};
+use crate::stream::StreamForwarder;
 use crate::tls::SniResolver;
 
 /// Build the `domain -> routes` table, lowercasing domains so that
@@ -59,43 +62,63 @@ fn main() -> Result<()> {
         cfg.servers.len()
     );
 
-    // Pre-load all cert/key pairs for SNI selection.
-    let resolver = SniResolver::from_servers(&cfg.servers, cfg.tls.fallback_cert)
-        .context("loading TLS certificates")?;
-
     let mut server = Server::new(None).context("creating Pingora server")?;
     server.bootstrap();
 
-    // Shared between the :80 and :443 listeners, so one client cannot use two
-    // ports to get two connection budgets.
-    let conn_filter: Arc<dyn ConnectionFilter> =
-        Arc::new(ConnLimiter::new(cfg.limits.per_ip_conns_per_sec));
+    if cfg.servers.is_empty() {
+        info!("no [[server]] entries: HTTP and HTTPS listeners are not started");
+    } else {
+        // Pre-load all cert/key pairs for SNI selection.
+        let resolver = SniResolver::from_servers(&cfg.servers, cfg.tls.fallback_cert)
+            .context("loading TLS certificates")?;
 
-    // --- HTTPS (TLS termination + reverse proxy) ---
-    let mut https_service = http_proxy_service(
-        &server.configuration,
-        HttpsProxy::new(
-            routes,
-            RequestLimiter::new(cfg.limits.per_ip_rps),
-            cfg.limits.max_body_bytes,
-        ),
-    );
-    https_service.set_connection_filter(conn_filter.clone());
-    let tls_settings =
-        TlsSettings::with_callbacks(Box::new(resolver)).context("building TLS settings")?;
-    https_service.add_tls_with_settings(&cfg.listen.https, None, tls_settings);
-    server.add_service(https_service);
-    info!("HTTPS listening on {}", cfg.listen.https);
+        // Shared between the :80 and :443 listeners, so one client cannot use two
+        // ports to get two connection budgets.
+        let conn_filter: Arc<dyn ConnectionFilter> =
+            Arc::new(ConnLimiter::new(cfg.limits.per_ip_conns_per_sec));
 
-    // --- HTTP (redirect to HTTPS) ---
-    let mut http_service = http_proxy_service(&server.configuration, RedirectProxy);
-    http_service.set_connection_filter(conn_filter);
-    http_service.add_tcp(&cfg.listen.http);
-    server.add_service(http_service);
-    info!(
-        "HTTP listening on {} (redirecting to HTTPS)",
-        cfg.listen.http
-    );
+        // --- HTTPS (TLS termination + reverse proxy) ---
+        let mut https_service = http_proxy_service(
+            &server.configuration,
+            HttpsProxy::new(
+                routes,
+                RequestLimiter::new(cfg.limits.per_ip_rps),
+                cfg.limits.max_body_bytes,
+            ),
+        );
+        https_service.set_connection_filter(conn_filter.clone());
+        let tls_settings =
+            TlsSettings::with_callbacks(Box::new(resolver)).context("building TLS settings")?;
+        https_service.add_tls_with_settings(&cfg.listen.https, None, tls_settings);
+        server.add_service(https_service);
+        info!("HTTPS listening on {}", cfg.listen.https);
+
+        // --- HTTP (redirect to HTTPS) ---
+        let mut http_service = http_proxy_service(&server.configuration, RedirectProxy);
+        http_service.set_connection_filter(conn_filter);
+        http_service.add_tcp(&cfg.listen.http);
+        server.add_service(http_service);
+        info!(
+            "HTTP listening on {} (redirecting to HTTPS)",
+            cfg.listen.http
+        );
+    }
+
+    // --- Raw TCP streams ---
+    // One listener per [[stream]]. The upstream is usually a port published by
+    // the ssh tunnel, which systemd owns; uping neither starts nor watches it.
+    for s in &cfg.streams {
+        let forwarder = StreamForwarder::new(s);
+        info!(
+            "stream {} listening on {} -> {}",
+            forwarder.label(),
+            s.listen,
+            forwarder.upstream()
+        );
+        let mut service = Service::new(format!("stream:{}", forwarder.label()), forwarder);
+        service.add_tcp(&s.listen);
+        server.add_service(service);
+    }
 
     for s in &cfg.servers {
         info!("  {} -> {}", s.domain, s.upstream);
@@ -133,10 +156,20 @@ fn main() -> Result<()> {
         info!("TLS: no fallback certificate; unknown or missing SNI will fail the handshake");
     }
 
-    if cfg.listen.http.ends_with(":80") || cfg.listen.https.ends_with(":443") {
+    let privileged_http = !cfg.servers.is_empty()
+        && (cfg.listen.http.ends_with(":80") || cfg.listen.https.ends_with(":443"));
+    let privileged_stream = cfg.streams.iter().any(|s| {
+        s.listen
+            .trim()
+            .rsplit(':')
+            .next()
+            .and_then(|p| p.parse::<u16>().ok())
+            .is_some_and(|p| p < 1024)
+    });
+    if privileged_http || privileged_stream {
         warn!(
-            "a port below 1024 needs CAP_NET_BIND_SERVICE, not root: systemd units \
-             declare `AmbientCapabilities=CAP_NET_BIND_SERVICE` (see deploy/uping.service)"
+            "a port below 1024 needs CAP_NET_BIND_SERVICE, not root: the systemd unit \
+             declares `AmbientCapabilities=CAP_NET_BIND_SERVICE` (see deploy/install.sh)"
         );
     }
 
