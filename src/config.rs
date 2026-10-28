@@ -329,6 +329,7 @@ impl Config {
             if s.upstream.trim().is_empty() {
                 anyhow::bail!("`{}` has an empty `upstream`", s.domain);
             }
+            validate_upstream(&s.upstream, &format!("`{}` `upstream`", s.domain))?;
             if s.pub_key.trim().is_empty() {
                 anyhow::bail!("`{}` has an empty `pub_key`", s.domain);
             }
@@ -355,6 +356,7 @@ fn validate_routes(routes: &[Route], owner: &str) -> Result<()> {
         if r.upstream.trim().is_empty() {
             anyhow::bail!("{where_} has an empty `upstream`");
         }
+        validate_upstream(&r.upstream, &format!("{where_} `upstream`"))?;
         if !path.starts_with('/') {
             anyhow::bail!("{where_}: `path` must start with `/`");
         }
@@ -447,7 +449,7 @@ fn validate_streams(cfg: &mut Config) -> Result<()> {
         s.listen = canonical_bind(&s.listen, &format!("{where_} `listen`"))?;
 
         let listen = parse_addr(&s.listen, &format!("{where_} `listen`"))?;
-        let _ = parse_addr(&s.upstream, &format!("{where_} `upstream`"))?;
+        validate_upstream(&s.upstream, &format!("{where_} `upstream`"))?;
 
         if http_bound && addrs_conflict(&listen, &http) {
             anyhow::bail!(
@@ -481,9 +483,58 @@ fn validate_streams(cfg: &mut Config) -> Result<()> {
 }
 
 fn parse_addr(raw: &str, what: &str) -> Result<std::net::SocketAddr> {
-    raw.trim()
+    let addr = raw
+        .trim()
         .parse::<std::net::SocketAddr>()
-        .map_err(|e| anyhow::anyhow!("{what} `{}` is not a `IP:port` address: {e}", raw.trim()))
+        .map_err(|e| anyhow::anyhow!("{what} `{}` is not a `IP:port` address: {e}", raw.trim()))?;
+    if addr.port() == 0 {
+        anyhow::bail!(
+            "{what} `{}`: port 0 binds an ephemeral port, never the one you meant",
+            raw.trim()
+        );
+    }
+    Ok(addr)
+}
+
+/// An upstream names exactly one peer.
+///
+/// `IP:port` is the written form; a DNS name (`localhost:3000`) is accepted
+/// because pingora and tokio resolve it at connect time. A wildcard is not: it
+/// is a listen address, and an upstream that means "every interface" is not an
+/// address at all. An IPv6 literal must be bracketed — `::1:443` has no port,
+/// only `[::1]:443` does. Port 0 is never a destination.
+///
+/// One rule, called from all three upstream sites (`[[server]]`, `[[route]]`,
+/// `[[stream]]`): a destination that cannot be dialled must fail at load, not
+/// at the first request.
+fn validate_upstream(raw: &str, what: &str) -> Result<()> {
+    let raw = raw.trim();
+
+    if raw.starts_with('*') {
+        anyhow::bail!("{what} `{raw}`: `*` is a listen address; an upstream must name one peer");
+    }
+
+    if let Ok(addr) = raw.parse::<std::net::SocketAddr>() {
+        if addr.port() == 0 {
+            anyhow::bail!("{what} `{raw}`: port 0 is not a port a service listens on");
+        }
+        return Ok(());
+    }
+
+    match raw.rsplit_once(':') {
+        Some((host, port)) if !host.is_empty() && !host.contains(':') => {
+            let port: u16 = port
+                .parse()
+                .map_err(|e| anyhow::anyhow!("{what} `{raw}`: bad port `{port}`: {e}"))?;
+            if port == 0 {
+                anyhow::bail!("{what} `{raw}`: port 0 is not a port a service listens on");
+            }
+            Ok(())
+        }
+        // No port at all, or an unbracketed IPv6 literal: let `parse_addr`
+        // report the syntax and quote the offender.
+        _ => parse_addr(raw, what).map(|_| ()),
+    }
 }
 
 /// Canonical form of a *bind* address: `*:port` means every IPv4 interface.
@@ -1094,7 +1145,7 @@ upstream = "127.0.0.1:10025"
         let err = Config::load(&path).unwrap_err().to_string();
 
         assert!(
-            err.contains("is not a `IP:port` address"),
+            err.contains("`*` is a listen address"),
             "an upstream must name a real peer, got: {err}"
         );
         let _ = std::fs::remove_file(path);
