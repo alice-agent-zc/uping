@@ -44,13 +44,97 @@ fn build_routes(cfg: &Config) -> RouteTable {
     RouteTable::new(sites)
 }
 
+const USAGE: &str = "usage: uping [config.toml] [--check|--dry-run]";
+
+/// A parsed command line: one optional config path and one flag.
+struct Args {
+    path: String,
+    check: bool,
+}
+
+/// Hand-parsed: two shapes and one flag do not justify a dependency, and a
+/// parser is itself a thing that can reject a valid invocation.
+///
+/// Both `uping --check [path]` and `uping [path] --check` are accepted.
+fn parse_args(raw: impl Iterator<Item = String>) -> Result<Args> {
+    let mut path: Option<String> = None;
+    let mut check = false;
+
+    for arg in raw {
+        match arg.as_str() {
+            "--check" | "--dry-run" => check = true,
+            "-h" | "--help" => {
+                println!("{USAGE}");
+                std::process::exit(0);
+            }
+            other if other.starts_with('-') => {
+                anyhow::bail!("unknown option `{other}`; {USAGE}")
+            }
+            other => {
+                if path.replace(other.to_string()).is_some() {
+                    anyhow::bail!(
+                        "unexpected argument `{other}`: at most one config path; {USAGE}"
+                    );
+                }
+            }
+        }
+    }
+
+    Ok(Args {
+        path: path.unwrap_or_else(|| "config.toml".into()),
+        check,
+    })
+}
+
+/// Run [`check_config`] and exit: `0` with one line on stdout, `1` with the
+/// whole cause chain on stderr.
+fn run_check(path: &str) -> ! {
+    match check_config(path) {
+        Ok(line) => {
+            println!("{line}");
+            std::process::exit(0)
+        }
+        Err(e) => {
+            eprintln!("error: {e:#}");
+            std::process::exit(1)
+        }
+    }
+}
+
+/// Validate the config without touching the network, binding nothing and
+/// needing no privilege.
+///
+/// It runs the load path the server would — [`Config::load`], then
+/// [`SniResolver::from_servers`] — because the failures that take production
+/// down happen *before* a socket exists: a malformed address, a cert that
+/// cannot be read or parsed. A check that skipped the certs would pass the
+/// config that killed the service on 2026-10-25.
+fn check_config(path: &str) -> Result<String> {
+    let cfg = Config::load(path).with_context(|| format!("loading configuration from `{path}`"))?;
+
+    // Same condition as `main`: an empty `[[server]]` list loads no TLS.
+    if !cfg.servers.is_empty() {
+        SniResolver::from_servers(&cfg.servers, cfg.tls.fallback_cert)
+            .context("loading TLS certificates")?;
+    }
+
+    let routes = build_routes(&cfg).route_count();
+    Ok(format!(
+        "ok: {} [[server]], {} [[stream]], {routes} route(s) · {path}",
+        cfg.servers.len(),
+        cfg.streams.len()
+    ))
+}
+
 fn main() -> Result<()> {
+    let args = parse_args(std::env::args().skip(1))?;
+    if args.check {
+        run_check(&args.path);
+    }
+
     env_logger::init();
 
-    // Usage: uping [config.toml]
-    let config_path = std::env::args()
-        .nth(1)
-        .unwrap_or_else(|| "config.toml".into());
+    let config_path = args.path;
     let cfg = Config::load(&config_path)
         .with_context(|| format!("loading configuration from `{config_path}`"))?;
 
@@ -201,6 +285,39 @@ mod tests {
             routes,
             streams: Vec::new(),
         }
+    }
+
+    fn args(raw: &[&str]) -> Result<Args> {
+        parse_args(raw.iter().map(|s| s.to_string()))
+    }
+
+    #[test]
+    fn the_check_flag_is_accepted_before_or_after_the_path() {
+        for raw in [&["--check", "a.toml"][..], &["a.toml", "--check"][..]] {
+            let parsed = args(raw).expect("check flag should parse");
+            assert!(parsed.check);
+            assert_eq!(parsed.path, "a.toml");
+        }
+    }
+
+    #[test]
+    fn the_check_flag_alone_reads_config_toml() {
+        let parsed = args(&["--check"]).unwrap();
+        assert!(parsed.check);
+        assert_eq!(parsed.path, "config.toml");
+    }
+
+    #[test]
+    fn no_flag_means_serve() {
+        let parsed = args(&["a.toml"]).unwrap();
+        assert!(!parsed.check);
+        assert_eq!(parsed.path, "a.toml");
+    }
+
+    #[test]
+    fn an_unknown_option_and_a_second_path_are_rejected() {
+        assert!(args(&["--nope"]).is_err());
+        assert!(args(&["a.toml", "b.toml"]).is_err());
     }
 
     #[test]
