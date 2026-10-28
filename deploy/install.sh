@@ -286,6 +286,24 @@ EOF
     return 1
 }
 
+# The rehearsal: load the config and resolve the certificates exactly as the
+# service would, and stop before a socket is created. Needs no root, no free
+# port and no network. A load-time rejection — a malformed address, a wildcard
+# where an upstream belongs — is an outage at boot, not a warning, so callers
+# abort on failure.
+config_check() {
+    if [ ! -x "$BIN" ]; then
+        printf '  FAIL  no binary at %s to run --check with\n' "$BIN"
+        return 1
+    fi
+    if "$BIN" --check "$CONF"; then
+        ok "config $CONF loads and its certificates resolve"
+        return 0
+    fi
+    printf '  FAIL  config %s would not load (reasons above)\n' "$CONF"
+    return 1
+}
+
 # Download-only: the one mode a non-root shell can run, which is the whole point
 # — CI proves the published asset is installable before anyone is root.
 if [ -n "$FETCH_DIR" ]; then
@@ -305,7 +323,12 @@ command -v systemctl >/dev/null 2>&1 \
 
 if [ "$VERIFY_ONLY" = 1 ]; then
     [ -r "$CONF" ] || die "no config at $CONF to check"
-    verify && exit 0 || exit 1
+    step "config check"
+    cfg_ok=0
+    config_check || cfg_ok=1
+    verify || cfg_ok=1
+    [ "$cfg_ok" = 0 ] && exit 0
+    exit 1
 fi
 
 # --- 2. what it needs before it writes anything -----------------------------------
@@ -361,6 +384,14 @@ if [ -n "${EXAMPLE_CONF:-}" ] && [ -r "$EXAMPLE_CONF" ]; then
     install -o root -g "$USER_NAME" -m 0640 "$EXAMPLE_CONF" "$CONF.example"
     ok "example config at $CONF.example"
 fi
+
+# --- 3b. the rehearsal -----------------------------------------------------------
+# Before the unit is written and before the certbot hook can restart anything:
+# a config that would not load stops the install here, instead of becoming a
+# service that starts and dies. Runs under --no-start too — a bad config on disk
+# is a fault either way.
+step "config check"
+config_check || die "config $CONF would not load — stopping before the service is touched"
 
 # --- 4. the unit -----------------------------------------------------------------
 step "unit"

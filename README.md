@@ -204,6 +204,10 @@ cargo build --release
 ./target/release/uping config.toml      # try it on high ports: test.config.toml
 ```
 
+`uping --check [config.toml]` says whether that config would load — addresses,
+upstreams, duplicate listeners, certificates — and exits before any socket is
+bound, so it needs neither root nor a free port.
+
 Building has a few prerequisites that are not part of a default Rust install —
 CMake in particular. **[CONTRIBUTING.md](CONTRIBUTING.md)** covers those, the
 deployment step by step, and how to try uping out without root.
