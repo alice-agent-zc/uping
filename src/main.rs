@@ -1,11 +1,15 @@
 //! uping — a tiny TOML-configured reverse proxy on Cloudflare Pingora.
 //!
-//! v0.1.1: read a config, load certs, serve HTTPS (SNI) on :443, redirect plain
-//! HTTP to HTTPS on :80, and keep a lid on abusive clients.
+//! v0.2 reads a config, obtains or loads one certificate per domain, serves
+//! HTTPS (SNI) on the configured addresses, redirects plain HTTP to HTTPS, and
+//! keeps a lid on abusive clients. A `[[server]]` or route may also serve a
+//! directory directly (`root`). `[[stream]]` raw TCP forwarding is experimental.
 
+mod acme;
 mod config;
 mod limits;
 mod proxy;
+mod static_files;
 mod stream;
 mod tls;
 
@@ -20,9 +24,10 @@ use pingora::proxy::http_proxy_service;
 use pingora::server::Server;
 use pingora::services::listening::Service;
 
+use crate::acme::{CertManager, ChallengeStore};
 use crate::config::Config;
 use crate::limits::{ConnLimiter, RequestLimiter};
-use crate::proxy::{HttpsProxy, PathRoute, RedirectProxy, RouteTable, SiteRoutes};
+use crate::proxy::{HttpsProxy, PathRoute, RedirectProxy, RouteTable, SiteRoutes, Target};
 use crate::stream::StreamForwarder;
 use crate::tls::SniResolver;
 
@@ -32,16 +37,24 @@ use crate::tls::SniResolver;
 ///
 /// Each server gets its own routes plus the top-level `[[route]]` entries whose
 /// `hosts` cover it, resolved by [`Config::routes_for`].
-fn build_routes(cfg: &Config) -> RouteTable {
+fn build_routes(cfg: &Config) -> Result<RouteTable> {
     let mut sites = HashMap::new();
     for s in &cfg.servers {
-        let routes = cfg.routes_for(s).into_iter().map(PathRoute::from_config);
+        let catch_all = Target::from_config(&s.upstream, &s.root, &s.index, &cfg.root_dir)
+            .with_context(|| format!("building the catch-all for `{}`", s.domain))?;
+        let mut routes = Vec::new();
+        for r in cfg.routes_for(s) {
+            routes.push(
+                PathRoute::from_config(r, &cfg.root_dir)
+                    .with_context(|| format!("building route `{}` for `{}`", r.path, s.domain))?,
+            );
+        }
         sites.insert(
             s.domain.to_ascii_lowercase(),
-            SiteRoutes::new(s.upstream.clone(), routes),
+            SiteRoutes::new(catch_all, routes),
         );
     }
-    RouteTable::new(sites)
+    Ok(RouteTable::new(sites))
 }
 
 const USAGE: &str = "usage: uping [config.toml] [--check|--dry-run]";
@@ -113,14 +126,27 @@ fn check_config(path: &str) -> Result<String> {
     let cfg = Config::load(path).with_context(|| format!("loading configuration from `{path}`"))?;
 
     // Same condition as `main`: an empty `[[server]]` list loads no TLS.
+    // `load_existing` parses every certificate that is already on disk and
+    // counts the `auto` ones that do not exist yet. It never touches the
+    // network and writes nothing, so `--check` stays a pure read.
+    let mut pending = 0;
     if !cfg.servers.is_empty() {
-        SniResolver::from_servers(&cfg.servers, cfg.tls.fallback_cert)
-            .context("loading TLS certificates")?;
+        let default_domain = cfg
+            .servers
+            .first()
+            .map(|s| s.domain.to_ascii_lowercase())
+            .unwrap_or_default();
+        let resolver = SniResolver::empty(default_domain, cfg.tls.fallback_cert);
+        let manager = CertManager::new(&cfg, resolver, ChallengeStore::new());
+        pending = manager
+            .load_existing(&cfg.servers)
+            .context("loading TLS certificates")?
+            .len();
     }
 
-    let routes = build_routes(&cfg).route_count();
+    let routes = build_routes(&cfg)?.route_count();
     Ok(format!(
-        "ok: {} [[server]], {} [[stream]], {routes} route(s) · {path}",
+        "ok: {} [[server]], {} [[stream]], {routes} route(s), {pending} certificate(s) to request · {path}",
         cfg.servers.len(),
         cfg.streams.len()
     ))
@@ -138,8 +164,8 @@ fn main() -> Result<()> {
     let cfg = Config::load(&config_path)
         .with_context(|| format!("loading configuration from `{config_path}`"))?;
 
-    // domain -> upstreams
-    let routes = Arc::new(build_routes(&cfg));
+    // domain -> targets
+    let routes = Arc::new(build_routes(&cfg)?);
     info!(
         "{} path route(s) across {} domain(s)",
         routes.route_count(),
@@ -152,9 +178,21 @@ fn main() -> Result<()> {
     if cfg.servers.is_empty() {
         info!("no [[server]] entries: HTTP and HTTPS listeners are not started");
     } else {
-        // Pre-load all cert/key pairs for SNI selection.
-        let resolver = SniResolver::from_servers(&cfg.servers, cfg.tls.fallback_cert)
-            .context("loading TLS certificates")?;
+        let default_domain = cfg
+            .servers
+            .first()
+            .map(|s| s.domain.to_ascii_lowercase())
+            .unwrap_or_default();
+        let resolver = SniResolver::empty(default_domain, cfg.tls.fallback_cert);
+        let challenges = ChallengeStore::new();
+        let certs = Arc::new(CertManager::new(&cfg, resolver.clone(), challenges.clone()));
+
+        // Load manual pairs and request the `auto` ones that do not exist yet.
+        // On a first start this binds the HTTP address briefly for http-01,
+        // then releases it before pingora takes it over.
+        certs
+            .prepare(&cfg.servers, &cfg.listen.http_addrs())
+            .context("preparing TLS certificates")?;
 
         // Shared between the :80 and :443 listeners, so one client cannot use two
         // ports to get two connection budgets.
@@ -165,32 +203,46 @@ fn main() -> Result<()> {
         let mut https_service = http_proxy_service(
             &server.configuration,
             HttpsProxy::new(
-                routes,
+                routes.clone(),
                 RequestLimiter::new(cfg.limits.per_ip_rps),
                 cfg.limits.max_body_bytes,
             ),
         );
         https_service.set_connection_filter(conn_filter.clone());
-        let tls_settings =
-            TlsSettings::with_callbacks(Box::new(resolver)).context("building TLS settings")?;
-        https_service.add_tls_with_settings(&cfg.listen.https, None, tls_settings);
+        for addr in cfg.listen.https_addrs() {
+            let tls_settings = TlsSettings::with_callbacks(Box::new(resolver.clone()))
+                .context("building TLS settings")?;
+            https_service.add_tls_with_settings(&addr, None, tls_settings);
+            info!("HTTPS listening on {addr}");
+        }
         server.add_service(https_service);
-        info!("HTTPS listening on {}", cfg.listen.https);
 
-        // --- HTTP (redirect to HTTPS) ---
-        let mut http_service = http_proxy_service(&server.configuration, RedirectProxy);
-        http_service.set_connection_filter(conn_filter);
-        http_service.add_tcp(&cfg.listen.http);
-        server.add_service(http_service);
-        info!(
-            "HTTP listening on {} (redirecting to HTTPS)",
-            cfg.listen.http
+        // --- HTTP (redirect to HTTPS, plus the ACME challenge path) ---
+        let mut http_service = http_proxy_service(
+            &server.configuration,
+            RedirectProxy::new(challenges.clone()),
         );
+        http_service.set_connection_filter(conn_filter);
+        for addr in cfg.listen.http_addrs() {
+            http_service.add_tcp(&addr);
+            info!("HTTP listening on {addr} (redirecting to HTTPS)");
+        }
+        server.add_service(http_service);
+
+        certs
+            .spawn_renewal(cfg.servers.clone())
+            .context("starting certificate renewal")?;
     }
 
-    // --- Raw TCP streams ---
+    // --- Raw TCP streams (experimental in v0.2) ---
     // One listener per [[stream]]. The upstream is whatever holds the port on
     // loopback; uping neither starts nor watches it.
+    if !cfg.streams.is_empty() {
+        warn!(
+            "[[stream]] is experimental: its config, behaviour and support may change \
+             before it is declared stable"
+        );
+    }
     for s in &cfg.streams {
         let forwarder = StreamForwarder::new(s);
         info!(
@@ -205,13 +257,22 @@ fn main() -> Result<()> {
     }
 
     for s in &cfg.servers {
-        info!("  {} -> {}", s.domain, s.upstream);
+        let destination = if !s.upstream.trim().is_empty() {
+            s.upstream.trim().to_string()
+        } else {
+            format!("static:{}", s.root.trim())
+        };
+        info!("  {} -> {destination}", s.domain);
         for r in cfg.routes_for(s) {
+            let destination = if !r.upstream.trim().is_empty() {
+                r.upstream.trim().to_string()
+            } else {
+                format!("static:{}", r.root.trim())
+            };
             info!(
-                "  {}{} -> {}{}",
+                "  {}{} -> {destination}{}",
                 s.domain,
                 r.prefix(),
-                r.upstream,
                 if r.strip_prefix {
                     " (prefix stripped)"
                 } else {
@@ -241,36 +302,47 @@ fn main() -> Result<()> {
     }
 
     let privileged_http = !cfg.servers.is_empty()
-        && (cfg.listen.http.ends_with(":80") || cfg.listen.https.ends_with(":443"));
-    let privileged_stream = cfg.streams.iter().any(|s| {
-        s.listen
-            .trim()
-            .rsplit(':')
-            .next()
-            .and_then(|p| p.parse::<u16>().ok())
-            .is_some_and(|p| p < 1024)
-    });
+        && cfg
+            .listen
+            .http_addrs()
+            .into_iter()
+            .chain(cfg.listen.https_addrs())
+            .any(|addr| is_privileged(&addr));
+    let privileged_stream = cfg.streams.iter().any(|s| is_privileged(&s.listen));
     if privileged_http || privileged_stream {
         warn!(
-            "a port below 1024 needs CAP_NET_BIND_SERVICE, not root: the systemd unit \
-             declares `AmbientCapabilities=CAP_NET_BIND_SERVICE` (see deploy/install.sh)"
+            "a port below 1024 needs CAP_NET_BIND_SERVICE, not root: \
+             `sudo setcap 'cap_net_bind_service=+ep' $(command -v uping)`"
         );
     }
 
     server.run_forever();
 }
 
+/// Does this bind address name a port below 1024?
+fn is_privileged(raw: &str) -> bool {
+    raw.trim()
+        .rsplit(':')
+        .next()
+        .and_then(|port| port.parse::<u16>().ok())
+        .is_some_and(|port| port < 1024)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::config::Server as ConfigServer;
+    use crate::proxy::Target;
 
     fn server(domain: &str, upstream: &str) -> ConfigServer {
         ConfigServer {
             domain: domain.to_string(),
+            keys: None,
             pub_key: "certs/test.local.crt".to_string(),
             priv_key: "certs/test.local.key".to_string(),
             upstream: upstream.to_string(),
+            root: String::new(),
+            index: "index.html".to_string(),
             routes: Vec::new(),
         }
     }
@@ -278,12 +350,21 @@ mod tests {
     /// A config holding only the parts `build_routes` reads.
     fn config(servers: Vec<ConfigServer>, routes: Vec<crate::config::Route>) -> Config {
         Config {
+            root_dir: std::env::temp_dir(),
             listen: Default::default(),
             limits: Default::default(),
             tls: Default::default(),
+            acme: Default::default(),
             servers,
             routes,
             streams: Vec::new(),
+        }
+    }
+
+    fn upstream(routes: &RouteTable, host: &str, path: &str) -> String {
+        match routes.get(host).unwrap().resolve(path).target {
+            Target::Proxy(upstream) => upstream.clone(),
+            Target::Static(_) => panic!("expected a proxy target for {host}{path}"),
         }
     }
 
@@ -326,16 +407,10 @@ mod tests {
             server("Test.Local", "127.0.0.1:8080"),
             server("API.Example.COM", "127.0.0.1:9000"),
         ];
-        let routes = build_routes(&config(servers, Vec::new()));
+        let routes = build_routes(&config(servers, Vec::new())).unwrap();
 
-        assert_eq!(
-            routes.get("test.local").unwrap().resolve("/").upstream,
-            "127.0.0.1:8080"
-        );
-        assert_eq!(
-            routes.get("api.example.com").unwrap().resolve("/").upstream,
-            "127.0.0.1:9000"
-        );
+        assert_eq!(upstream(&routes, "test.local", "/"), "127.0.0.1:8080");
+        assert_eq!(upstream(&routes, "api.example.com", "/"), "127.0.0.1:9000");
         assert!(routes.get("Test.Local").is_none());
     }
 
@@ -345,15 +420,20 @@ mod tests {
         s.routes = vec![crate::config::Route {
             path: "/assets/".to_string(),
             upstream: "127.0.0.1:8085".to_string(),
+            root: String::new(),
+            index: "index.html".to_string(),
             strip_prefix: true,
             hosts: Vec::new(),
         }];
-        let routes = build_routes(&config(vec![s], Vec::new()));
+        let routes = build_routes(&config(vec![s], Vec::new())).unwrap();
 
         assert_eq!(routes.route_count(), 1);
         let hit = routes.get("aaa.local").unwrap().resolve("/assets/app.css");
-        assert_eq!(hit.upstream, "127.0.0.1:8085");
         assert_eq!(hit.strip, Some("/assets"));
+        assert_eq!(
+            upstream(&routes, "aaa.local", "/assets/app.css"),
+            "127.0.0.1:8085"
+        );
     }
 
     #[test]
@@ -365,15 +445,20 @@ mod tests {
         let global = crate::config::Route {
             path: "/mcp".to_string(),
             upstream: "127.0.0.1:9000".to_string(),
+            root: String::new(),
+            index: "index.html".to_string(),
             strip_prefix: false,
             hosts: Vec::new(),
         };
-        let routes = build_routes(&config(servers, vec![global]));
+        let routes = build_routes(&config(servers, vec![global])).unwrap();
 
         assert_eq!(routes.route_count(), 2);
         for domain in ["a.example", "b.example"] {
-            let hit = routes.get(domain).unwrap().resolve("/mcp/v1");
-            assert_eq!(hit.upstream, "127.0.0.1:9000", "{domain}");
+            assert_eq!(
+                upstream(&routes, domain, "/mcp/v1"),
+                "127.0.0.1:9000",
+                "{domain}"
+            );
         }
     }
 
@@ -383,11 +468,8 @@ mod tests {
             server("test.local", "127.0.0.1:8080"),
             server("TEST.LOCAL", "127.0.0.1:9090"),
         ];
-        let routes = build_routes(&config(servers, Vec::new()));
+        let routes = build_routes(&config(servers, Vec::new())).unwrap();
 
-        assert_eq!(
-            routes.get("test.local").unwrap().resolve("/").upstream,
-            "127.0.0.1:9090"
-        );
+        assert_eq!(upstream(&routes, "test.local", "/"), "127.0.0.1:9090");
     }
 }

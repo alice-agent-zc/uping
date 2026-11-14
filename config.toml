@@ -1,14 +1,28 @@
-# uping v0.1.1 — example configuration
+# uping v0.2 — example configuration
 #
 # Run:  uping config.toml
+# Check: uping --check config.toml
 #
-# Plain HTTP requests are automatically redirected (301) to HTTPS.
+# Every relative path (certificates, static roots, cert_dir) is resolved from
+# the directory that holds this file.
 
 # Optional. Defaults to 0.0.0.0:80 and 0.0.0.0:443.
 # `*:port` is accepted as shorthand for `0.0.0.0:port`.
+# An IPv6 literal works directly; `ipv6 = true` turns the wildcard into the
+# dual-stack `[::]:port` (and adds [::1]:port beside a 127.0.0.1 listener).
 # [listen]
 # http  = "*:80"
 # https = "*:443"
+# ipv6  = false
+
+# Optional. Let's Encrypt, used by keys = "auto".
+# [acme]
+# email             = "ops@example.com"
+# staging           = false
+# cert_dir          = "cert"        # <this file's directory>/cert/<domain>/
+# renew_before_days = 30            # clamped to 1..=89
+# directory         = ""            # another ACME directory URL
+# ca_bundle         = ""            # PEM root for a private ACME CA
 
 # Optional. Abuse protection, counted per client IP over a 1-second window.
 # Set any of them to 0 to switch that limit off.
@@ -23,11 +37,27 @@
 
 [[server]]
 domain   = "www.example.com"
-pub_key  = "certs/www.example.com/fullchain.pem"
-priv_key = "certs/www.example.com/privkey.pem"
-upstream = "127.0.0.1:8080"          # catch-all: every path without its own route
+keys     = "auto"                 # default when no pub_key/priv_key are given
+upstream = "127.0.0.1:8080"       # catch-all: every path without its own route
 
-# Optional. One upstream per path prefix. The longest prefix wins, and a prefix
+# A static site: no backend, just files. Exactly one of upstream/root.
+#
+# [[server]]
+# domain = "static.example.com"
+# keys   = "auto"
+# root   = "public"               # relative to this file, or absolute
+# index  = "index.html"
+
+# Manual certificates: point at the two PEM files and renew them yourself.
+#
+# [[server]]
+# domain   = "manual.example.com"
+# keys     = "manual"
+# pub_key  = "cert/manual.example.com/fullchain.pem"
+# priv_key = "cert/manual.example.com/privkey.pem"
+# upstream = "127.0.0.1:8080"
+
+# Optional. One target per path prefix. The longest prefix wins, and a prefix
 # only matches whole segments: /mcp covers /mcp and /mcp/sse, not /mcpx.
 #
 # [[server.route]]
@@ -35,9 +65,9 @@ upstream = "127.0.0.1:8080"          # catch-all: every path without its own rou
 # upstream = "127.0.0.1:8081"
 #
 # [[server.route]]
-# path         = "/assets/"
-# upstream     = "127.0.0.1:8085"
-# strip_prefix = true                # backend sees /app.css, not /assets/app.css
+# path         = "/assets"
+# root         = "public/assets"
+# strip_prefix = true            # /assets/app.css -> public/assets/app.css
 
 # Optional. One route for several domains at once. `hosts` empty (or ["*"])
 # means every [[server]]; a named list must match configured domains.
@@ -48,12 +78,11 @@ upstream = "127.0.0.1:8080"          # catch-all: every path without its own rou
 # upstream = "127.0.0.1:8081"
 # hosts    = ["www.example.com", "api.example.com"]   # optional
 
-# Optional. Raw TCP forwarding: one listener per entry, no TLS termination
-# (v0.2.0). `listen` accepts `*:port` as shorthand for `0.0.0.0:port`; an
-# `upstream` must name a real peer.
+# EXPERIMENTAL in v0.2. Raw TCP forwarding: one listener per entry, no TLS
+# termination. `listen` accepts `*:port`; an `upstream` must name a real peer.
 #
 # [[stream]]
 # name     = "smtp"
 # listen   = "*:25"
 # upstream = "127.0.0.1:10025"
-# connect_timeout_ms = 5000        # optional, default 5000, clamped 100..30000
+# connect_timeout_ms = 5000      # optional, default 5000, clamped 100..30000

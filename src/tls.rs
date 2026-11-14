@@ -17,6 +17,8 @@
 //! BoringSSL backends. The rustls backend logs a warning and ignores them.
 
 use std::collections::HashMap;
+use std::path::Path;
+use std::sync::{Arc, RwLock};
 
 use async_trait::async_trait;
 use log::{debug, error};
@@ -24,15 +26,26 @@ use pingora::listeners::TlsAccept;
 use pingora::protocols::tls::TlsRef;
 use pingora::tls::{ext, pkey, ssl, x509};
 
+#[cfg(test)]
 use crate::config::Server;
 
-/// A parsed certificate + private key, ready to hand to OpenSSL.
-type CertKey = (x509::X509, pkey::PKey<pkey::Private>);
+/// A parsed leaf + its intermediate chain + private key, ready for OpenSSL.
+struct CertKey {
+    leaf: x509::X509,
+    /// Intermediates, in the order they appear after the leaf in fullchain.pem.
+    chain: Vec<x509::X509>,
+    key: pkey::PKey<pkey::Private>,
+}
 
 /// Resolves a certificate from the client's SNI hostname.
+///
+/// The map sits behind a lock because `keys = "auto"` replaces an entry when a
+/// renewal lands. The callback only ever reads it, and the write is a handful of
+/// pointer moves, so a writer never delays a handshake meaningfully.
+#[derive(Clone)]
 pub struct SniResolver {
     /// Lowercased domain -> (cert, key).
-    certs: HashMap<String, CertKey>,
+    certs: Arc<RwLock<HashMap<String, Arc<CertKey>>>>,
     /// Certificate used when SNI matches nothing (first configured domain).
     default_domain: String,
     /// Serve `default_domain` when SNI is absent or unknown.
@@ -40,32 +53,84 @@ pub struct SniResolver {
 }
 
 impl SniResolver {
-    /// Load every cert/key pair from the config up front.
-    pub fn from_servers(servers: &[Server], fallback: bool) -> anyhow::Result<Self> {
-        let mut certs = HashMap::new();
-
-        for s in servers {
-            let cert_pem = std::fs::read(&s.pub_key).map_err(|e| {
-                anyhow::anyhow!("reading cert `{}` for {}: {e}", s.pub_key, s.domain)
-            })?;
-            let key_pem = std::fs::read(&s.priv_key).map_err(|e| {
-                anyhow::anyhow!("reading key `{}` for {}: {e}", s.priv_key, s.domain)
-            })?;
-
-            let cert = x509::X509::from_pem(&cert_pem)
-                .map_err(|e| anyhow::anyhow!("parsing cert `{}`: {e}", s.pub_key))?;
-            let key = pkey::PKey::private_key_from_pem(&key_pem)
-                .map_err(|e| anyhow::anyhow!("parsing key `{}`: {e}", s.priv_key))?;
-
-            certs.insert(s.domain.to_ascii_lowercase(), (cert, key));
-        }
-
-        let default_domain = servers[0].domain.to_ascii_lowercase();
-        Ok(Self {
-            certs,
-            default_domain,
+    /// An empty resolver. Fill it with [`SniResolver::load_files`] or
+    /// [`SniResolver::install`].
+    pub fn empty(default_domain: impl Into<String>, fallback: bool) -> Self {
+        Self {
+            certs: Arc::new(RwLock::new(HashMap::new())),
+            default_domain: default_domain.into().to_ascii_lowercase(),
             fallback,
-        })
+        }
+    }
+
+    /// Load every cert/key pair from the explicit `pub_key`/`priv_key` fields.
+    /// Kept for the unit tests.
+    #[cfg(test)]
+    pub fn from_servers(servers: &[Server], fallback: bool) -> anyhow::Result<Self> {
+        let default_domain = servers
+            .first()
+            .map(|s| s.domain.to_ascii_lowercase())
+            .unwrap_or_default();
+        let resolver = SniResolver::empty(default_domain, fallback);
+        for s in servers {
+            resolver.load_files(&s.domain, Path::new(&s.pub_key), Path::new(&s.priv_key))?;
+        }
+        Ok(resolver)
+    }
+
+    /// Read and parse one pair from disk, replacing any current entry.
+    pub fn load_files(&self, domain: &str, cert: &Path, key: &Path) -> anyhow::Result<()> {
+        let cert_pem = std::fs::read(cert)
+            .map_err(|e| anyhow::anyhow!("reading cert `{}` for {domain}: {e}", cert.display()))?;
+        let key_pem = std::fs::read(key)
+            .map_err(|e| anyhow::anyhow!("reading key `{}` for {domain}: {e}", key.display()))?;
+        self.install(domain, &cert_pem, &key_pem)
+            .map_err(|e| anyhow::anyhow!("{e} (`{}` / `{}`)", cert.display(), key.display()))
+    }
+
+    /// Parse a PEM pair and swap it into the live map. `cert_pem` may hold the
+    /// full chain: the first certificate is the leaf, the rest are sent as
+    /// intermediates. Dropping the chain would break clients that do not chase
+    /// the leaf's AIA extension.
+    pub fn install(&self, domain: &str, cert_pem: &[u8], key_pem: &[u8]) -> anyhow::Result<()> {
+        let domain = domain.trim().to_ascii_lowercase();
+        let mut certs = x509::X509::stack_from_pem(cert_pem)
+            .map_err(|e| anyhow::anyhow!("parsing cert for {domain}: {e}"))?;
+        if certs.is_empty() {
+            anyhow::bail!("no certificate found in the PEM for {domain}");
+        }
+        let leaf = certs.remove(0);
+        let key = pkey::PKey::private_key_from_pem(key_pem)
+            .map_err(|e| anyhow::anyhow!("parsing key for {domain}: {e}"))?;
+        let mut live = self.certs.write().unwrap_or_else(|e| e.into_inner());
+        live.insert(
+            domain,
+            Arc::new(CertKey {
+                leaf,
+                chain: certs,
+                key,
+            }),
+        );
+        Ok(())
+    }
+
+    /// Number of intermediates held for `domain`. Tests only.
+    #[cfg(test)]
+    pub fn chain_len(&self, domain: &str) -> Option<usize> {
+        self.certs
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&domain.to_ascii_lowercase())
+            .map(|pair| pair.chain.len())
+    }
+
+    /// Does this resolver hold a certificate for `domain`?
+    #[cfg(test)]
+    pub fn has(&self, domain: &str) -> bool {
+        self.certs
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains_key(&domain.to_ascii_lowercase())
     }
 
     /// Pick the certificate key to use for a given SNI hostname.
@@ -76,11 +141,12 @@ impl SniResolver {
     ///   handshake is expected to fail
     fn resolve_key(&self, sni: &str) -> Option<String> {
         let sni = sni.to_ascii_lowercase();
+        let certs = self.certs.read().unwrap_or_else(|e| e.into_inner());
 
-        if self.certs.contains_key(&sni) {
+        if certs.contains_key(&sni) {
             return Some(sni);
         }
-        if self.fallback && self.certs.contains_key(&self.default_domain) {
+        if self.fallback && certs.contains_key(&self.default_domain) {
             debug!("no certificate configured for SNI `{sni}`, using default");
             return Some(self.default_domain.clone());
         }
@@ -101,12 +167,24 @@ impl TlsAccept for SniResolver {
             return;
         };
 
-        let (cert, key) = &self.certs[&domain];
+        let pair = {
+            let certs = self.certs.read().unwrap_or_else(|e| e.into_inner());
+            certs.get(&domain).cloned()
+        };
+        let Some(pair) = pair else {
+            error!("certificate for `{domain}` disappeared during the handshake");
+            return;
+        };
 
-        if let Err(e) = ext::ssl_use_certificate(ssl_ref, cert) {
+        if let Err(e) = ext::ssl_use_certificate(ssl_ref, &pair.leaf) {
             error!("failed to set certificate for `{sni}`: {e}");
         }
-        if let Err(e) = ext::ssl_use_private_key(ssl_ref, key) {
+        for intermediate in &pair.chain {
+            if let Err(e) = ext::ssl_add_chain_cert(ssl_ref, intermediate) {
+                error!("failed to add an intermediate for `{sni}`: {e}");
+            }
+        }
+        if let Err(e) = ext::ssl_use_private_key(ssl_ref, &pair.key) {
             error!("failed to set private key for `{sni}`: {e}");
         }
     }
@@ -140,8 +218,10 @@ mod tests {
             cert.set_subject_name(&name).unwrap();
             cert.set_issuer_name(&name).unwrap();
             cert.set_pubkey(&key).unwrap();
-            cert.set_not_before(&Asn1Time::days_from_now(0).unwrap()).unwrap();
-            cert.set_not_after(&Asn1Time::days_from_now(365).unwrap()).unwrap();
+            cert.set_not_before(&Asn1Time::days_from_now(0).unwrap())
+                .unwrap();
+            cert.set_not_after(&Asn1Time::days_from_now(365).unwrap())
+                .unwrap();
             cert.sign(&key, MessageDigest::sha256()).unwrap();
             let cert = cert.build();
 
@@ -152,7 +232,10 @@ mod tests {
             std::fs::write(&cert_path, cert.to_pem().unwrap()).unwrap();
             std::fs::write(&key_path, key.private_key_to_pem_pkcs8().unwrap()).unwrap();
 
-            (cert_path.display().to_string(), key_path.display().to_string())
+            (
+                cert_path.display().to_string(),
+                key_path.display().to_string(),
+            )
         })
     }
 
@@ -160,9 +243,12 @@ mod tests {
         let (cert, key) = pair();
         Server {
             domain: domain.to_string(),
+            keys: None,
             pub_key: cert.clone(),
             priv_key: key.clone(),
             upstream: "127.0.0.1:8080".to_string(),
+            root: String::new(),
+            index: "index.html".to_string(),
             routes: Vec::new(),
         }
     }
@@ -178,21 +264,64 @@ mod tests {
     #[test]
     fn loads_the_test_certificate() {
         let resolver = SniResolver::from_servers(&[test_server("test.local")], true).unwrap();
-        assert!(resolver.certs.contains_key("test.local"));
+        assert!(resolver.has("test.local"));
+    }
+
+    /// A `fullchain.pem` has more than one certificate in it. The leaf is used
+    /// as the server certificate; the rest must be sent as the chain, or a
+    /// client that cannot chase the leaf's AIA extension fails the handshake.
+    #[test]
+    fn a_fullchain_keeps_its_intermediates() {
+        let (cert_path, key_path) = pair();
+        let leaf = std::fs::read(cert_path).unwrap();
+        let key = std::fs::read(key_path).unwrap();
+
+        let mut fullchain = leaf.clone();
+        fullchain.extend_from_slice(&leaf); // a second cert is enough to parse
+
+        let resolver = SniResolver::empty("test.local", true);
+        resolver.install("test.local", &fullchain, &key).unwrap();
+
+        assert_eq!(resolver.chain_len("test.local"), Some(1));
+        assert_eq!(
+            resolver.resolve_key("test.local").as_deref(),
+            Some("test.local")
+        );
+    }
+
+    #[test]
+    fn an_install_without_a_certificate_is_refused() {
+        let (_, key_path) = pair();
+        let key = std::fs::read(key_path).unwrap();
+        let resolver = SniResolver::empty("test.local", true);
+        let err = resolver
+            .install("test.local", b"", &key)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("no certificate found") || err.contains("parsing cert"),
+            "{err}"
+        );
     }
 
     #[test]
     fn domain_keys_are_lowercased() {
         let resolver = SniResolver::from_servers(&[test_server("TEST.Local")], true).unwrap();
-        assert!(resolver.certs.contains_key("test.local"));
+        assert!(resolver.has("test.local"));
         assert_eq!(resolver.default_domain, "test.local");
     }
 
     #[test]
     fn resolve_key_matches_sni_case_insensitively() {
         let resolver = SniResolver::from_servers(&[test_server("test.local")], true).unwrap();
-        assert_eq!(resolver.resolve_key("test.local").as_deref(), Some("test.local"));
-        assert_eq!(resolver.resolve_key("TEST.LOCAL").as_deref(), Some("test.local"));
+        assert_eq!(
+            resolver.resolve_key("test.local").as_deref(),
+            Some("test.local")
+        );
+        assert_eq!(
+            resolver.resolve_key("TEST.LOCAL").as_deref(),
+            Some("test.local")
+        );
     }
 
     #[test]
@@ -230,10 +359,15 @@ mod tests {
 
     #[test]
     fn fallback_never_overrides_an_exact_match() {
-        let resolver =
-            SniResolver::from_servers(&[test_server("test.local"), test_server("other.local")], true)
-                .unwrap();
-        assert_eq!(resolver.resolve_key("other.local").as_deref(), Some("other.local"));
+        let resolver = SniResolver::from_servers(
+            &[test_server("test.local"), test_server("other.local")],
+            true,
+        )
+        .unwrap();
+        assert_eq!(
+            resolver.resolve_key("other.local").as_deref(),
+            Some("other.local")
+        );
     }
 
     #[test]
@@ -267,7 +401,10 @@ mod tests {
             .err()
             .unwrap()
             .to_string();
-        assert!(err.contains("parsing cert"), "unexpected error: {err}");
+        assert!(
+            err.contains("parsing cert") || err.contains("no certificate found"),
+            "unexpected error: {err}"
+        );
         let _ = std::fs::remove_file(bad);
     }
 }
