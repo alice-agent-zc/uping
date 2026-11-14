@@ -10,12 +10,11 @@
 //! policy blocks it) and never `/dev/null`. `target/` is disposable; every run
 //! rewrites its own fixtures.
 //!
-//! Two cases deliberately absent, because today's behaviour is a design decision
-//! rather than a bug — see the PR body. Two `[[server]]` with the same `domain`
-//! ("last wins", asserted by `later_entries_win_on_duplicate_domains` in
-//! `src/main.rs`), and an unknown field, which is silently ignored because no
-//! struct carries `deny_unknown_fields`. Both need a ruling before a test pins
-//! them.
+//! One case is deliberately absent because today's behaviour is a design
+//! decision rather than a bug: two `[[server]]` with the same `domain` ("last
+//! wins", asserted by `later_entries_win_on_duplicate_domains` in `src/main.rs`).
+//! Unknown fields are now refused by `deny_unknown_fields`, so a typo cannot
+//! silently become a default.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -224,7 +223,7 @@ fn a_missing_upstream_is_refused() {
     assert_refused(
         "upstream-missing.toml",
         &SERVER.replace("upstream = \"127.0.0.1:8080\"", "upstream = \"\""),
-        "empty `upstream`",
+        "needs an `upstream` or a `root`",
     );
 }
 
@@ -255,6 +254,15 @@ fn two_streams_on_one_port_are_refused() {
 // ---------------------------------------------------------------------------
 // The rest of the load path.
 // ---------------------------------------------------------------------------
+
+#[test]
+fn an_unknown_field_is_refused() {
+    assert_refused(
+        "unknown-field.toml",
+        &SERVER.replace("upstream =", "upstrem ="),
+        "unknown field",
+    );
+}
 
 #[test]
 fn an_empty_pub_key_is_refused() {
@@ -289,7 +297,7 @@ fn an_unreadable_certificate_is_refused() {
     assert_refused(
         "cert-missing.toml",
         &SERVER.replace("certs/test.local.crt", "/nonexistent/nope.crt"),
-        "reading cert",
+        "certificate is missing",
     );
 }
 
@@ -308,6 +316,23 @@ fn a_certificate_that_is_not_a_certificate_is_refused() {
 // ---------------------------------------------------------------------------
 // The green side: a valid config must pass, or the corpus means nothing.
 // ---------------------------------------------------------------------------
+
+/// A first start with `keys = "auto"` has no certificate on disk yet. That is
+/// not a config error: `--check` must report the work a start would do, and must
+/// not create the directory or contact the CA.
+#[test]
+fn an_auto_server_without_a_certificate_is_accepted_by_check() {
+    let body = "[[server]]\ndomain = \"auto.example\"\nupstream = \"127.0.0.1:8080\"\n";
+    let ok = assert_accepted("good-auto-missing.toml", body);
+    assert!(
+        ok.contains("1 certificate(s) to request"),
+        "the pending certificate must be visible, got: {ok:?}"
+    );
+    assert!(
+        !fixtures().join("cert").exists(),
+        "`--check` must not create the certificate directory"
+    );
+}
 
 /// The exact shape that died on 2026-10-25: `[[stream]] listen = "*:443"`.
 ///

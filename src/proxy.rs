@@ -11,12 +11,22 @@ use pingora::proxy::{ProxyHttp, Session};
 use pingora::upstreams::peer::HttpPeer;
 use pingora::{Error, ErrorType, Result};
 
+use crate::acme::{ChallengeStore, CHALLENGE_PREFIX};
 use crate::limits::RequestLimiter;
+use crate::static_files::{self, StaticSite};
 
 /// Lowercase a `host[:port]` value, dropping any port suffix.
+///
+/// An IPv6 authority is bracketed (`[2001:db8::1]:443`); splitting on the first
+/// colon would otherwise reduce it to `[`.
 fn normalize_host(raw: &str) -> String {
-    let host = raw.split(':').next().unwrap_or(raw);
-    host.trim().to_ascii_lowercase()
+    let raw = raw.trim();
+    let host = if let Some(rest) = raw.strip_prefix('[') {
+        rest.split(']').next().unwrap_or(rest)
+    } else {
+        raw.split(':').next().unwrap_or(raw)
+    };
+    host.to_ascii_lowercase()
 }
 
 /// Pick the effective hostname: the `Host` header wins, the request URI
@@ -24,7 +34,7 @@ fn normalize_host(raw: &str) -> String {
 fn select_host(header: Option<&str>, uri_host: Option<&str>) -> Option<String> {
     match header {
         Some(raw) => Some(normalize_host(raw)),
-        None => uri_host.map(|h| h.to_ascii_lowercase()),
+        None => uri_host.map(normalize_host),
     }
 }
 
@@ -55,8 +65,15 @@ fn declared_content_length(session: &Session) -> Option<u64> {
 }
 
 /// Build the HTTPS URL a plain-HTTP request is redirected to.
+///
+/// `host` has already been normalized (brackets stripped), so an IPv6 literal
+/// has to be put back between brackets or the URL is not parseable.
 fn redirect_location(host: &str, path: &str) -> String {
-    format!("https://{host}{path}")
+    if host.contains(':') && !host.starts_with('[') {
+        format!("https://[{host}]{path}")
+    } else {
+        format!("https://{host}{path}")
+    }
 }
 
 /// Does `path` fall under `prefix`? A prefix matches on a segment boundary, so
@@ -89,43 +106,74 @@ fn rewrite_path_and_query(path: &str, query: Option<&str>, prefix: &str) -> Stri
     }
 }
 
+/// Where one request goes.
+#[derive(Debug, Clone)]
+pub enum Target {
+    /// Forward it to a `host:port` upstream.
+    Proxy(String),
+    /// Serve it from a directory on this host.
+    Static(StaticSite),
+}
+
+impl Target {
+    pub fn from_config(
+        upstream: &str,
+        root: &str,
+        index: &str,
+        root_dir: &std::path::Path,
+    ) -> anyhow::Result<Self> {
+        if !upstream.trim().is_empty() {
+            return Ok(Target::Proxy(upstream.trim().to_string()));
+        }
+        let path = if std::path::Path::new(root.trim()).is_absolute() {
+            std::path::PathBuf::from(root.trim())
+        } else {
+            root_dir.join(root.trim())
+        };
+        Ok(Target::Static(StaticSite::new(path, index)?))
+    }
+}
+
 /// One path route, ready for matching.
 #[derive(Debug, Clone)]
 pub struct PathRoute {
     /// Prefix with no trailing `/`.
     pub prefix: String,
-    pub upstream: String,
+    pub target: Target,
     pub strip_prefix: bool,
 }
 
 impl PathRoute {
-    pub fn from_config(route: &crate::config::Route) -> Self {
-        Self {
+    pub fn from_config(
+        route: &crate::config::Route,
+        root_dir: &std::path::Path,
+    ) -> anyhow::Result<Self> {
+        Ok(Self {
             prefix: route.prefix().to_string(),
-            upstream: route.upstream.clone(),
+            target: Target::from_config(&route.upstream, &route.root, &route.index, root_dir)?,
             strip_prefix: route.strip_prefix,
-        }
+        })
     }
 }
 
-/// The upstream a request resolved to.
-#[derive(Debug, PartialEq, Eq)]
+/// The destination a request resolved to.
+#[derive(Debug)]
 pub struct Resolved<'a> {
-    pub upstream: &'a str,
-    /// Prefix to remove from the path before forwarding it, if the route asked.
+    pub target: &'a Target,
+    /// Prefix to remove from the path before using it, if the route asked.
     pub strip: Option<&'a str>,
 }
 
-/// The routes of one domain: a catch-all upstream plus optional path routes,
+/// The routes of one domain: a catch-all target plus optional path routes,
 /// longest prefix first.
 #[derive(Debug)]
 pub struct SiteRoutes {
-    catch_all: String,
+    catch_all: Target,
     routes: Vec<PathRoute>,
 }
 
 impl SiteRoutes {
-    pub fn new(catch_all: String, routes: impl IntoIterator<Item = PathRoute>) -> Self {
+    pub fn new(catch_all: Target, routes: impl IntoIterator<Item = PathRoute>) -> Self {
         let mut routes: Vec<PathRoute> = routes.into_iter().collect();
         // Longest first: `/assets/` is looked at before `/`.
         routes.sort_by_key(|r| std::cmp::Reverse(r.prefix.len()));
@@ -137,13 +185,13 @@ impl SiteRoutes {
         for r in &self.routes {
             if matches_prefix(&r.prefix, path) {
                 return Resolved {
-                    upstream: &r.upstream,
+                    target: &r.target,
                     strip: r.strip_prefix.then_some(r.prefix.as_str()),
                 };
             }
         }
         Resolved {
-            upstream: &self.catch_all,
+            target: &self.catch_all,
             strip: None,
         }
     }
@@ -234,9 +282,20 @@ impl ProxyHttp for HttpsProxy {
             return Ok(true);
         };
 
-        let path = session.req_header().uri.path();
-        let resolved = site.resolve(path);
-        ctx.upstream = Some(resolved.upstream.to_string());
+        let path = session.req_header().uri.path().to_string();
+        let query = session.req_header().uri.query().map(str::to_string);
+        let resolved = site.resolve(&path);
+
+        // A static target answers right here and never reaches `upstream_peer`.
+        if let Target::Static(site) = resolved.target {
+            static_files::serve(session, site, &path, query.as_deref(), resolved.strip).await?;
+            return Ok(true);
+        }
+
+        let Target::Proxy(upstream) = resolved.target else {
+            unreachable!("a static target returned above")
+        };
+        ctx.upstream = Some(upstream.clone());
         ctx.strip_prefix = resolved.strip.map(str::to_string);
 
         // 3. Reject obviously oversized bodies before reading anything.
@@ -356,15 +415,24 @@ impl ProxyHttp for HttpsProxy {
     }
 }
 
-/// Answers every plain-HTTP request with a 301 to the HTTPS equivalent.
-pub struct RedirectProxy;
+/// Answers plain-HTTP requests with a 301 to the HTTPS equivalent, except for
+/// the ACME http-01 path, which must be served in the clear.
+pub struct RedirectProxy {
+    challenges: ChallengeStore,
+}
+
+impl RedirectProxy {
+    pub fn new(challenges: ChallengeStore) -> Self {
+        Self { challenges }
+    }
+}
 
 #[async_trait]
 impl ProxyHttp for RedirectProxy {
     type CTX = ();
     fn new_ctx(&self) {}
 
-    /// Never actually reached: `request_filter` always answers early with a 301.
+    /// Never actually reached: `request_filter` always answers early.
     /// `ProxyHttp` has no default impl for this, so we provide one anyway.
     async fn upstream_peer(
         &self,
@@ -377,6 +445,31 @@ impl ProxyHttp for RedirectProxy {
     }
 
     async fn request_filter(&self, session: &mut Session, _ctx: &mut Self::CTX) -> Result<bool> {
+        let path = session.req_header().uri.path().to_string();
+
+        if let Some(token) = path.strip_prefix(CHALLENGE_PREFIX) {
+            let token = token.split('/').next().unwrap_or(token);
+            match self.challenges.get(token) {
+                Some(body) => {
+                    let mut resp = ResponseHeader::build(200, Some(2))?;
+                    resp.insert_header("Content-Type", "text/plain")?;
+                    resp.insert_header("Content-Length", body.len().to_string())?;
+                    let head = session.req_header().method == http::Method::HEAD;
+                    session.write_response_header(Box::new(resp), head).await?;
+                    if !head {
+                        session
+                            .write_response_body(Some(Bytes::from(body)), true)
+                            .await?;
+                    }
+                }
+                None => {
+                    debug!("acme: no challenge for token `{token}`");
+                    session.respond_error(404).await?;
+                }
+            }
+            return Ok(true);
+        }
+
         let host = request_host(session).unwrap_or_default();
         let path = session
             .req_header()
@@ -410,6 +503,12 @@ mod tests {
     }
 
     #[test]
+    fn normalize_host_keeps_a_bracketed_ipv6_literal_whole() {
+        assert_eq!(normalize_host("[2001:DB8::1]:443"), "2001:db8::1");
+        assert_eq!(normalize_host("[::1]"), "::1");
+    }
+
+    #[test]
     fn select_host_prefers_the_host_header() {
         assert_eq!(
             select_host(Some("WWW.Example.com:80"), Some("ignored.example")),
@@ -436,22 +535,33 @@ mod tests {
         );
     }
 
+    fn proxy(upstream: &str) -> Target {
+        Target::Proxy(upstream.to_string())
+    }
+
     fn site() -> SiteRoutes {
         SiteRoutes::new(
-            "127.0.0.1:8080".to_string(),
+            proxy("127.0.0.1:8080"),
             [
                 PathRoute {
                     prefix: "/mcp".to_string(),
-                    upstream: "127.0.0.1:8081".to_string(),
+                    target: proxy("127.0.0.1:8081"),
                     strip_prefix: false,
                 },
                 PathRoute {
                     prefix: "/assets".to_string(),
-                    upstream: "127.0.0.1:8085".to_string(),
+                    target: proxy("127.0.0.1:8085"),
                     strip_prefix: true,
                 },
             ],
         )
+    }
+
+    fn upstream(site: &SiteRoutes, path: &str) -> String {
+        match site.resolve(path).target {
+            Target::Proxy(upstream) => upstream.clone(),
+            Target::Static(_) => panic!("expected a proxy target for {path}"),
+        }
     }
 
     #[test]
@@ -465,15 +575,15 @@ mod tests {
     #[test]
     fn the_longest_prefix_wins() {
         let site = site();
-        assert_eq!(site.resolve("/assets/a.css").upstream, "127.0.0.1:8085");
-        assert_eq!(site.resolve("/mcp").upstream, "127.0.0.1:8081");
+        assert_eq!(upstream(&site, "/assets/a.css"), "127.0.0.1:8085");
+        assert_eq!(upstream(&site, "/mcp"), "127.0.0.1:8081");
     }
 
     #[test]
     fn an_unknown_path_falls_through_to_the_catch_all() {
         let site = site();
         let hit = site.resolve("/somewhere/else");
-        assert_eq!(hit.upstream, "127.0.0.1:8080");
+        assert_eq!(upstream(&site, "/somewhere/else"), "127.0.0.1:8080");
         assert_eq!(hit.strip, None);
     }
 
@@ -511,28 +621,28 @@ mod tests {
     #[test]
     fn routes_are_sorted_by_length_not_by_config_order() {
         let site = SiteRoutes::new(
-            "127.0.0.1:8080".to_string(),
+            proxy("127.0.0.1:8080"),
             [
                 PathRoute {
                     prefix: "/a".to_string(),
-                    upstream: "127.0.0.1:9001".to_string(),
+                    target: proxy("127.0.0.1:9001"),
                     strip_prefix: false,
                 },
                 PathRoute {
                     prefix: "/a/b/c".to_string(),
-                    upstream: "127.0.0.1:9003".to_string(),
+                    target: proxy("127.0.0.1:9003"),
                     strip_prefix: false,
                 },
                 PathRoute {
                     prefix: "/a/b".to_string(),
-                    upstream: "127.0.0.1:9002".to_string(),
+                    target: proxy("127.0.0.1:9002"),
                     strip_prefix: false,
                 },
             ],
         );
-        assert_eq!(site.resolve("/a/b/c/d").upstream, "127.0.0.1:9003");
-        assert_eq!(site.resolve("/a/b/d").upstream, "127.0.0.1:9002");
-        assert_eq!(site.resolve("/a/z").upstream, "127.0.0.1:9001");
+        assert_eq!(upstream(&site, "/a/b/c/d"), "127.0.0.1:9003");
+        assert_eq!(upstream(&site, "/a/b/d"), "127.0.0.1:9002");
+        assert_eq!(upstream(&site, "/a/z"), "127.0.0.1:9001");
     }
 
     #[test]
@@ -544,6 +654,14 @@ mod tests {
         assert_eq!(
             redirect_location("example.com", "/"),
             "https://example.com/"
+        );
+    }
+
+    #[test]
+    fn redirect_location_rebrackets_an_ipv6_literal() {
+        assert_eq!(
+            redirect_location("2001:db8::1", "/x"),
+            "https://[2001:db8::1]/x"
         );
     }
 }

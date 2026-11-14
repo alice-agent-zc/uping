@@ -5,13 +5,13 @@ name: release
 # is the form that stays empty instead of erroring when no dispatch ran.
 run-name: release ${{ github.event.inputs.tag || github.ref_name }}
 
-# A tag is the only thing that publishes, so the asset a user's `curl | sh`
-# gets is always the code the tag names. `workflow_dispatch` rebuilds an
-# existing tag in place — that is the repair path for a runner or toolchain
-# problem, and it is deliberate: it can replace a published asset.
+# A tag is the only thing that publishes, so the asset a user downloads is
+# always the code the tag names. `workflow_dispatch` rebuilds an existing tag in
+# place — that is the repair path for a runner or toolchain problem, and it is
+# deliberate: it can replace a published asset.
 #
-# Asset layout is a contract with deploy/install.sh:
-#   uping-<target>.tar.gz         contains uping + config.toml.example
+# Asset layout:
+#   uping-<target>.tar.gz         contains uping, config.toml.example, uping.service
 #   uping-<target>.tar.gz.sha256  bare "<hash>  <file>" from sha256sum
 on:
   push:
@@ -19,7 +19,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Existing tag to publish (e.g. v0.1.2)"
+        description: "Existing tag to publish (e.g. v0.2.1)"
         required: true
 
 permissions:
@@ -41,21 +41,6 @@ jobs:
         id: tag
         run: echo "name=${{ inputs.tag || github.ref_name }}" >> "$GITHUB_OUTPUT"
 
-      # A dispatch runs the workflow from the default branch but checks out the
-      # tag, so a tag older than this file builds code that cannot be released
-      # (and the smoke steps below would fail with an unrelated error). Say so.
-      - name: the tag carries this workflow
-        env:
-          TAG: ${{ steps.tag.outputs.name }}
-        run: |
-          for f in deploy/install.sh deploy/install-test.sh; do
-            if [ ! -f "$f" ]; then
-              echo "tag $TAG predates $f: move the tag to the release commit" >&2
-              echo "  git tag -f $TAG <merge-commit> && git push -f origin $TAG" >&2
-              exit 1
-            fi
-          done
-
       # pingora builds zlib-ng through cmake, and the openssl backend needs the
       # headers; neither is on a bare runner.
       - name: build deps
@@ -68,15 +53,18 @@ jobs:
         with:
           key: ${{ env.TARGET }}
 
+      - name: tests
+        run: cargo test --locked --target "$TARGET"
+
       - name: build
         run: cargo build --release --locked --target "$TARGET"
 
-      # An ELF that links but does not reach main is not a release. uping has no
-      # --help, so the cheapest proof it executes is the config error it must
-      # print for a path that does not exist.
+      # An ELF that links but does not reach main is not a release. `--check`
+      # is the cheapest proof it executes: it must print the config-loading
+      # error for a path that does not exist.
       - name: the binary runs
         run: |
-          out=$(./target/"$TARGET"/release/uping /nonexistent.toml 2>&1 || true)
+          out=$(./target/"$TARGET"/release/uping --check /nonexistent.toml 2>&1 || true)
           printf '%s\n' "$out"
           case $out in
             *"loading configuration"*) ;;
@@ -89,22 +77,13 @@ jobs:
           cp target/"$TARGET"/release/uping dist/uping
           strip dist/uping
           cp config.toml dist/config.toml.example
+          cp uping.service dist/uping.service
           # tar -C dist writes the archive beside the workflow's cwd, so the
-          # checksum is taken there too. install.sh reads only field 1 of this
-          # file; the filename is for a human opening the release.
-          tar -C dist -czf "uping-$TARGET.tar.gz" uping config.toml.example
+          # checksum is taken there too.
+          tar -C dist -czf "uping-$TARGET.tar.gz" uping config.toml.example uping.service
           sha256sum "uping-$TARGET.tar.gz" > "uping-$TARGET.tar.gz.sha256"
           ls -l uping-"$TARGET".tar.gz*
           cat uping-"$TARGET".tar.gz.sha256
-
-      - name: installer is valid shell
-        run: sh -n deploy/install.sh
-
-      # The refusals too, not just a download: a tampered checksum, a missing
-      # checksum, a non-ELF payload. Runs before publish, so a broken installer
-      # cannot ship beside a good binary.
-      - name: installer test, no root, file:// mirror
-        run: sh deploy/install-test.sh target/"$TARGET"/release/uping
 
       - name: publish
         env:
@@ -116,22 +95,3 @@ jobs:
                  --title "uping $TAG" --generate-notes
           gh release upload "$TAG" --repo "$GITHUB_REPOSITORY" --clobber \
             uping-"$TARGET".tar.gz uping-"$TARGET".tar.gz.sha256
-
-      # The point of the whole exercise: the published asset, fetched and
-      # checksum-verified by the published installer, with no local build in
-      # reach. Pinned to the tag so a stale `latest` cannot mask a broken upload.
-      - name: the installer can fetch it
-        env:
-          TAG: ${{ steps.tag.outputs.name }}
-        run: |
-          fetched=""
-          for i in 1 2 3 4 5; do
-            if sh deploy/install.sh --version "$TAG" --fetch-only "$RUNNER_TEMP/fetch"; then
-              fetched=1
-              break
-            fi
-            echo "attempt $i failed, retrying in 10s" >&2
-            sleep 10
-          done
-          [ -n "$fetched" ] || { echo "the published asset never downloaded" >&2; exit 1; }
-          "$RUNNER_TEMP/fetch/uping" /nonexistent.toml 2>&1 | grep -q "loading configuration"

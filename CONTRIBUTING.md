@@ -2,7 +2,7 @@
 
 Thanks for looking. This file is the technical counterpart to the
 [README](README.md): what you need in order to build uping, run its tests, try it
-locally, and deploy it as a service.
+locally, and run it as an ordinary user.
 
 ## Prerequisites
 
@@ -21,6 +21,9 @@ TLS is on the **OpenSSL** backend deliberately: dynamic per-SNI certificate
 selection — one listener, many domains — only exists for OpenSSL/BoringSSL in
 Pingora. The rustls backend logs a warning and ignores the callback.
 
+The ACME client uses `rustls` with the `ring` provider, not `aws-lc`, so the
+build does not need that toolchain.
+
 ## Build and test
 
 ```sh
@@ -28,9 +31,26 @@ cargo build --release
 cargo test
 ```
 
-The tests cover config parsing and validation, host routing, the per-IP
-limiters, and SNI certificate resolution. They need no network, no certificates
-on disk, and no root.
+The suite runs without root, without network and without a certificate checked
+into the tree:
+
+- config parsing and validation, including static roots, IPv6 listeners and
+  certificate modes;
+- host routing, path routing, the per-IP limiters, SNI resolution;
+- static-file traversal and symlink guards;
+- a throwaway ACME **CA over TLS** (`tests/acme_e2e.rs`) that exercises a real
+  first start: account creation, http-01 token publication and fetch, order
+  finalization, and the written `cert/<domain>/` pair;
+- `--check` against a corpus of bad configs (`tests/config_check.rs`);
+- end-to-end raw TCP forwarding and static serving against the real binary.
+
+Run the formatting and lint gates before opening a PR:
+
+```sh
+cargo fmt --all -- --check
+cargo clippy --all-targets -- -D warnings
+cargo test
+```
 
 ## Running it locally
 
@@ -39,8 +59,8 @@ on disk, and no root.
 
 It expects a `test.local` certificate at `certs/test.local.crt` and
 `certs/test.local.key`. **No certificates are committed to this repository** —
-generate your own. `certs/` is gitignored, so nothing you put there can end up
-in a commit:
+generate your own. `certs/` is gitignored, so nothing you put there can end up in
+a commit:
 
 ```sh
 mkdir -p certs
@@ -67,99 +87,64 @@ curl -i  --resolve test.local:8088:127.0.0.1 http://test.local:8088/     # -> 30
 `test.local` is not in DNS — the TLS handshake needs a hostname (SNI) to choose
 a certificate for.
 
-## Deploying as a service
+For a static root, point `root = "…"` at a directory and drop `upstream`; for
+ACME, `keys = "auto"` and a name that resolves to the host.
+
+## Running it as a service
 
 uping does **not** run as root. The only root-level thing it does is bind `:80`
 and `:443`, and that is one capability — `CAP_NET_BIND_SERVICE` — not an
-identity. The unit runs as the dedicated `uping` user; the process holds no
-other privilege and cannot regain any (`NoNewPrivileges=yes`,
-`CapabilityBoundingSet=` one bit wide).
-
-The deployment is one script. It carries the unit and the certbot hook, creates
-the user and the directories, installs binary and config, starts the service,
-and then checks what it did:
+identity. Install it as a user service:
 
 ```sh
 cargo build --release
-curl --proto '=https' --tlsv1.2 -sSf \
-  https://raw.githubusercontent.com/raonagos/uping/main/deploy/install.sh \
-  | sudo sh -s -- --binary target/release/uping --config config.toml
+sudo setcap 'cap_net_bind_service=+ep' target/release/uping
+mkdir -p ~/.config/systemd/user
+cp uping.service ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable --now uping
+loginctl enable-linger "$USER"        # start at boot, not only at login
 ```
 
-Re-run it to upgrade: it keeps `/etc/uping/config.toml` unless `--config` says
-otherwise, and saves the unit it replaces as `uping.service.bak.<timestamp>`.
-`sudo sh deploy/install.sh --verify-only` re-runs just the checks, changes
-nothing, and exits non-zero on anything that still needs root — the unit's user,
-the ambient capability, the config and every certificate read *as the service
-user*, the live process's uid and capability mask, and who holds `:80`/`:443`.
+The repository's `uping.service` assumes the source checkout at `~/uping` and a
+config at `~/uping/config.toml`; adjust `WorkingDirectory` / `ExecStart` if your
+paths differ. The capability is stored on the binary and is **lost on every
+rebuild** — re-apply it after `cargo build --release`.
 
-Two things the unit does not give the user, because it must not:
+Certificates live under the config directory: `~/uping/cert/<domain>/` in this
+layout, `auto`-managed. For `keys = "manual"`, point `pub_key`/`priv_key` at any
+readable pair — a certbot copy under the same tree is fine, but uping will not
+reload it until restart.
 
-- **The config** is `root:uping 0640` — readable, not writable, by the proxy.
-- **The certificates.** `/etc/letsencrypt/live/*/privkey.pem` is mode `0600`
-  root-owned and reissued underneath you, so the proxy never reads it: a
-  certbot deploy hook copies the two files it needs into
-  `/etc/uping/certs/<lineage>/` as `root:uping 0640` and restarts the service.
-  Point `pub_key`/`priv_key` at that copy.
-
-The installer drops that hook at `/usr/local/lib/uping/install-cert.sh` and
-links it into `/etc/letsencrypt/renewal-hooks/deploy/`, where certbot runs it
-after any renewal — including the ones its own timer starts. For a lineage that
-already exists, run it once by hand:
-
-```sh
-sudo RENEWED_LINEAGE=/etc/letsencrypt/live/example.com /usr/local/lib/uping/install-cert.sh
-```
-
-```toml
-[[server]]
-domain   = "example.com"
-pub_key  = "/etc/uping/certs/example.com/fullchain.pem"
-priv_key = "/etc/uping/certs/example.com/privkey.pem"
-upstream = "127.0.0.1:8080"
-```
-
-### Moving an existing root install
-
-The same script is the migration. Publish the certificates the unprivileged
-user will read, point the config at those copies, keep a copy of the old one,
-then run the installer:
-
-```sh
-sudo cp -a /etc/uping/config.toml /etc/uping/config.toml.before-unprivileged
-sudo RENEWED_LINEAGE=/etc/letsencrypt/live/example.com /usr/local/lib/uping/install-cert.sh
-# edit pub_key/priv_key per [[server]] to /etc/uping/certs/<domain>/…
-curl --proto '=https' --tlsv1.2 -sSf <install.sh url> | sudo sh -s -- --binary ./uping
-curl -skI --resolve example.com:443:127.0.0.1 https://example.com/
-```
-
-Rollback is the saved unit and a `daemon-reload`, plus
-`config.toml.before-unprivileged`. Nothing else on the host is changed.
-
-### Not using systemd
-
-`AmbientCapabilities` needs systemd. Without it, grant the binary the one
-capability directly (`libcap2-bin`), and run it as `uping`:
-
-```sh
-sudo setcap 'cap_net_bind_service=+ep' /usr/local/bin/uping
-```
-
-The capability lives on the file and is **lost on every rebuild** — re-apply it
-after each `install`, or prefer the unit.
+The deployment script and its certbot hook were removed in v0.2.1. They belonged
+to the root-owned `/etc/uping` layout; ACME now does the renewal in-process. The
+apt layout (`/etc/uping/config.toml`, `/bin/uping`, `/etc/uping/cert`) is planned
+for the v0.3 release, and a package will carry its own unit.
 
 ## Project layout
 
 ```
 src/
-  main.rs    # bootstrap, wiring, run
-  config.rs  # TOML schema + validation
-  tls.rs     # SNI certificate resolver
-  limits.rs  # per-IP rate + connection limiters
-  proxy.rs   # HTTPS proxy + HTTP redirect
+  main.rs          # bootstrap, wiring, run, --check
+  config.rs        # TOML schema + validation
+  tls.rs           # SNI certificate resolver (live, renewals replace entries)
+  acme.rs          # ACME account, http-01 orders, storage, renewal thread
+  static_files.rs  # safe path resolution + streamed file responses
+  limits.rs        # per-IP rate + connection limiters
+  proxy.rs         # HTTPS proxy, HTTP redirect + ACME challenge path
+  stream.rs        # experimental raw TCP forwarder
+tests/
+  config_check.rs  # the bad-config corpus for --check
+  acme_e2e.rs      # a fake ACME CA, TLS, real first start
+  static_e2e.rs    # static serving through the real binary
+  stream_e2e.rs    # raw TCP forwarding through the real binary
+uping.service      # user unit
 ```
 
 ## Before you open a pull request
 
-- `cargo test` and `cargo clippy --all-targets` are clean.
+- `cargo fmt --all -- --check`, `cargo clippy --all-targets -- -D warnings` and
+  `cargo test` are clean.
 - New behaviour comes with a test; keep the diff scoped.
+- Anything touching `[[stream]]` should remember it is labelled experimental in
+  the README and the startup log.

@@ -1,8 +1,24 @@
 //! uping configuration model.
 //!
-//! The whole config stays small, but v0.1.1 adds two optional sections:
+//! The whole config stays small. Relative paths — manual key files, static
+//! roots, the certificate directory — are resolved against the directory that
+//! holds `config.toml`, so the process can be started from anywhere.
 //!
 //! ```toml
+//! # Optional. Listener addresses. `ipv6 = true` widens the wildcard to the
+//! # dual-stack `[::]:port`; an IPv6 literal is also accepted directly.
+//! [listen]
+//! http  = "0.0.0.0:80"
+//! https = "0.0.0.0:443"
+//! ipv6  = true
+//!
+//! # Optional. ACME / Let's Encrypt, used by `keys = "auto"`.
+//! [acme]
+//! email             = "ops@example.com"
+//! staging           = false
+//! cert_dir          = "cert"          # <config dir>/cert/<domain>/
+//! renew_before_days = 30              # clamped to 1..=89
+//!
 //! # Optional. Abuse protection. Each limit can be disabled with 0.
 //! [limits]
 //! per_ip_rps         = 300        # sustained requests/sec from one client IP
@@ -15,21 +31,26 @@
 //!
 //! [[server]]
 //! domain   = "www.example.com"
-//! pub_key  = "certs/www.example.com/fullchain.pem"
-//! priv_key = "certs/www.example.com/privkey.pem"
+//! keys     = "auto"                    # default when no key paths are given
 //! upstream = "127.0.0.1:8080"          # catch-all
 //!
-//! # Optional. One upstream per path prefix; the longest prefix wins.
+//! # Or serve files instead of proxying; one of upstream/root.
+//! [[server]]
+//! domain = "static.example.com"
+//! root   = "public"                    # relative to config.toml
+//! index  = "index.html"
+//!
+//! # Optional. One target per path prefix; the longest prefix wins.
 //! [[server.route]]
-//! path     = "/mcp"                    # segment prefix: /mcp, /mcp/…
+//! path     = "/mcp"
 //! upstream = "127.0.0.1:8081"
 //!
 //! [[server.route]]
-//! path         = "/assets/"
-//! upstream     = "127.0.0.1:8085"
-//! strip_prefix = true                  # backend sees /app.css, not /assets/app.css
+//! path         = "/assets"
+//! root         = "public/assets"
+//! strip_prefix = true
 //!
-//! # Optional. Raw TCP forwarding, one listener per entry (v0.2.0).
+//! # Experimental. Raw TCP forwarding, one listener per entry.
 //! [[stream]]
 //! name     = "smtp"                    # log label, optional
 //! listen   = "*:25"                    # `*` = every IPv4 interface = 0.0.0.0
@@ -37,14 +58,23 @@
 //! connect_timeout_ms = 5000            # default 5000, clamped to 100..30000
 //! ```
 
-use std::path::Path;
+use std::net::{IpAddr, SocketAddr};
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use serde::Deserialize;
 
 /// Top level configuration.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Config {
+    /// Directory the config file lives in. Every relative path in the file —
+    /// static roots, manual key paths, the certificate directory — is resolved
+    /// against it, so `uping /etc/uping/config.toml` behaves the same whatever
+    /// the current directory is. Not deserialized.
+    #[serde(skip)]
+    pub root_dir: PathBuf,
+
     /// Listening addresses. Defaults to :80 / :443, so most users never set this.
     #[serde(default)]
     pub listen: Listen,
@@ -56,6 +86,10 @@ pub struct Config {
     /// TLS behaviour.
     #[serde(default)]
     pub tls: Tls,
+
+    /// Certificate acquisition and storage (`keys = "auto"`).
+    #[serde(default)]
+    pub acme: Acme,
 
     /// One entry per reverse-proxied domain.
     #[serde(rename = "server", default)]
@@ -75,13 +109,22 @@ pub struct Config {
 /// Where uping binds. Defaults to the standard HTTP/HTTPS ports.
 ///
 /// Both fields accept `*:port` as shorthand for `0.0.0.0:port`; the wildcard is
-/// canonicalised at load time.
-#[derive(Debug, Deserialize)]
+/// canonicalised at load time. An IPv6 literal is written the usual way, e.g.
+/// `"[::]:443"`.
+///
+/// `ipv6 = true` widens the common wildcard cases: `0.0.0.0:port` becomes the
+/// dual-stack `[::]:port` (one socket serving both families), and a loopback
+/// `127.0.0.1:port` gains `[::1]:port` beside it. A concrete IPv4 address is
+/// left alone — write the IPv6 address you want explicitly instead.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Listen {
     #[serde(default = "default_http")]
     pub http: String,
     #[serde(default = "default_https")]
     pub https: String,
+    #[serde(default)]
+    pub ipv6: bool,
 }
 
 impl Default for Listen {
@@ -89,7 +132,43 @@ impl Default for Listen {
         Listen {
             http: default_http(),
             https: default_https(),
+            ipv6: false,
         }
+    }
+}
+
+impl Listen {
+    /// The HTTP addresses to bind, after the `ipv6` convenience is applied.
+    pub fn http_addrs(&self) -> Vec<String> {
+        bind_set(&self.http, self.ipv6)
+    }
+
+    /// The HTTPS addresses to bind, after the `ipv6` convenience is applied.
+    pub fn https_addrs(&self) -> Vec<String> {
+        bind_set(&self.https, self.ipv6)
+    }
+}
+
+/// Expand one configured bind address into the addresses to actually bind.
+fn bind_set(raw: &str, ipv6: bool) -> Vec<String> {
+    if !ipv6 {
+        return vec![raw.to_string()];
+    }
+    let Ok(addr) = raw.parse::<SocketAddr>() else {
+        // Validation reports the syntax error later; leave the string alone.
+        return vec![raw.to_string()];
+    };
+    match addr.ip() {
+        IpAddr::V4(v4) if v4.is_unspecified() => {
+            // Linux binds `[::]` dual-stack by default, so this one socket also
+            // answers IPv4. Listing 0.0.0.0 beside it would fail with EADDRINUSE.
+            vec![format!("[::]:{}", addr.port())]
+        }
+        IpAddr::V4(v4) if v4.is_loopback() => {
+            vec![raw.to_string(), format!("[::1]:{}", addr.port())]
+        }
+        // A concrete address has no derivable v6 sibling.
+        _ => vec![raw.to_string()],
     }
 }
 
@@ -112,6 +191,7 @@ fn default_https() -> String {
 /// A single-IP flood of tens of thousands of requests per second is stopped;
 /// a burst of a few hundred is not.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Limits {
     /// Sustained HTTP requests per second from one client IP, across all
     /// domains. Above this the request is answered with `429 Too Many Requests`.
@@ -153,6 +233,7 @@ fn default_max_body_bytes() -> usize {
 
 /// TLS behaviour.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Tls {
     /// When a client sends no SNI, or an SNI that matches no `[[server]]`, serve
     /// the first configured certificate instead of failing the handshake.
@@ -176,26 +257,151 @@ fn default_true() -> bool {
     true
 }
 
+/// How a domain's certificate is obtained.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum KeyMode {
+    /// Request and renew the certificate through ACME. This is the default for
+    /// a `[[server]]` that names no key paths.
+    Auto,
+    /// Read the two PEM files named by `pub_key` and `priv_key`; renew them
+    /// yourself (certbot, an ACME client, a paid CA, …).
+    Manual,
+}
+
+/// Let's Encrypt / ACME settings, used when a `[[server]]` is in `auto` mode.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Acme {
+    /// Contact address sent to the CA. Optional — the CA accepts an empty
+    /// contact — but without it you get no expiry warning if renewal fails.
+    #[serde(default)]
+    pub email: String,
+
+    /// Use the Let's Encrypt staging directory. Certificates from it are not
+    /// trusted by browsers; it exists so a misconfiguration can be debugged
+    /// without burning the production rate limit.
+    #[serde(default)]
+    pub staging: bool,
+
+    /// A custom ACME directory URL. Empty means Let's Encrypt (production or
+    /// staging, per `staging`).
+    #[serde(default)]
+    pub directory: String,
+
+    /// PEM root certificate to trust for an `https://` `directory` that is not
+    /// signed by a public CA — a private ACME server (step-ca, Pebble, an
+    /// internal CA). Empty means the system trust store.
+    #[serde(default)]
+    pub ca_bundle: String,
+
+    /// Where generated certificates live, relative to the config file (or
+    /// absolute). One subdirectory per domain:
+    /// `<cert_dir>/<domain>/{fullchain,privkey}.pem`. Default `cert`.
+    #[serde(default = "default_cert_dir")]
+    pub cert_dir: String,
+
+    /// Renew when the certificate has fewer than this many days left. Clamped
+    /// to `1..=89` (Let's Encrypt certificates live 90 days).
+    #[serde(default = "default_renew_before_days")]
+    pub renew_before_days: u64,
+}
+
+impl Default for Acme {
+    fn default() -> Self {
+        Acme {
+            email: String::new(),
+            staging: false,
+            directory: String::new(),
+            ca_bundle: String::new(),
+            cert_dir: default_cert_dir(),
+            renew_before_days: default_renew_before_days(),
+        }
+    }
+}
+
+impl Acme {
+    /// The directory URL the client should talk to.
+    pub fn directory_url(&self) -> &str {
+        let custom = self.directory.trim();
+        if !custom.is_empty() {
+            custom
+        } else if self.staging {
+            "https://acme-staging-v02.api.letsencrypt.org/directory"
+        } else {
+            "https://acme-v02.api.letsencrypt.org/directory"
+        }
+    }
+}
+
+fn default_cert_dir() -> String {
+    "cert".to_string()
+}
+
+fn default_renew_before_days() -> u64 {
+    30
+}
+
+fn default_index() -> String {
+    "index.html".to_string()
+}
+
 /// A single reverse-proxied domain.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Server {
     /// The public domain name, e.g. `www.example.com`. Matched case-insensitively
     /// against the TLS SNI name and the HTTP `Host` header.
     pub domain: String,
 
-    /// Path to the PEM certificate (leaf first, then any intermediates / fullchain).
+    /// `auto` (ACME) or `manual` (read `pub_key`/`priv_key`). When omitted,
+    /// naming both key paths selects `manual`; naming neither selects `auto`.
+    #[serde(default)]
+    pub keys: Option<KeyMode>,
+
+    /// Path to the PEM certificate (leaf first, then any intermediates /
+    /// fullchain). Required in `manual` mode; in `auto` mode it optionally
+    /// overrides where the generated certificate is written.
+    #[serde(default)]
     pub pub_key: String,
 
-    /// Path to the PEM private key.
+    /// Path to the PEM private key. Same rules as `pub_key`.
+    #[serde(default)]
     pub priv_key: String,
 
     /// Where to forward traffic, e.g. `127.0.0.1:8080` or `localhost:3000`.
+    /// Exactly one of `upstream` and `root` must be set.
+    #[serde(default)]
     pub upstream: String,
 
+    /// Serve static files from this directory when no route matches, instead
+    /// of proxying. Relative to the config file. Exactly one of `upstream` and
+    /// `root` must be set.
+    #[serde(default)]
+    pub root: String,
+
+    /// File served for a directory request. Default `index.html`.
+    #[serde(default = "default_index")]
+    pub index: String,
+
     /// Optional path routes (`[[server.route]]`). The longest matching `path`
-    /// wins; everything else falls through to `upstream`.
+    /// wins; everything else falls through to this server's `upstream`/`root`.
     #[serde(rename = "route", default)]
     pub routes: Vec<Route>,
+}
+
+impl Server {
+    /// The effective certificate mode, applying the backwards-compatible
+    /// inference described on `keys`.
+    pub fn key_mode(&self) -> KeyMode {
+        self.keys.unwrap_or_else(|| {
+            if self.pub_key.trim().is_empty() && self.priv_key.trim().is_empty() {
+                KeyMode::Auto
+            } else {
+                KeyMode::Manual
+            }
+        })
+    }
 }
 
 /// One path-prefix route.
@@ -204,14 +410,27 @@ pub struct Server {
 /// top-level `[[route]]` it serves every domain named in `hosts` — or every
 /// `[[server]]` when `hosts` is empty.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Route {
     /// Path prefix, e.g. `/mcp` or `/assets/`.
     pub path: String,
 
-    /// Where requests matching `path` are forwarded.
+    /// Where requests matching `path` are forwarded. Exactly one of `upstream`
+    /// and `root` must be set.
+    #[serde(default)]
     pub upstream: String,
 
-    /// Remove `path` from the request path before forwarding it.
+    /// Serve static files under this directory instead of proxying. Relative
+    /// to the config file. Exactly one of `upstream` and `root` must be set.
+    #[serde(default)]
+    pub root: String,
+
+    /// File served for a directory request. Default `index.html`.
+    #[serde(default = "default_index")]
+    pub index: String,
+
+    /// Remove `path` from the request path before forwarding it (or before
+    /// resolving it under `root`).
     #[serde(default)]
     pub strip_prefix: bool,
 
@@ -250,6 +469,7 @@ impl Route {
 /// copied to `upstream` and back, byte for byte. This is what a mail port needs
 /// — the TLS inside the stream belongs to the mail server, not to uping.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Stream {
     /// Log label. Falls back to the `listen` address when empty.
     #[serde(default)]
@@ -308,6 +528,35 @@ impl Config {
         self.servers.is_empty() && self.streams.is_empty()
     }
 
+    /// Resolve a configured path: absolute paths are kept, relative ones are
+    /// taken from the directory holding `config.toml`.
+    pub fn resolve(&self, raw: &str) -> PathBuf {
+        resolve_path(&self.root_dir, raw)
+    }
+
+    /// Where `keys = "auto"` writes certificates.
+    pub fn cert_dir(&self) -> PathBuf {
+        self.resolve(&self.acme.cert_dir)
+    }
+
+    /// The certificate and key paths for one server. In `auto` mode they are
+    /// either the optional `pub_key`/`priv_key` overrides or
+    /// `<cert_dir>/<domain>/{fullchain,privkey}.pem`.
+    #[cfg(test)]
+    pub fn key_paths(&self, server: &Server) -> (PathBuf, PathBuf) {
+        if !server.pub_key.trim().is_empty() {
+            (
+                self.resolve(&server.pub_key),
+                self.resolve(&server.priv_key),
+            )
+        } else {
+            let dir = self
+                .cert_dir()
+                .join(server.domain.trim().to_ascii_lowercase());
+            (dir.join("fullchain.pem"), dir.join("privkey.pem"))
+        }
+    }
+
     /// Read and parse a TOML config file.
     pub fn load(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
@@ -315,6 +564,7 @@ impl Config {
             .with_context(|| format!("reading config file `{}`", path.display()))?;
         let mut cfg: Config = toml::from_str(&raw)
             .with_context(|| format!("parsing TOML in `{}`", path.display()))?;
+        cfg.root_dir = absolute_parent(path)?;
 
         if cfg.is_empty() {
             anyhow::bail!(
@@ -322,41 +572,161 @@ impl Config {
                 path.display()
             );
         }
-        for s in &cfg.servers {
-            if s.domain.trim().is_empty() {
-                anyhow::bail!("a [[server]] entry has an empty `domain`");
+        for s in &mut cfg.servers {
+            // The same trimmed value must be what routing stores, not just
+            // what validation looks at.
+            s.domain = s.domain.trim().to_string();
+            s.index = s.index.trim().to_string();
+            for r in &mut s.routes {
+                r.path = r.path.trim().to_string();
+                r.index = r.index.trim().to_string();
             }
-            if s.upstream.trim().is_empty() {
-                anyhow::bail!("`{}` has an empty `upstream`", s.domain);
-            }
-            validate_upstream(&s.upstream, &format!("`{}` `upstream`", s.domain))?;
-            if s.pub_key.trim().is_empty() {
-                anyhow::bail!("`{}` has an empty `pub_key`", s.domain);
-            }
-            if s.priv_key.trim().is_empty() {
-                anyhow::bail!("`{}` has an empty `priv_key`", s.domain);
-            }
-            validate_routes(&s.routes, &format!("`{}`", s.domain))?;
+            validate_server(s, &cfg.root_dir)?;
         }
-        validate_routes(&cfg.routes, "global")?;
+        for r in &mut cfg.routes {
+            r.path = r.path.trim().to_string();
+            r.index = r.index.trim().to_string();
+        }
+        validate_routes(&cfg.routes, "global", &cfg.root_dir)?;
         validate_global_hosts(&cfg)?;
+        cfg.acme.renew_before_days = cfg.acme.renew_before_days.clamp(1, 89);
+        validate_acme(&cfg.acme, &cfg.root_dir)?;
         validate_streams(&mut cfg)?;
         Ok(cfg)
     }
 }
 
+/// The directory of `path`, made absolute. `Path::parent` returns an empty path
+/// for a bare filename, which is not useful for resolving config-relative files.
+fn absolute_parent(path: &Path) -> Result<PathBuf> {
+    let parent = path.parent().unwrap_or_else(|| Path::new(""));
+    let abs = if parent.as_os_str().is_empty() {
+        std::env::current_dir().context("reading the current directory")?
+    } else if parent.is_absolute() {
+        parent.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .context("reading the current directory")?
+            .join(parent)
+    };
+    Ok(abs)
+}
+
+fn resolve_path(root_dir: &Path, raw: &str) -> PathBuf {
+    let p = Path::new(raw.trim());
+    if p.is_absolute() {
+        p.to_path_buf()
+    } else {
+        root_dir.join(p)
+    }
+}
+
+/// One `[[server]]`: a domain, a certificate mode, and one catch-all target.
+fn validate_server(s: &Server, root_dir: &Path) -> Result<()> {
+    if s.domain.trim().is_empty() {
+        anyhow::bail!("a [[server]] entry has an empty `domain`");
+    }
+    let domain = s.domain.trim();
+    if domain.contains('/')
+        || domain.contains(':')
+        || domain.contains(char::is_whitespace)
+        || domain.contains('*')
+    {
+        anyhow::bail!("`{domain}` is not a hostname: no scheme, path, port or wildcard");
+    }
+
+    validate_target(&s.upstream, &s.root, root_dir, &format!("`{domain}`"))?;
+    validate_index(&s.index, &format!("`{domain}`"))?;
+
+    let mode = s.key_mode();
+    let pub_set = !s.pub_key.trim().is_empty();
+    let priv_set = !s.priv_key.trim().is_empty();
+    match mode {
+        KeyMode::Manual if !pub_set => anyhow::bail!("`{domain}` has an empty `pub_key`"),
+        KeyMode::Manual if !priv_set => anyhow::bail!("`{domain}` has an empty `priv_key`"),
+        KeyMode::Auto if pub_set != priv_set => anyhow::bail!(
+            "`{domain}`: give both `pub_key` and `priv_key` to override the certificate paths, or neither"
+        ),
+        _ => {}
+    }
+
+    validate_routes(&s.routes, &format!("`{domain}`"), root_dir)?;
+    Ok(())
+}
+
+/// Exactly one of `upstream` and `root`, and it has to be usable now.
+fn validate_target(upstream: &str, root: &str, root_dir: &Path, owner: &str) -> Result<()> {
+    let has_upstream = !upstream.trim().is_empty();
+    let has_root = !root.trim().is_empty();
+
+    match (has_upstream, has_root) {
+        (false, false) => anyhow::bail!("{owner} needs an `upstream` or a `root`"),
+        (true, true) => {
+            anyhow::bail!("{owner} has both `upstream` and `root`; a request has one destination")
+        }
+        (true, false) => {
+            validate_upstream(upstream, &format!("{owner} `upstream`"))?;
+            Ok(())
+        }
+        (false, true) => validate_static_root(root, root_dir, &format!("{owner} `root`")),
+    }
+}
+
+fn validate_static_root(raw: &str, root_dir: &Path, what: &str) -> Result<()> {
+    let path = resolve_path(root_dir, raw);
+    let meta = std::fs::metadata(&path)
+        .with_context(|| format!("{what} `{}` is not a readable directory", path.display()))?;
+    if !meta.is_dir() {
+        anyhow::bail!("{what} `{}` is not a directory", path.display());
+    }
+    Ok(())
+}
+
+fn validate_index(index: &str, owner: &str) -> Result<()> {
+    let index = index.trim();
+    if index.is_empty() {
+        anyhow::bail!("{owner} has an empty `index`");
+    }
+    if index.contains('/') || index.contains('\\') || index == ".." || index == "." {
+        anyhow::bail!("{owner}: `index = \"{index}\"` must be a plain file name");
+    }
+    Ok(())
+}
+
+fn validate_acme(acme: &Acme, root_dir: &Path) -> Result<()> {
+    let url = acme.directory.trim();
+    if !url.is_empty() && !(url.starts_with("https://") || url.starts_with("http://")) {
+        anyhow::bail!("`[acme] directory = \"{url}\"` must be an http(s) URL");
+    }
+    let bundle = acme.ca_bundle.trim();
+    if !bundle.is_empty() {
+        let path = resolve_path(root_dir, bundle);
+        if !path.is_file() {
+            anyhow::bail!(
+                "`[acme] ca_bundle = \"{bundle}\"` is not a readable PEM file (`{}`)",
+                path.display()
+            );
+        }
+    }
+    if !acme.email.trim().is_empty() && !acme.email.contains('@') {
+        anyhow::bail!(
+            "`[acme] email = \"{}\"` does not look like an address",
+            acme.email
+        );
+    }
+    Ok(())
+}
+
 /// Reject route tables that would be ambiguous or unusable at request time.
-fn validate_routes(routes: &[Route], owner: &str) -> Result<()> {
+fn validate_routes(routes: &[Route], owner: &str, root_dir: &Path) -> Result<()> {
     let mut seen = std::collections::HashSet::new();
 
     for r in routes {
         let path = r.path.trim();
         let where_ = format!("{owner} route `{path}`");
 
-        if r.upstream.trim().is_empty() {
-            anyhow::bail!("{where_} has an empty `upstream`");
-        }
-        validate_upstream(&r.upstream, &format!("{where_} `upstream`"))?;
+        validate_target(&r.upstream, &r.root, root_dir, &where_)?;
+        validate_index(&r.index, &where_)?;
         if !path.starts_with('/') {
             anyhow::bail!("{where_}: `path` must start with `/`");
         }
@@ -364,7 +734,7 @@ fn validate_routes(routes: &[Route], owner: &str) -> Result<()> {
             anyhow::bail!("{where_}: `path` is a path prefix, not a URI");
         }
         if r.prefix() == "/" {
-            anyhow::bail!("{where_}: `/` is the catch-all, use the server's `upstream`");
+            anyhow::bail!("{where_}: `/` is the catch-all, use the server's `upstream` or `root`");
         }
         if !seen.insert(r.prefix().to_string()) {
             anyhow::bail!("{owner} has two routes for `{}`", r.prefix());
@@ -429,12 +799,27 @@ fn validate_streams(cfg: &mut Config) -> Result<()> {
     cfg.listen.http = canonical_bind(&cfg.listen.http, "`[listen] http`")?;
     cfg.listen.https = canonical_bind(&cfg.listen.https, "`[listen] https`")?;
 
-    let http = parse_addr(&cfg.listen.http, "`[listen] http`")?;
-    let https = parse_addr(&cfg.listen.https, "`[listen] https`")?;
+    let http = parse_all(&cfg.listen.http_addrs(), "`[listen] http`")?;
+    let https = parse_all(&cfg.listen.https_addrs(), "`[listen] https`")?;
     let http_bound = !cfg.servers.is_empty();
     let https_bound = !cfg.servers.is_empty();
 
-    let mut seen: Vec<(std::net::SocketAddr, String)> = Vec::new();
+    // The two HTTP-facing listeners must not fight over one socket either.
+    if http_bound && https_bound {
+        for a in &http {
+            for b in &https {
+                if addrs_conflict(a, b) {
+                    anyhow::bail!(
+                        "`[listen] http` {} clashes with `[listen] https` {}",
+                        cfg.listen.http.trim(),
+                        cfg.listen.https.trim()
+                    );
+                }
+            }
+        }
+    }
+
+    let mut seen: Vec<(SocketAddr, String)> = Vec::new();
 
     for s in &mut cfg.streams {
         let where_ = format!("[[stream]] `{}`", s.label());
@@ -451,14 +836,14 @@ fn validate_streams(cfg: &mut Config) -> Result<()> {
         let listen = parse_addr(&s.listen, &format!("{where_} `listen`"))?;
         validate_upstream(&s.upstream, &format!("{where_} `upstream`"))?;
 
-        if http_bound && addrs_conflict(&listen, &http) {
+        if http_bound && http.iter().any(|a| addrs_conflict(&listen, a)) {
             anyhow::bail!(
                 "{where_}: `listen` {} clashes with `[listen] http` {}",
                 s.listen.trim(),
                 cfg.listen.http.trim()
             );
         }
-        if https_bound && addrs_conflict(&listen, &https) {
+        if https_bound && https.iter().any(|a| addrs_conflict(&listen, a)) {
             anyhow::bail!(
                 "{where_}: `listen` {} clashes with `[listen] https` {}",
                 s.listen.trim(),
@@ -480,6 +865,10 @@ fn validate_streams(cfg: &mut Config) -> Result<()> {
             .clamp(MIN_STREAM_TIMEOUT_MS, MAX_STREAM_TIMEOUT_MS);
     }
     Ok(())
+}
+
+fn parse_all(raw: &[String], what: &str) -> Result<Vec<SocketAddr>> {
+    raw.iter().map(|a| parse_addr(a, what)).collect()
 }
 
 fn parse_addr(raw: &str, what: &str) -> Result<std::net::SocketAddr> {
@@ -547,9 +936,9 @@ fn canonical_bind(raw: &str, what: &str) -> Result<String> {
     let raw = raw.trim();
     let canon = match raw.strip_prefix('*') {
         Some(rest) if rest.starts_with(':') => format!("0.0.0.0{rest}"),
-        Some(_) => anyhow::bail!(
-            "{what} `{raw}`: a wildcard address is written `*:port`, e.g. `*:25`"
-        ),
+        Some(_) => {
+            anyhow::bail!("{what} `{raw}`: a wildcard address is written `*:port`, e.g. `*:25`")
+        }
         None => raw.to_string(),
     };
     canon
@@ -709,7 +1098,10 @@ upstream = "127.0.0.1:8080"
         );
         let err = Config::load(&path).unwrap_err().to_string();
 
-        assert!(err.contains("empty `upstream`"), "unexpected error: {err}");
+        assert!(
+            err.contains("needs an `upstream` or a `root`"),
+            "unexpected error: {err}"
+        );
         let _ = std::fs::remove_file(path);
     }
 
@@ -842,7 +1234,10 @@ strip_prefix = true
         );
         let err = Config::load(&path).unwrap_err().to_string();
 
-        assert!(err.contains("empty `upstream`"), "unexpected error: {err}");
+        assert!(
+            err.contains("needs an `upstream` or a `root`"),
+            "unexpected error: {err}"
+        );
         let _ = std::fs::remove_file(path);
     }
 
@@ -1094,7 +1489,9 @@ upstream = "127.0.0.1:10025"
     fn a_wildcard_stream_listen_is_canonicalised() {
         let path = write_temp(
             "stream-star.toml",
-            &format!("{MINIMAL}\n[[stream]]\nlisten = \"*:2525\"\nupstream = \"127.0.0.1:10025\"\n"),
+            &format!(
+                "{MINIMAL}\n[[stream]]\nlisten = \"*:2525\"\nupstream = \"127.0.0.1:10025\"\n"
+            ),
         );
         let cfg = Config::load(&path).unwrap();
 
@@ -1243,6 +1640,282 @@ upstream = "127.0.0.1:10025"
 
         assert!(
             err.contains("no [[server]] or [[stream]] entries"),
+            "unexpected error: {err}"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    // -----------------------------------------------------------------------
+    // Certificate modes
+    // -----------------------------------------------------------------------
+
+    const AUTO_SERVER: &str = r#"
+[[server]]
+domain   = "auto.local"
+upstream = "127.0.0.1:8080"
+"#;
+
+    #[test]
+    fn a_server_without_key_paths_defaults_to_auto() {
+        let path = write_temp("auto-default.toml", AUTO_SERVER);
+        let cfg = Config::load(&path).unwrap();
+        let s = &cfg.servers[0];
+
+        assert_eq!(s.key_mode(), KeyMode::Auto);
+        let (cert, key) = cfg.key_paths(s);
+        assert!(cert.ends_with("cert/auto.local/fullchain.pem"), "{cert:?}");
+        assert!(key.ends_with("cert/auto.local/privkey.pem"), "{key:?}");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn a_server_with_both_key_paths_defaults_to_manual() {
+        let path = write_temp("manual-default.toml", MINIMAL);
+        let cfg = Config::load(&path).unwrap();
+
+        assert_eq!(cfg.servers[0].key_mode(), KeyMode::Manual);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn an_explicit_auto_mode_may_override_the_storage_paths() {
+        let path = write_temp(
+            "auto-paths.toml",
+            r#"
+[[server]]
+domain   = "auto.local"
+keys     = "auto"
+pub_key  = "mine/fullchain.pem"
+priv_key = "mine/privkey.pem"
+upstream = "127.0.0.1:8080"
+"#,
+        );
+        let cfg = Config::load(&path).unwrap();
+        assert_eq!(cfg.servers[0].key_mode(), KeyMode::Auto);
+        let (cert, key) = cfg.key_paths(&cfg.servers[0]);
+        assert!(cert.ends_with("mine/fullchain.pem"));
+        assert!(key.ends_with("mine/privkey.pem"));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn manual_mode_requires_both_key_paths() {
+        let path = write_temp(
+            "manual-half.toml",
+            r#"
+[[server]]
+domain   = "manual.local"
+keys     = "manual"
+pub_key  = "only-cert.pem"
+upstream = "127.0.0.1:8080"
+"#,
+        );
+        let err = Config::load(&path).unwrap_err().to_string();
+        assert!(err.contains("empty `priv_key`"), "unexpected error: {err}");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn auto_mode_refuses_a_half_overridden_pair() {
+        let path = write_temp(
+            "auto-half.toml",
+            r#"
+[[server]]
+domain   = "auto.local"
+keys     = "auto"
+pub_key  = "only-cert.pem"
+upstream = "127.0.0.1:8080"
+"#,
+        );
+        let err = Config::load(&path).unwrap_err().to_string();
+        assert!(
+            err.contains("give both `pub_key` and `priv_key`"),
+            "unexpected error: {err}"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn the_certificate_directory_defaults_beside_the_config() {
+        let path = write_temp("cert-dir.toml", AUTO_SERVER);
+        let cfg = Config::load(&path).unwrap();
+        assert_eq!(cfg.cert_dir(), std::env::temp_dir().join("cert"));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn acme_settings_are_clamped_and_defaulted() {
+        let path = write_temp(
+            "acme.toml",
+            &format!(
+                "[acme]\nrenew_before_days = 300\ncert_dir = \"tls\"\nstaging = true\n{AUTO_SERVER}"
+            ),
+        );
+        let cfg = Config::load(&path).unwrap();
+        assert_eq!(cfg.acme.renew_before_days, 89);
+        assert_eq!(cfg.acme.cert_dir, "tls");
+        assert!(cfg.acme.directory_url().contains("staging"));
+        assert_eq!(cfg.cert_dir(), std::env::temp_dir().join("tls"));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn a_bad_acme_directory_is_refused() {
+        let path = write_temp(
+            "acme-bad.toml",
+            &format!("[acme]\ndirectory = \"not-a-url\"\n{AUTO_SERVER}"),
+        );
+        let err = Config::load(&path).unwrap_err().to_string();
+        assert!(err.contains("http(s) URL"), "unexpected error: {err}");
+        let _ = std::fs::remove_file(path);
+    }
+
+    // -----------------------------------------------------------------------
+    // Static roots
+    // -----------------------------------------------------------------------
+
+    fn static_root(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("uping-cfg-root-{}-{tag}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("index.html"), b"hello").unwrap();
+        dir
+    }
+
+    #[test]
+    fn a_server_may_serve_static_files_instead_of_proxying() {
+        let root = static_root("server");
+        let path = write_temp(
+            "static-server.toml",
+            &format!(
+                "[[server]]\ndomain = \"static.local\"\nroot = \"{}\"\nindex = \"index.html\"\n",
+                root.display()
+            ),
+        );
+        let cfg = Config::load(&path).unwrap();
+        assert!(cfg.servers[0].upstream.is_empty());
+        assert_eq!(cfg.servers[0].index, "index.html");
+        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_route_may_serve_static_files_and_strip_its_prefix() {
+        let root = static_root("route");
+        let path = write_temp(
+            "static-route.toml",
+            &format!(
+                "{MINIMAL}\n[[server.route]]\npath = \"/assets\"\nroot = \"{}\"\nstrip_prefix = true\n",
+                root.display()
+            ),
+        );
+        let cfg = Config::load(&path).unwrap();
+        let route = &cfg.servers[0].routes[0];
+        assert_eq!(route.prefix(), "/assets");
+        assert!(route.upstream.is_empty());
+        assert!(route.strip_prefix);
+        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_static_root_that_does_not_exist_is_refused() {
+        let path = write_temp(
+            "static-missing.toml",
+            "[[server]]\ndomain = \"static.local\"\nroot = \"/nonexistent/uping-root\"\n",
+        );
+        let err = Config::load(&path).unwrap_err().to_string();
+        assert!(
+            err.contains("not a readable directory"),
+            "unexpected error: {err}"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn upstream_and_root_are_mutually_exclusive() {
+        let root = static_root("both");
+        let path = write_temp(
+            "static-both.toml",
+            &format!(
+                "[[server]]\ndomain = \"both.local\"\nupstream = \"127.0.0.1:8080\"\nroot = \"{}\"\n",
+                root.display()
+            ),
+        );
+        let err = Config::load(&path).unwrap_err().to_string();
+        assert!(
+            err.contains("both `upstream` and `root`"),
+            "unexpected error: {err}"
+        );
+        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    // -----------------------------------------------------------------------
+    // IPv6
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn an_ipv6_literal_is_accepted_in_both_listener_slots() {
+        let path = write_temp(
+            "ipv6-literal.toml",
+            &format!("[listen]\nhttp = \"[::1]:8088\"\nhttps = \"[::]:8443\"\n{MINIMAL}"),
+        );
+        let cfg = Config::load(&path).unwrap();
+        assert_eq!(cfg.listen.http_addrs(), vec!["[::1]:8088"]);
+        assert_eq!(cfg.listen.https_addrs(), vec!["[::]:8443"]);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn ipv6_widens_the_wildcard_into_one_dual_stack_socket() {
+        let path = write_temp(
+            "ipv6-wild.toml",
+            &format!("[listen]\nhttp = \"0.0.0.0:8088\"\nhttps = \"0.0.0.0:8443\"\nipv6 = true\n{MINIMAL}"),
+        );
+        let cfg = Config::load(&path).unwrap();
+        assert_eq!(cfg.listen.http_addrs(), vec!["[::]:8088"]);
+        assert_eq!(cfg.listen.https_addrs(), vec!["[::]:8443"]);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn ipv6_adds_the_v6_loopback_beside_the_v4_one() {
+        let path = write_temp(
+            "ipv6-loop.toml",
+            &format!("[listen]\nhttp = \"127.0.0.1:8088\"\nhttps = \"127.0.0.1:8443\"\nipv6 = true\n{MINIMAL}"),
+        );
+        let cfg = Config::load(&path).unwrap();
+        assert_eq!(
+            cfg.listen.http_addrs(),
+            vec!["127.0.0.1:8088", "[::1]:8088"]
+        );
+        assert_eq!(
+            cfg.listen.https_addrs(),
+            vec!["127.0.0.1:8443", "[::1]:8443"]
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn ipv6_leaves_a_concrete_v4_address_alone() {
+        let path = write_temp(
+            "ipv6-concrete.toml",
+            &format!("[listen]\nhttp = \"10.0.0.1:8088\"\nipv6 = true\n{MINIMAL}"),
+        );
+        let cfg = Config::load(&path).unwrap();
+        assert_eq!(cfg.listen.http_addrs(), vec!["10.0.0.1:8088"]);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn http_and_https_may_not_share_a_socket() {
+        let path = write_temp(
+            "listen-same.toml",
+            &format!("[listen]\nhttp = \"127.0.0.1:8443\"\nhttps = \"127.0.0.1:8443\"\n{MINIMAL}"),
+        );
+        let err = Config::load(&path).unwrap_err().to_string();
+        assert!(
+            err.contains("clashes with `[listen] https`"),
             "unexpected error: {err}"
         );
         let _ = std::fs::remove_file(path);
