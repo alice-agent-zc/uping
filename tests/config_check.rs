@@ -391,6 +391,27 @@ fn a_wildcard_stream_listen_is_refused() {
     );
 }
 
+/// The deprecated map form still works, but `--check` says so on stderr while
+/// keeping stdout machine-readable.
+#[test]
+fn the_deprecated_map_form_is_accepted_with_a_warning() {
+    let (cert, key) = cert_pair();
+    let body = format!(
+        "[server.\"map.local\"]\nkeys = \"manual\"\n\
+         pub_key = \"{cert}\"\npriv_key = \"{key}\"\nupstream = \"127.0.0.1:8080\"\n"
+    );
+    let path = write("map-form.toml", &body);
+    let out = check(&path);
+
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr(&out));
+    assert!(stdout(&out).starts_with("ok: 1 [[server]]"));
+    assert!(
+        stderr(&out).contains("map form is deprecated"),
+        "stderr: {}",
+        stderr(&out)
+    );
+}
+
 /// A config a real operator would write, path first and `--check` last.
 #[test]
 fn a_realistic_three_server_config_is_accepted() {

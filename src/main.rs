@@ -100,6 +100,17 @@ fn parse_args(raw: impl Iterator<Item = String>) -> Result<Args> {
     })
 }
 
+/// `--check` and `--dns-zone` have no logger yet, so the deprecation goes to
+/// stderr; stdout stays machine-readable.
+fn warn_deprecated_map(cfg: &Config) {
+    if cfg.deprecated_server_map {
+        eprintln!(
+            "warning: the `[server.\"domain\"]` map form is deprecated; use `[[server]]` \
+             with `domain = \"...\"` instead"
+        );
+    }
+}
+
 /// Run [`check_config`] and exit: `0` with one line on stdout, `1` with the
 /// whole cause chain on stderr.
 fn run_check(path: &str) -> ! {
@@ -136,6 +147,7 @@ fn run_dns_zone(path: &str) -> ! {
 
 fn dns_zone(path: &str) -> Result<String> {
     let cfg = Config::load(path).with_context(|| format!("loading configuration from `{path}`"))?;
+    warn_deprecated_map(&cfg);
     let mut records: Vec<(String, std::net::IpAddr)> = Vec::new();
     for server in &cfg.servers {
         let (v4, v6) = server.binds(cfg.listen.https)?;
@@ -185,6 +197,7 @@ fn dns_zone(path: &str) -> Result<String> {
 /// config that killed the service on 2026-10-25.
 fn check_config(path: &str) -> Result<String> {
     let cfg = Config::load(path).with_context(|| format!("loading configuration from `{path}`"))?;
+    warn_deprecated_map(&cfg);
 
     // Same condition as `main`: an empty `[[server]]` list loads no TLS.
     // `from_config` parses every certificate that is already on disk and counts
