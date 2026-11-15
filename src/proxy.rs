@@ -673,11 +673,17 @@ impl ProxyHttp for HttpsProxy {
 /// the ACME http-01 path, which must be served in the clear.
 pub struct RedirectProxy {
     challenges: ChallengeStore,
+    /// Domains configured with `http = false`: they exist only behind HTTPS, so
+    /// a request for one on port 80 is a plain `404`, not a redirect.
+    disabled: Arc<RwLock<Arc<HashSet<String>>>>,
 }
 
 impl RedirectProxy {
-    pub fn new(challenges: ChallengeStore) -> Self {
-        Self { challenges }
+    pub fn new(challenges: ChallengeStore, disabled: Arc<RwLock<Arc<HashSet<String>>>>) -> Self {
+        Self {
+            challenges,
+            disabled,
+        }
     }
 }
 
@@ -700,6 +706,17 @@ impl ProxyHttp for RedirectProxy {
 
     async fn request_filter(&self, session: &mut Session, _ctx: &mut Self::CTX) -> Result<bool> {
         session.set_keepalive(Some(KEEPALIVE_TIMEOUT_SECS));
+        let host = request_host(session).unwrap_or_default();
+        let disabled = {
+            let set = self.disabled.read().unwrap_or_else(|e| e.into_inner());
+            set.contains(&host)
+        };
+        if disabled {
+            debug!("no HTTP vhost for `{host}` (`http = false`), answering 404");
+            session.respond_error(404).await?;
+            return Ok(true);
+        }
+
         let path = session.req_header().uri.path().to_string();
 
         if let Some(token) = path.strip_prefix(CHALLENGE_PREFIX) {
@@ -725,7 +742,6 @@ impl ProxyHttp for RedirectProxy {
             return Ok(true);
         }
 
-        let host = request_host(session).unwrap_or_default();
         let path = session
             .req_header()
             .uri

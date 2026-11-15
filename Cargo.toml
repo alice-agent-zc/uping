@@ -6,6 +6,9 @@ description = "A tiny TOML-configured reverse proxy with automatic HTTPS (ACME),
 license = "Apache-2.0"
 authors = ["tetuaoro <65575727+tetuaoro@users.noreply.github.com>"]
 repository = "https://github.com/raonagos/uping"
+readme = "README.md"
+keywords = ["reverse-proxy", "tls", "acme", "pingora", "http"]
+categories = ["web-programming::http-server", "network-programming"]
 
 [dependencies]
 pingora = { version = "0.9", features = ["proxy", "openssl", "connection_filter"] }

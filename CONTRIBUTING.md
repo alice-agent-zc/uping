@@ -46,6 +46,10 @@ The suite needs no root, no network and no certificate checked into the tree:
   `200`, and a TCP-only listener is not a healthy TLS upstream;
 - upstream TLS (`tests/upstream_tls_e2e.rs`): private CA, verify opt-out, and a
   wrong SNI failing the handshake;
+- a private site (`tests/private_http_e2e.rs`): `http = false` is `404` on :80
+  and still works on :443;
+- `--dns-zone` (`tests/dns_zone_e2e.rs`): records, a wildcard refusal, and the
+  `--check` conflict;
 - a SIGHUP reload test (`tests/reload_e2e.rs`): new root, invalid TOML, listener
   change;
 - end-to-end static serving and raw TCP forwarding.
@@ -112,6 +116,19 @@ listen6 = "[2001:db8::10]:8443"
 domain = "static.example.com"
 root   = "public"                 # instead of upstream
 index  = "index.html"             # the default
+
+# A private site: only on the WireGuard address, and no public HTTP vhost.
+# `keys = "manual"` is required because http-01 cannot run with `http = false`;
+# the certificate comes from an internal CA (step-ca) whose root the clients trust.
+#
+# [[server]]
+# domain   = "app.vpn.example"
+# keys     = "manual"
+# pub_key  = "cert/app.vpn.example/fullchain.pem"
+# priv_key = "cert/app.vpn.example/privkey.pem"
+# upstream = "127.0.0.1:8080"
+# listen   = "10.8.0.1"     # the wg0 address
+# http     = false          # no :80 redirect, no ACME challenge
 
 # Map form: the table key is the domain. Routes nested below it belong to it.
 [server."mcp.example.com"]
@@ -183,6 +200,8 @@ listen6  = "[2001:db8::10]:8443"   # IPv6 with an explicit port
   global listener gets `421 Misdirected Request`.
 - HTTP is not per-server: it stays on `[listen] ipv4/ipv6` port 80, because that
   is where the ACME http-01 challenge answers and where the redirect lives.
+  A site that must not exist publicly sets `http = false` (see
+  [Private sites](#private-sites-and-dns) below).
 
 An overlap (e.g. a server overriding to `0.0.0.0:443` while the global listener
 already binds it) is refused when the config loads, with both sides named.
@@ -340,6 +359,67 @@ One listener per entry; duplicate sockets are a config error. Half-close is
 forwarded so the upstream can drain. There is no idle timeout (IMAP IDLE needs
 long silence) and no TLS termination — terminate it in the upstream.
 
+## Private sites and DNS
+
+A VPS that also runs WireGuard can host services that exist only inside the
+tunnel. Two settings make that explicit:
+
+```toml
+[[server]]
+domain   = "app.vpn.example"
+keys     = "manual"
+pub_key  = "cert/app.vpn.example/fullchain.pem"
+priv_key = "cert/app.vpn.example/privkey.pem"
+upstream = "127.0.0.1:8080"
+listen   = "10.8.0.1"   # the wg0 address only
+http     = false        # no :80 redirect, no ACME challenge
+```
+
+- `listen` (and `listen6`) bind the site to the VPN interface; the public
+  listeners never see it.
+- `http = false` removes the domain from port 80 entirely: a request for it on
+  :80 is `404`, not a redirect, so the name is not advertised.
+- `keys = "auto"` is refused with `http = false`: the http-01 challenge needs
+  port 80. Use `keys = "manual"` with a certificate from an internal CA
+  (step-ca, `mkcert` for a lab) whose root is installed on the clients. Let's
+  Encrypt's DNS-01 is not implemented yet.
+- `uping.service` must start after `wg-quick@wg0`, otherwise the address does
+  not exist at bind time. Firewall the port on `wg0` only.
+
+### `uping --dns-zone`
+
+uping does **not** serve DNS. The WireGuard-side resolver owns that: a resolver
+coupled to the proxy would have its own attack surface (UDP/TCP 53,
+amplification) and would stop answering whenever uping restarts.
+
+Instead, `uping --dns-zone` renders the records its config already knows, in
+`hosts(5)` format — one line per configured domain and family:
+
+```sh
+$ uping --dns-zone config.toml
+# uping --dns-zone: one record per configured domain and family.
+# Load with dnsmasq `addn-hosts=`, CoreDNS `hosts`, or /etc/hosts.
+10.8.0.1 app.vpn.example
+203.0.113.10 www.example.com
+2001:db8::1 www.example.com
+```
+
+The address comes from the site's `listen`/`listen6`, or from `[listen] ipv4` /
+`ipv6` when it has no override. A wildcard address (`0.0.0.0`, `::`) is refused:
+a DNS record must name a real address. That is the whole point — the config is
+the single source of truth, and the resolver loads its output:
+
+```sh
+uping --dns-zone config.toml > /etc/dnsmasq.d/uping.hosts
+# dnsmasq.conf: addn-hosts=/etc/dnsmasq.d/uping.hosts
+#                local=/vpn.example/
+#                interface=wg0
+#                bind-interfaces
+```
+
+On the client, `DNS = 10.8.0.1` in the WireGuard config. Public names keep
+resolving through the forwarder; `vpn.example` only exists in the tunnel.
+
 ## Reloading
 
 `systemctl --user reload uping` sends `SIGHUP`; uping re-reads the same config
@@ -352,6 +432,7 @@ Applied live:
 - `[tls] fallback_cert`;
 - manual certificates already on disk, and existing `auto` ones;
 - which domains each already-bound HTTPS listener may answer;
+- which domains answer on port 80 (`http = false` is applied live);
 - the health probe follows the new route table automatically;
 - a newly added `auto` domain is requested in the background through the
   running HTTP listener.
@@ -453,6 +534,8 @@ tests/
   listen_e2e.rs    # a per-server listener and its 421 isolation
   health_e2e.rs    # backend down -> 503, recovered -> 200
   upstream_tls_e2e.rs  # private CA, verify opt-out, wrong-SNI failure
+  private_http_e2e.rs  # http = false on :80, HTTPS still served
+  dns_zone_e2e.rs      # --dns-zone records and refusals
   reload_e2e.rs    # SIGHUP, bad config, listener warning
   static_e2e.rs    # static serving through the real binary
   stream_e2e.rs    # raw TCP through the real binary

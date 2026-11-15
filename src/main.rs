@@ -49,25 +49,29 @@ fn build_routes(cfg: &Config) -> Result<RouteTable> {
     RouteTable::from_config(cfg)
 }
 
-const USAGE: &str = "usage: uping [config.toml] [--check|--dry-run]";
+const USAGE: &str = "usage: uping [config.toml] [--check|--dry-run|--dns-zone]";
 
 /// A parsed command line: one optional config path and one flag.
 struct Args {
     path: String,
     check: bool,
+    dns_zone: bool,
 }
 
 /// Hand-parsed: two shapes and one flag do not justify a dependency, and a
 /// parser is itself a thing that can reject a valid invocation.
 ///
-/// Both `uping --check [path]` and `uping [path] --check` are accepted.
+/// Both `uping --check [path]` and `uping [path] --check` are accepted, and the
+/// same goes for `--dns-zone`.
 fn parse_args(raw: impl Iterator<Item = String>) -> Result<Args> {
     let mut path: Option<String> = None;
     let mut check = false;
+    let mut dns_zone = false;
 
     for arg in raw {
         match arg.as_str() {
             "--check" | "--dry-run" => check = true,
+            "--dns-zone" => dns_zone = true,
             "-h" | "--help" => {
                 println!("{USAGE}");
                 std::process::exit(0);
@@ -85,9 +89,14 @@ fn parse_args(raw: impl Iterator<Item = String>) -> Result<Args> {
         }
     }
 
+    if check && dns_zone {
+        anyhow::bail!("`--check` and `--dns-zone` are different outputs; pick one");
+    }
+
     Ok(Args {
         path: path.unwrap_or_else(|| "config.toml".into()),
         check,
+        dns_zone,
     })
 }
 
@@ -104,6 +113,66 @@ fn run_check(path: &str) -> ! {
             std::process::exit(1)
         }
     }
+}
+
+/// Print the resolver records for this config and exit.
+///
+/// The format is `hosts(5)` — `IP name`, one line per family — because that is
+/// what dnsmasq (`addn-hosts=`), CoreDNS (`hosts`) and `/etc/hosts` all read.
+/// uping does not serve DNS: the WireGuard-side resolver owns that, and this
+/// command keeps the names in sync with the proxy config.
+fn run_dns_zone(path: &str) -> ! {
+    match dns_zone(path) {
+        Ok(text) => {
+            print!("{text}");
+            std::process::exit(0)
+        }
+        Err(e) => {
+            eprintln!("error: {e:#}");
+            std::process::exit(1)
+        }
+    }
+}
+
+fn dns_zone(path: &str) -> Result<String> {
+    let cfg = Config::load(path).with_context(|| format!("loading configuration from `{path}`"))?;
+    let mut records: Vec<(String, std::net::IpAddr)> = Vec::new();
+    for server in &cfg.servers {
+        let (v4, v6) = server.binds(cfg.listen.https)?;
+        let addrs: Vec<std::net::IpAddr> = if v4.is_none() && v6.is_none() {
+            let mut all = vec![std::net::IpAddr::V4(cfg.listen.ipv4_addr()?)];
+            if let Some(v6) = cfg.listen.ipv6_addr()? {
+                all.push(std::net::IpAddr::V6(v6));
+            }
+            all
+        } else {
+            [v4, v6]
+                .into_iter()
+                .flatten()
+                .map(|addr| addr.ip())
+                .collect()
+        };
+        for ip in addrs {
+            if ip.is_unspecified() {
+                anyhow::bail!(
+                    "`{}` listens on the wildcard {ip}; set `[listen] ipv4`/`ipv6` \
+                     or a per-server `listen`/`listen6` to a concrete address, \
+                     otherwise a DNS record would point nowhere",
+                    server.domain
+                );
+            }
+            records.push((server.domain.clone(), ip));
+        }
+    }
+    records.sort();
+    let mut out = String::from(
+        "# uping --dns-zone: one record per configured domain and family.\n\
+         # Load with dnsmasq `addn-hosts=`, CoreDNS `hosts`, or /etc/hosts.\n",
+    );
+    for (domain, ip) in records {
+        out.push_str(&format!("{ip} {domain}\n"));
+    }
+    Ok(out)
 }
 
 /// Validate the config without touching the network, binding nothing and
@@ -142,6 +211,9 @@ fn main() -> Result<()> {
     let args = parse_args(std::env::args().skip(1))?;
     if args.check {
         run_check(&args.path);
+    }
+    if args.dns_zone {
+        run_dns_zone(&args.path);
     }
 
     env_logger::init();
@@ -186,6 +258,14 @@ fn main() -> Result<()> {
 
     // A first start has no HTTP listener yet, so the challenge binds the
     // configured HTTP address briefly and releases it before Pingora starts.
+    let http_disabled: Arc<RwLock<Arc<HashSet<String>>>> = Arc::new(RwLock::new(Arc::new(
+        cfg.servers
+            .iter()
+            .filter(|s| !s.http)
+            .map(|s| s.domain.to_ascii_lowercase())
+            .collect(),
+    )));
+
     let http_addrs: Vec<String> = cfg
         .listen
         .http_addrs()
@@ -252,7 +332,7 @@ fn main() -> Result<()> {
         // and a redirect does not need to know which vhost it came from.
         let mut http_service = ProxyServiceBuilder::new(
             &server.configuration,
-            RedirectProxy::new(challenges.clone()),
+            RedirectProxy::new(challenges.clone(), http_disabled.clone()),
         )
         .server_options(server_options)
         .build();
@@ -278,6 +358,7 @@ fn main() -> Result<()> {
         conn_limiter,
         max_body,
         allow_lists,
+        http_disabled,
         renewal_servers,
         health.clone(),
         &cfg,
@@ -393,6 +474,7 @@ mod tests {
             domain: domain.to_string(),
             listen: String::new(),
             listen6: String::new(),
+            http: true,
             keys: None,
             pub_key: "certs/test.local.crt".to_string(),
             priv_key: "certs/test.local.key".to_string(),
@@ -453,6 +535,21 @@ mod tests {
         let parsed = args(&["a.toml"]).unwrap();
         assert!(!parsed.check);
         assert_eq!(parsed.path, "a.toml");
+    }
+
+    #[test]
+    fn the_dns_zone_flag_is_accepted_before_or_after_the_path() {
+        for raw in [&["--dns-zone", "a.toml"][..], &["a.toml", "--dns-zone"][..]] {
+            let parsed = args(raw).expect("dns-zone flag should parse");
+            assert!(parsed.dns_zone);
+            assert!(!parsed.check);
+            assert_eq!(parsed.path, "a.toml");
+        }
+    }
+
+    #[test]
+    fn check_and_dns_zone_are_mutually_exclusive() {
+        assert!(args(&["--check", "--dns-zone", "a.toml"]).is_err());
     }
 
     #[test]

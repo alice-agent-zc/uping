@@ -595,6 +595,13 @@ pub struct Server {
     #[serde(default)]
     pub listen6: String,
 
+    /// Answer plain HTTP for this domain (the redirect and the ACME http-01
+    /// challenge). Default `true`. `false` means the domain exists only behind
+    /// HTTPS: a request for it on port 80 gets `404`, and `keys = "auto"` is
+    /// refused because http-01 needs that listener.
+    #[serde(default = "default_true")]
+    pub http: bool,
+
     /// `auto` (ACME) or `manual` (read `pub_key`/`priv_key`). When omitted,
     /// naming both key paths selects `manual`; naming neither selects `auto`.
     #[serde(default)]
@@ -976,6 +983,14 @@ fn validate_server(s: &Server, root_dir: &Path, https_port: u16) -> Result<()> {
         _ => {}
     }
 
+    if !s.http && mode == KeyMode::Auto {
+        anyhow::bail!(
+            "`{domain}` sets `http = false` but uses `keys = \"auto\"`: the ACME \
+             http-01 challenge needs the HTTP listener. Use `keys = \"manual\"` \
+             with a certificate from an internal CA, or keep `http = true`."
+        );
+    }
+
     validate_routes(&s.routes, &format!("`{domain}`"), root_dir)?;
     Ok(())
 }
@@ -1290,10 +1305,27 @@ fn validate_upstream(raw: &str, what: &str) -> Result<()> {
 }
 
 /// Two listen addresses clash when they name the same port and their IPs can be
-/// the same socket — the same address, or one side unspecified (`0.0.0.0`).
-/// Different concrete IPs on one port are legal and are left alone.
+/// the same socket.
+///
+/// Within one family that means the same address, or one side unspecified
+/// (`0.0.0.0` / `::`). Across families only the IPv6 wildcard is a conflict:
+/// Linux binds `[::]` dual-stack, so it already owns every IPv4 address on that
+/// port. `0.0.0.0` and a concrete IPv6 address are two independent sockets and
+/// are left alone.
 fn addrs_conflict(a: &std::net::SocketAddr, b: &std::net::SocketAddr) -> bool {
-    a.port() == b.port() && (a.ip() == b.ip() || a.ip().is_unspecified() || b.ip().is_unspecified())
+    if a.port() != b.port() {
+        return false;
+    }
+    match (a.ip(), b.ip()) {
+        (std::net::IpAddr::V4(x), std::net::IpAddr::V4(y)) => {
+            x == y || x.is_unspecified() || y.is_unspecified()
+        }
+        (std::net::IpAddr::V6(x), std::net::IpAddr::V6(y)) => {
+            x == y || x.is_unspecified() || y.is_unspecified()
+        }
+        (std::net::IpAddr::V4(_), std::net::IpAddr::V6(v6))
+        | (std::net::IpAddr::V6(v6), std::net::IpAddr::V4(_)) => v6.is_unspecified(),
+    }
 }
 
 #[cfg(test)]
@@ -1820,6 +1852,29 @@ listen6 = "2001:db8::1:9443"
             err.contains("only applies with `upstream_tls = true`"),
             "unexpected error: {err}"
         );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn http_false_needs_a_manual_certificate() {
+        let path = write_temp(
+            "http-off-auto.toml",
+            "[[server]]\ndomain = \"private.local\"\nupstream = \"127.0.0.1:8080\"\nhttp = false\n",
+        );
+        let err = Config::load(&path).unwrap_err().to_string();
+        assert!(
+            err.contains("http-01 challenge needs the HTTP listener"),
+            "unexpected error: {err}"
+        );
+        let _ = std::fs::remove_file(path);
+
+        let path = write_temp(
+            "http-off-manual.toml",
+            "[[server]]\ndomain = \"private.local\"\nkeys = \"manual\"\n\
+             pub_key = \"p.crt\"\npriv_key = \"p.key\"\nupstream = \"127.0.0.1:8080\"\nhttp = false\n",
+        );
+        let cfg = Config::load(&path).unwrap();
+        assert!(!cfg.servers[0].http);
         let _ = std::fs::remove_file(path);
     }
 

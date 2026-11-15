@@ -308,6 +308,7 @@ mod tests {
             domain: domain.to_string(),
             listen: String::new(),
             listen6: String::new(),
+            http: true,
             keys: None,
             pub_key: cert.clone(),
             priv_key: key.clone(),

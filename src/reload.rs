@@ -73,6 +73,8 @@ pub struct Reloader {
     conn_limiter: Arc<ConnLimiter>,
     max_body: Arc<AtomicUsize>,
     allow_lists: Vec<(GroupKey, Allowed)>,
+    /// Domains with `http = false`, swapped on reload.
+    http_disabled: Arc<RwLock<Arc<HashSet<String>>>>,
     /// Shared with the renewal thread; swapped on every successful reload.
     renewal_servers: Arc<RwLock<Vec<crate::config::Server>>>,
     /// Probed before the new route table becomes live.
@@ -98,6 +100,7 @@ impl Reloader {
         conn_limiter: Arc<ConnLimiter>,
         max_body: Arc<AtomicUsize>,
         allow_lists: Vec<(GroupKey, Allowed)>,
+        http_disabled: Arc<RwLock<Arc<HashSet<String>>>>,
         renewal_servers: Arc<RwLock<Vec<crate::config::Server>>>,
         health: Arc<HealthTracker>,
         cfg: &Config,
@@ -112,6 +115,7 @@ impl Reloader {
             conn_limiter,
             max_body,
             allow_lists,
+            http_disabled,
             renewal_servers,
             health,
             issue_tx: Mutex::new(issue_tx),
@@ -215,6 +219,17 @@ impl Reloader {
         // new config no longer names keeps its old set on purpose: the running
         // socket is still there until the restart, and its routes decide what
         // actually exists.
+        let disabled: HashSet<String> = new
+            .servers
+            .iter()
+            .filter(|s| !s.http)
+            .map(|s| s.domain.to_ascii_lowercase())
+            .collect();
+        *self
+            .http_disabled
+            .write()
+            .unwrap_or_else(|e| e.into_inner()) = Arc::new(disabled);
+
         for (key, allowed) in &self.allow_lists {
             if let Some(group) = groups.iter().find(|g| &g.key == key) {
                 let domains: HashSet<String> = group.domains.iter().cloned().collect();

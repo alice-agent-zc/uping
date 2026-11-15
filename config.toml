@@ -2,6 +2,7 @@
 #
 # Run:    uping config.toml
 # Check:  uping --check config.toml
+# DNS:    uping --dns-zone config.toml       (hosts records for a VPN resolver)
 # Reload: systemctl --user reload uping     (SIGHUP, no restart)
 # Restart only after installing a new binary, or after changing [listen],
 # a server's listen/listen6, or [[stream]].
@@ -57,6 +58,7 @@ upstream = "127.0.0.1:8080"       # catch-all: every path without its own route
 # challenge listener.
 # listen  = "203.0.113.10"
 # listen6 = "[2001:db8::10]:8443"
+# http    = false                 # no :80 vhost (private/VPN site; needs manual keys)
 
 # Optional. Speak HTTPS to the backend instead of plain HTTP.
 # upstream_tls    = true
