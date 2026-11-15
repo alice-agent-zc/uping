@@ -22,7 +22,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use instant_acme::{
@@ -90,6 +90,9 @@ pub struct CertManager {
     cert_dir: PathBuf,
     resolver: SniResolver,
     challenges: ChallengeStore,
+    /// One ACME order at a time. A renewal and a reload can both find work for
+    /// the same account; serialising avoids two orders racing the same token.
+    issue_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl CertManager {
@@ -100,6 +103,7 @@ impl CertManager {
             cert_dir: cfg.cert_dir(),
             resolver,
             challenges,
+            issue_lock: Arc::new(tokio::sync::Mutex::new(())),
         }
     }
 
@@ -120,47 +124,9 @@ impl CertManager {
         }
     }
 
-    /// Load every certificate that already exists. Returns the `auto` servers
-    /// whose pair is missing (or incomplete), to be requested next.
-    ///
-    /// A missing *manual* pair is an error: the operator promised two files and
-    /// uping cannot conjure them. A missing `auto` pair is expected on a first
-    /// start, and is the only reason this function returns work.
-    pub fn load_existing(&self, servers: &[Server]) -> Result<Vec<Server>> {
-        let mut pending = Vec::new();
-        for s in servers {
-            let (cert, key) = self.key_paths(s);
-            let cert_ok = cert.is_file();
-            let key_ok = key.is_file();
-
-            if cert_ok && key_ok {
-                if let Err(e) = self.resolver.load_files(&s.domain, &cert, &key) {
-                    match s.key_mode() {
-                        KeyMode::Manual => return Err(e),
-                        KeyMode::Auto => {
-                            warn!("{}; the certificate will be requested again", e);
-                            pending.push(s.clone());
-                        }
-                    }
-                }
-            } else {
-                match s.key_mode() {
-                    KeyMode::Manual => anyhow::bail!(
-                        "`{}` is manual and its certificate is missing: `{}` / `{}`",
-                        s.domain,
-                        cert.display(),
-                        key.display()
-                    ),
-                    KeyMode::Auto => pending.push(s.clone()),
-                }
-            }
-        }
-        Ok(pending)
-    }
-
-    /// Request every pending certificate. The HTTP challenge listener is bound
-    /// only if there is something to request, and is released before the caller
-    /// starts pingora.
+    /// Request every pending certificate at startup. The HTTP challenge
+    /// listener is bound only if there is something to request, and is released
+    /// before the caller starts pingora.
     pub fn obtain_missing(&self, pending: &[Server], http_addrs: &[String]) -> Result<()> {
         if pending.is_empty() {
             return Ok(());
@@ -197,17 +163,46 @@ impl CertManager {
         })
     }
 
-    /// Load what exists, then request what does not. The synchronous entry point
-    /// used by `main`.
-    pub fn prepare(&self, servers: &[Server], http_addrs: &[String]) -> Result<()> {
-        let pending = self.load_existing(servers)?;
-        self.obtain_missing(&pending, http_addrs)
+    /// Request pending certificates while the real HTTP listener is already
+    /// running. Used by a reload that adds an `auto` domain: the challenge is
+    /// served by the live redirect proxy, so nothing binds port 80 a second
+    /// time.
+    pub fn obtain_missing_live(&self, pending: &[Server]) {
+        if pending.is_empty() {
+            return;
+        }
+        let runtime = match tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        {
+            Ok(runtime) => runtime,
+            Err(e) => {
+                error!("acme: cannot create a renewal runtime: {e}");
+                return;
+            }
+        };
+
+        runtime.block_on(async {
+            for s in pending {
+                info!(
+                    "acme: requesting a certificate for {} ({})",
+                    s.domain,
+                    self.acme.directory_url()
+                );
+                if let Err(e) = self.issue(s).await {
+                    error!("acme: {} failed: {e:#}", s.domain);
+                }
+            }
+        });
     }
 
     /// Start the renewal thread. It checks once an hour; a certificate is only
     /// reissued when it is inside the `renew_before_days` window, so the hourly
     /// wake-up is just a local file read.
-    pub fn spawn_renewal(self: Arc<Self>, servers: Vec<Server>) -> Result<()> {
+    pub fn spawn_renewal(
+        self: Arc<Self>,
+        servers: Arc<std::sync::RwLock<Vec<Server>>>,
+    ) -> Result<()> {
         std::thread::Builder::new()
             .name("uping-acme".into())
             .spawn(move || {
@@ -228,7 +223,10 @@ impl CertManager {
                 std::thread::sleep(Duration::from_secs(30));
 
                 loop {
-                    runtime.block_on(self.renew_due(&servers));
+                    // The reload thread swaps this list in place; snapshot it so
+                    // a renewal never holds the lock across an await.
+                    let snapshot = servers.read().unwrap_or_else(|e| e.into_inner()).clone();
+                    runtime.block_on(self.renew_due(&snapshot));
                     std::thread::sleep(Duration::from_secs(60 * 60));
                 }
             })
@@ -295,7 +293,35 @@ impl CertManager {
 
     /// Run one order end to end and install the result.
     async fn issue(&self, server: &Server) -> Result<()> {
+        let _guard = self.issue_lock.lock().await;
         let domain = server.domain.trim().to_ascii_lowercase();
+
+        // Another thread may have issued this pair while we waited for the
+        // lock (renewal vs. a reload queue). Re-check under the lock and skip a
+        // duplicate order when a valid pair is already on disk.
+        let (cert_path, key_path) = self.key_paths(server);
+        if cert_path.is_file() && key_path.is_file() {
+            if let Ok(pem) = std::fs::read(&cert_path) {
+                if matches!(cert_is_due(&pem, self.acme.renew_before_days), Ok(false)) {
+                    if let Err(e) = self
+                        .resolver
+                        .load_files(&server.domain, &cert_path, &key_path)
+                    {
+                        debug!(
+                            "acme: {} has a valid pair but could not load it: {e}",
+                            server.domain
+                        );
+                    } else {
+                        debug!(
+                            "acme: {} already has a valid certificate; skipping",
+                            server.domain
+                        );
+                        return Ok(());
+                    }
+                }
+            }
+        }
+
         let account = self.account().await?;
         let identifiers = [Identifier::Dns(domain.clone())];
         let mut order = account
@@ -612,24 +638,66 @@ fn write_atomic(path: &Path, bytes: &[u8], mode: u32) -> Result<()> {
     use std::io::Write;
     use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
-    let tmp = path.with_extension(format!("tmp.{}", std::process::id()));
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(mode)
-        .open(&tmp)
-        .with_context(|| format!("creating `{}`", tmp.display()))?;
-    file.write_all(bytes)
-        .with_context(|| format!("writing `{}`", tmp.display()))?;
-    file.sync_all()
-        .with_context(|| format!("flushing `{}`", tmp.display()))?;
-    drop(file);
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("uping");
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
 
-    std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(mode))
-        .with_context(|| format!("setting permissions on `{}`", tmp.display()))?;
-    std::fs::rename(&tmp, path).with_context(|| format!("replacing `{}`", path.display()))?;
-    Ok(())
+    // `create_new` rather than truncate: a predictable temp name in a
+    // world-writable directory would otherwise be a symlink target for another
+    // local user. Retry a few names in the unlikely event of a collision.
+    for attempt in 0..10 {
+        let tmp = parent.join(format!(
+            ".{name}.tmp.{}.{nanos}.{attempt}",
+            std::process::id()
+        ));
+        let opened = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(mode)
+            .open(&tmp);
+
+        let mut file = match opened {
+            Ok(file) => file,
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => {
+                return Err(e).with_context(|| format!("creating `{}`", tmp.display()));
+            }
+        };
+
+        let written = file
+            .write_all(bytes)
+            .with_context(|| format!("writing `{}`", tmp.display()))
+            .and_then(|()| {
+                file.sync_all()
+                    .with_context(|| format!("flushing `{}`", tmp.display()))
+            });
+        drop(file);
+        if let Err(e) = written {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(e);
+        }
+
+        if let Err(e) = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(mode)) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(e).with_context(|| format!("setting permissions on `{}`", tmp.display()));
+        }
+        if let Err(e) = std::fs::rename(&tmp, path) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(e).with_context(|| format!("replacing `{}`", path.display()));
+        }
+        return Ok(());
+    }
+
+    anyhow::bail!(
+        "could not create a temporary file next to `{}`: too many name collisions",
+        path.display()
+    )
 }
 
 #[cfg(test)]

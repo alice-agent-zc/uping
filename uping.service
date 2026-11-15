@@ -8,6 +8,12 @@
 #   systemctl --user enable --now uping
 #   loginctl enable-linger "$USER"      # start at boot, not only at login
 #
+# After editing config.toml:
+#   systemctl --user reload uping       # SIGHUP, no restart, no dropped conn
+# Restart after installing a new binary, or after changing [listen], a server's
+# listen/listen6, or [[stream]] (sockets cannot be rebound under a live process):
+#   systemctl --user restart uping
+#
 # The capability lives on the binary and is lost on every rebuild; re-apply it.
 # `AmbientCapabilities` is deliberately not used: systemd should not grant the
 # service a capability the binary can hold by itself, and it does not work in a
@@ -24,6 +30,7 @@ After=network.target
 Type=simple
 WorkingDirectory=%h/uping
 ExecStart=%h/uping/target/release/uping %h/uping/config.toml
+ExecReload=/bin/kill -HUP $MAINPID
 # AmbientCapabilities denied, use `sudo setcap 'cap_net_bind_service=+ep' path/to/binary` instead
 #AmbientCapabilities=CAP_NET_BIND_SERVICE
 Restart=always

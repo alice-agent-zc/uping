@@ -140,7 +140,7 @@ fn static_files_are_served_with_mime_types_and_a_traversal_guard() {
     std::fs::write(
         &cfg_path,
         format!(
-            "[listen]\nhttp = \"127.0.0.1:{http}\"\nhttps = \"127.0.0.1:{https}\"\n\
+            "[listen]\nipv4 = \"127.0.0.1\"\nhttp = {http}\nhttps = {https}\n\
              [tls]\nfallback_cert = true\n\
              [[server]]\ndomain = \"static.local\"\nkeys = \"manual\"\n\
              pub_key = \"{}\"\npriv_key = \"{}\"\nroot = \"{}\"\n\

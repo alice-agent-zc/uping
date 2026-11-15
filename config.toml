@@ -1,19 +1,22 @@
-# uping v0.2 — example configuration
+# uping v0.3 — example configuration
 #
-# Run:  uping config.toml
-# Check: uping --check config.toml
+# Run:    uping config.toml
+# Check:  uping --check config.toml
+# Reload: systemctl --user reload uping     (SIGHUP, no restart)
+# Restart only after installing a new binary, or after changing [listen],
+# a server's listen/listen6, or [[stream]].
 #
 # Every relative path (certificates, static roots, cert_dir) is resolved from
 # the directory that holds this file.
 
-# Optional. Defaults to 0.0.0.0:80 and 0.0.0.0:443.
-# `*:port` is accepted as shorthand for `0.0.0.0:port`.
-# An IPv6 literal works directly; `ipv6 = true` turns the wildcard into the
-# dual-stack `[::]:port` (and adds [::1]:port beside a 127.0.0.1 listener).
+# Optional. The host-wide listeners. One address per family, one port per
+# protocol. There is no wildcard and no list: a domain that needs another
+# address or port overrides it with `listen` / `listen6` below.
 # [listen]
-# http  = "*:80"
-# https = "*:443"
-# ipv6  = false
+# ipv4  = "0.0.0.0"                # default
+# ipv6  = ""                       # e.g. "2607:f1c0:f031:4500::1"; empty = off
+# http  = 80                       # default
+# https = 443                      # default
 
 # Optional. Let's Encrypt, used by keys = "auto".
 # [acme]
@@ -40,6 +43,13 @@ domain   = "www.example.com"
 keys     = "auto"                 # default when no pub_key/priv_key are given
 upstream = "127.0.0.1:8080"       # catch-all: every path without its own route
 
+# Optional. Give this domain its own HTTPS listener instead of the global one.
+# `listen` is IPv4, `listen6` is IPv6; each may carry a port, which defaults to
+# `[listen] https`. HTTP stays host-wide: it is the redirect and the ACME
+# challenge listener.
+# listen  = "203.0.113.10"
+# listen6 = "[2001:db8::10]:8443"
+
 # A static site: no backend, just files. Exactly one of upstream/root.
 #
 # [[server]]
@@ -57,8 +67,9 @@ upstream = "127.0.0.1:8080"       # catch-all: every path without its own route
 # priv_key = "cert/manual.example.com/privkey.pem"
 # upstream = "127.0.0.1:8080"
 
-# Optional. One target per path prefix. The longest prefix wins, and a prefix
-# only matches whole segments: /mcp covers /mcp and /mcp/sse, not /mcpx.
+# Optional. One target per path prefix, nested under its server. The longest
+# prefix wins, and a prefix only matches whole segments: /mcp covers /mcp and
+# /mcp/sse, not /mcpx.
 #
 # [[server.route]]
 # path     = "/mcp"
@@ -69,20 +80,22 @@ upstream = "127.0.0.1:8080"       # catch-all: every path without its own route
 # root         = "public/assets"
 # strip_prefix = true            # /assets/app.css -> public/assets/app.css
 
-# Optional. One route for several domains at once. `hosts` empty (or ["*"])
-# means every [[server]]; a named list must match configured domains.
-# On an identical path the domain's own [[server.route]] wins.
+# The map form names the domain in the table key; a route nested below it
+# belongs to exactly that domain. Useful when one domain has several routes.
 #
-# [[route]]
-# path     = "/mcp"
-# upstream = "127.0.0.1:8081"
-# hosts    = ["www.example.com", "api.example.com"]   # optional
+# [server."mcp.example.com"]
+# upstream = "127.0.0.1:9000"
+#
+# [[server."mcp.example.com".route]]
+# path     = "/sse"
+# upstream = "127.0.0.1:9001"
 
-# EXPERIMENTAL in v0.2. Raw TCP forwarding: one listener per entry, no TLS
-# termination. `listen` accepts `*:port`; an `upstream` must name a real peer.
+# EXPERIMENTAL in v0.3. Raw TCP forwarding: one listener per entry, no TLS
+# termination. `listen` is one concrete `IP:port`; an `upstream` must name a
+# real peer.
 #
 # [[stream]]
 # name     = "smtp"
-# listen   = "*:25"
+# listen   = "0.0.0.0:25"
 # upstream = "127.0.0.1:10025"
 # connect_timeout_ms = 5000      # optional, default 5000, clamped 100..30000

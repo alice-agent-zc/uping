@@ -21,6 +21,7 @@
 //! stopping a flood.
 
 use std::net::{IpAddr, SocketAddr};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -34,53 +35,71 @@ const WINDOW: Duration = Duration::from_secs(1);
 /// Per-IP HTTP request limiter. A budget of `0` disables it.
 pub struct RequestLimiter {
     rate: Rate,
-    max_per_window: usize,
+    max_per_window: AtomicUsize,
 }
 
 impl RequestLimiter {
     pub fn new(max_per_window: usize) -> Self {
         Self {
             rate: Rate::new(WINDOW),
-            max_per_window,
+            max_per_window: AtomicUsize::new(max_per_window),
         }
     }
 
     /// Count this request and report whether it is within budget.
     pub fn check(&self, ip: &IpAddr) -> bool {
-        if self.max_per_window == 0 {
+        let budget = self.max_per_window.load(Ordering::Relaxed);
+        if budget == 0 {
             return true;
         }
         let seen = self.rate.observe(ip, 1);
-        seen <= self.max_per_window as isize
+        seen <= budget as isize
     }
 
     /// The configured budget, for logging.
     pub fn budget(&self) -> usize {
-        self.max_per_window
+        self.max_per_window.load(Ordering::Relaxed)
+    }
+
+    /// Apply a new budget after a config reload. The counters are kept: a reload
+    /// must not hand a flooding client a fresh window.
+    pub fn set_budget(&self, max_per_window: usize) {
+        self.max_per_window.store(max_per_window, Ordering::Relaxed);
     }
 }
 
 /// Per-IP TCP connection limiter, applied before the TLS handshake.
 pub struct ConnLimiter {
     rate: Rate,
-    max_per_window: usize,
+    max_per_window: AtomicUsize,
 }
 
 impl ConnLimiter {
     pub fn new(max_per_window: usize) -> Self {
         Self {
             rate: Rate::new(WINDOW),
-            max_per_window,
+            max_per_window: AtomicUsize::new(max_per_window),
         }
     }
 
     /// Count this connection and report whether it is within budget.
     fn allow(&self, ip: &IpAddr) -> bool {
-        if self.max_per_window == 0 {
+        let budget = self.max_per_window.load(Ordering::Relaxed);
+        if budget == 0 {
             return true;
         }
         let seen = self.rate.observe(ip, 1);
-        seen <= self.max_per_window as isize
+        seen <= budget as isize
+    }
+
+    /// The current budget, for logging.
+    pub fn budget(&self) -> usize {
+        self.max_per_window.load(Ordering::Relaxed)
+    }
+
+    /// Apply a new budget after a config reload.
+    pub fn set_budget(&self, max_per_window: usize) {
+        self.max_per_window.store(max_per_window, Ordering::Relaxed);
     }
 }
 
@@ -88,7 +107,7 @@ impl ConnLimiter {
 impl std::fmt::Debug for ConnLimiter {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ConnLimiter")
-            .field("max_per_window", &self.max_per_window)
+            .field("max_per_window", &self.budget())
             .finish()
     }
 }
@@ -106,7 +125,7 @@ impl ConnectionFilter for ConnLimiter {
             debug!(
                 "dropping connection from {} (over {} conn/s)",
                 addr.ip(),
-                self.max_per_window
+                self.budget()
             );
         }
         allowed

@@ -1,8 +1,10 @@
 //! The two `ProxyHttp` implementations that make up uping.
 
-use std::collections::HashMap;
-use std::sync::Arc;
+use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, RwLock};
 
+use anyhow::Context;
 use async_trait::async_trait;
 use bytes::Bytes;
 use log::{debug, error, warn};
@@ -15,6 +17,10 @@ use crate::acme::{ChallengeStore, CHALLENGE_PREFIX};
 use crate::limits::RequestLimiter;
 use crate::static_files::{self, StaticSite};
 
+/// How long an idle HTTP/1.1 connection is kept for the next request.
+/// Pingora has no global default for this; 75 s matches nginx's default.
+const KEEPALIVE_TIMEOUT_SECS: u64 = 75;
+
 /// Lowercase a `host[:port]` value, dropping any port suffix.
 ///
 /// An IPv6 authority is bracketed (`[2001:db8::1]:443`); splitting on the first
@@ -26,7 +32,9 @@ fn normalize_host(raw: &str) -> String {
     } else {
         raw.split(':').next().unwrap_or(raw)
     };
-    host.to_ascii_lowercase()
+    // `example.com.` is the same name as `example.com`; a trailing dot in a
+    // Host header must not turn into a 404 (or a route mismatch).
+    host.trim_end_matches('.').to_ascii_lowercase()
 }
 
 /// Pick the effective hostname: the `Host` header wins, the request URI
@@ -109,8 +117,9 @@ fn rewrite_path_and_query(path: &str, query: Option<&str>, prefix: &str) -> Stri
 /// Where one request goes.
 #[derive(Debug, Clone)]
 pub enum Target {
-    /// Forward it to a `host:port` upstream.
-    Proxy(String),
+    /// Forward it to a `host:port` upstream. Shared so the per-request clone
+    /// is an atomic increment, not an allocation.
+    Proxy(Arc<str>),
     /// Serve it from a directory on this host.
     Static(StaticSite),
 }
@@ -123,7 +132,7 @@ impl Target {
         root_dir: &std::path::Path,
     ) -> anyhow::Result<Self> {
         if !upstream.trim().is_empty() {
-            return Ok(Target::Proxy(upstream.trim().to_string()));
+            return Ok(Target::Proxy(Arc::from(upstream.trim())));
         }
         let path = if std::path::Path::new(root.trim()).is_absolute() {
             std::path::PathBuf::from(root.trim())
@@ -208,6 +217,30 @@ impl RouteTable {
         Self { sites }
     }
 
+    /// Build the table from a validated config. The config loader has already
+    /// checked every target; this second pass canonicalises static roots and is
+    /// the only place a reload can fail after `Config::load`.
+    pub fn from_config(cfg: &crate::config::Config) -> anyhow::Result<Self> {
+        let mut sites = HashMap::new();
+        for s in &cfg.servers {
+            let catch_all = Target::from_config(&s.upstream, &s.root, &s.index, &cfg.root_dir)
+                .with_context(|| format!("building the catch-all for `{}`", s.domain))?;
+            let mut routes = Vec::new();
+            for r in cfg.routes_for(s) {
+                routes.push(
+                    PathRoute::from_config(r, &cfg.root_dir).with_context(|| {
+                        format!("building route `{}` for `{}`", r.path, s.domain)
+                    })?,
+                );
+            }
+            sites.insert(
+                s.domain.to_ascii_lowercase(),
+                SiteRoutes::new(catch_all, routes),
+            );
+        }
+        Ok(Self::new(sites))
+    }
+
     pub fn get(&self, host: &str) -> Option<&SiteRoutes> {
         self.sites.get(host)
     }
@@ -222,7 +255,9 @@ impl RouteTable {
 #[derive(Default)]
 pub struct ProxyCtx {
     /// Upstream chosen for this request in `request_filter`.
-    upstream: Option<String>,
+    upstream: Option<Arc<str>>,
+    /// Normalized host, so `upstream_peer` does not parse the header again.
+    host: Option<String>,
     /// Prefix the matched route wants removed before forwarding.
     strip_prefix: Option<String>,
     /// Bytes of request body seen so far, for chunked uploads.
@@ -231,19 +266,31 @@ pub struct ProxyCtx {
 
 /// Terminates TLS and forwards to the upstream of the matching domain and path.
 pub struct HttpsProxy {
-    routes: Arc<RouteTable>,
-    /// Per-IP request budget.
-    limiter: RequestLimiter,
+    /// Swapped whole on a reload; readers clone the current `Arc`.
+    routes: Arc<RwLock<Arc<RouteTable>>>,
+    /// Per-IP request budget; its counters survive a reload.
+    limiter: Arc<RequestLimiter>,
     /// Largest request body we accept; `0` disables the check.
-    max_body_bytes: usize,
+    max_body_bytes: Arc<AtomicUsize>,
+    /// Domains this listener is allowed to answer. A server with its own
+    /// `listen`/`listen6` lives in its own group; a request for a domain from
+    /// another group is misdirected, even though routes and certificates are
+    /// shared. Swapped on reload with the rest of the config.
+    allowed: Arc<RwLock<Arc<HashSet<String>>>>,
 }
 
 impl HttpsProxy {
-    pub fn new(routes: Arc<RouteTable>, limiter: RequestLimiter, max_body_bytes: usize) -> Self {
+    pub fn new(
+        routes: Arc<RwLock<Arc<RouteTable>>>,
+        limiter: Arc<RequestLimiter>,
+        max_body_bytes: Arc<AtomicUsize>,
+        allowed: Arc<RwLock<Arc<HashSet<String>>>>,
+    ) -> Self {
         Self {
             routes,
             limiter,
             max_body_bytes,
+            allowed,
         }
     }
 }
@@ -258,6 +305,8 @@ impl ProxyHttp for HttpsProxy {
 
     /// Runs before the request is forwarded: rate limit, route, size check.
     async fn request_filter(&self, session: &mut Session, ctx: &mut Self::CTX) -> Result<bool> {
+        session.set_keepalive(Some(KEEPALIVE_TIMEOUT_SECS));
+
         // 1. Per-IP request budget. Counted for every request, including the
         //    ones we are about to reject, so a flood never gets a free pass.
         if let Some(addr) = session.client_addr().and_then(|a| a.as_inet()) {
@@ -276,36 +325,57 @@ impl ProxyHttp for HttpsProxy {
         //    instead of a 500 from `upstream_peer`. An unknown *path* is not an
         //    error: it falls through to the server's catch-all upstream.
         let host = request_host(session).unwrap_or_default();
-        let Some(site) = self.routes.get(&host) else {
+        let routes = {
+            let live = self.routes.read().unwrap_or_else(|e| e.into_inner());
+            live.clone()
+        };
+        let Some(site) = routes.get(&host) else {
             debug!("no [[server]] entry for host `{host}`, answering 404");
             session.respond_error(404).await?;
             return Ok(true);
         };
 
-        let path = session.req_header().uri.path().to_string();
-        let query = session.req_header().uri.query().map(str::to_string);
-        let resolved = site.resolve(&path);
-
-        // A static target answers right here and never reaches `upstream_peer`.
-        if let Target::Static(site) = resolved.target {
-            static_files::serve(session, site, &path, query.as_deref(), resolved.strip).await?;
+        // A known domain can still be misdirected: it exists, but its own
+        // `listen`/`listen6` is a different socket.
+        let permitted = {
+            let allowed = self.allowed.read().unwrap_or_else(|e| e.into_inner());
+            allowed.contains(&host)
+        };
+        if !permitted {
+            debug!("host `{host}` is not served by this listener, answering 421");
+            session.respond_error(421).await?;
             return Ok(true);
         }
 
-        let Target::Proxy(upstream) = resolved.target else {
-            unreachable!("a static target returned above")
-        };
-        ctx.upstream = Some(upstream.clone());
-        ctx.strip_prefix = resolved.strip.map(str::to_string);
+        // `Resolved` borrows only the route table, so the request path can stay
+        // borrowed from the session until the static branch clones it.
+        let resolved = site.resolve(session.req_header().uri.path());
+
+        match resolved.target {
+            // A static target answers right here and never reaches
+            // `upstream_peer`.
+            Target::Static(target) => {
+                let uri = &session.req_header().uri;
+                let path = uri.path().to_string();
+                let query = uri.query().map(str::to_string);
+                static_files::serve(session, target, &path, query.as_deref(), resolved.strip)
+                    .await?;
+                return Ok(true);
+            }
+            Target::Proxy(upstream) => {
+                ctx.upstream = Some(upstream.clone());
+                ctx.host = Some(host);
+                ctx.strip_prefix = resolved.strip.map(str::to_string);
+            }
+        }
 
         // 3. Reject obviously oversized bodies before reading anything.
-        if self.max_body_bytes > 0 {
+        let max_body = self.max_body_bytes.load(Ordering::Relaxed);
+        if max_body > 0 {
             if let Some(len) = declared_content_length(session) {
-                if len > self.max_body_bytes as u64 {
-                    warn!(
-                        "rejecting {len}-byte body from host `{host}` (limit {})",
-                        self.max_body_bytes
-                    );
+                if len > max_body as u64 {
+                    let host = ctx.host.as_deref().unwrap_or_default();
+                    warn!("rejecting {len}-byte body from host `{host}` (limit {max_body})");
                     session.respond_error(413).await?;
                     return Ok(true);
                 }
@@ -317,19 +387,20 @@ impl ProxyHttp for HttpsProxy {
 
     async fn upstream_peer(
         &self,
-        session: &mut Session,
+        _session: &mut Session,
         ctx: &mut Self::CTX,
     ) -> Result<Box<HttpPeer>> {
         // `request_filter` always fills this in; if it is missing the request
-        // was answered early and never reaches here.
-        let upstream = ctx.upstream.clone().ok_or_else(|| {
+        // was answered early and never reaches here. `take` avoids a clone on
+        // every request: the context is not used again for this field.
+        let upstream = ctx.upstream.take().ok_or_else(|| {
             Error::new_str("internal error: no upstream resolved for this request")
         })?;
+        let host = ctx.host.take().unwrap_or_default();
 
-        let host = request_host(session).unwrap_or_default();
         debug!("proxying {host} -> {upstream}");
         // `tls = false`: we forward to a plain-HTTP upstream.
-        Ok(Box::new(HttpPeer::new(upstream.as_str(), false, host)))
+        Ok(Box::new(HttpPeer::new(&*upstream, false, host)))
     }
 
     /// Tell the backend where the request really came from.
@@ -400,12 +471,13 @@ impl ProxyHttp for HttpsProxy {
         _end_of_stream: bool,
         ctx: &mut Self::CTX,
     ) -> Result<()> {
-        if self.max_body_bytes == 0 {
+        let max_body = self.max_body_bytes.load(Ordering::Relaxed);
+        if max_body == 0 {
             return Ok(());
         }
         if let Some(chunk) = body {
             ctx.body_bytes += chunk.len() as u64;
-            if ctx.body_bytes > self.max_body_bytes as u64 {
+            if ctx.body_bytes > max_body as u64 {
                 // Surfacing this as an HTTPStatus error makes Pingora's
                 // `fail_to_proxy` answer the client with a real 413.
                 return Err(Error::new(ErrorType::HTTPStatus(413)));
@@ -445,6 +517,7 @@ impl ProxyHttp for RedirectProxy {
     }
 
     async fn request_filter(&self, session: &mut Session, _ctx: &mut Self::CTX) -> Result<bool> {
+        session.set_keepalive(Some(KEEPALIVE_TIMEOUT_SECS));
         let path = session.req_header().uri.path().to_string();
 
         if let Some(token) = path.strip_prefix(CHALLENGE_PREFIX) {
@@ -509,6 +582,12 @@ mod tests {
     }
 
     #[test]
+    fn normalize_host_drops_a_trailing_root_dot() {
+        assert_eq!(normalize_host("Example.COM."), "example.com");
+        assert_eq!(normalize_host("example.com.:443"), "example.com");
+    }
+
+    #[test]
     fn select_host_prefers_the_host_header() {
         assert_eq!(
             select_host(Some("WWW.Example.com:80"), Some("ignored.example")),
@@ -536,7 +615,7 @@ mod tests {
     }
 
     fn proxy(upstream: &str) -> Target {
-        Target::Proxy(upstream.to_string())
+        Target::Proxy(Arc::from(upstream))
     }
 
     fn site() -> SiteRoutes {
@@ -559,7 +638,7 @@ mod tests {
 
     fn upstream(site: &SiteRoutes, path: &str) -> String {
         match site.resolve(path).target {
-            Target::Proxy(upstream) => upstream.clone(),
+            Target::Proxy(upstream) => upstream.to_string(),
             Target::Static(_) => panic!("expected a proxy target for {path}"),
         }
     }

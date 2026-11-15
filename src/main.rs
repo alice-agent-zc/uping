@@ -1,60 +1,49 @@
 //! uping — a tiny TOML-configured reverse proxy on Cloudflare Pingora.
 //!
-//! v0.2 reads a config, obtains or loads one certificate per domain, serves
-//! HTTPS (SNI) on the configured addresses, redirects plain HTTP to HTTPS, and
-//! keeps a lid on abusive clients. A `[[server]]` or route may also serve a
-//! directory directly (`root`). `[[stream]]` raw TCP forwarding is experimental.
+//! v0.3 reads a config, obtains or loads one certificate per domain, serves
+//! HTTPS (SNI) on the global and per-domain listeners, redirects plain HTTP to
+//! HTTPS, and keeps a lid on abusive clients. A `[[server]]` or route may also
+//! serve a directory directly (`root`). `[[stream]]` raw TCP forwarding is
+//! experimental.
 
 mod acme;
 mod config;
 mod limits;
 mod proxy;
+mod reload;
 mod static_files;
 mod stream;
 mod tls;
 
-use std::collections::HashMap;
-use std::sync::Arc;
+use std::collections::HashSet;
+use std::sync::atomic::AtomicUsize;
+use std::sync::{Arc, RwLock};
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use log::{info, warn};
+use pingora::apps::HttpServerOptions;
 use pingora::listeners::tls::TlsSettings;
 use pingora::listeners::ConnectionFilter;
-use pingora::proxy::http_proxy_service;
+use pingora::proxy::ProxyServiceBuilder;
 use pingora::server::Server;
 use pingora::services::listening::Service;
 
 use crate::acme::{CertManager, ChallengeStore};
-use crate::config::Config;
+use crate::config::{Config, GroupKey};
 use crate::limits::{ConnLimiter, RequestLimiter};
-use crate::proxy::{HttpsProxy, PathRoute, RedirectProxy, RouteTable, SiteRoutes, Target};
+use crate::proxy::{HttpsProxy, RedirectProxy, RouteTable};
+use crate::reload::{Allowed, Reloader};
 use crate::stream::StreamForwarder;
 use crate::tls::SniResolver;
 
 /// Build the `domain -> routes` table, lowercasing domains so that
-/// `EXAMPLE.com` and `example.com` hit the same upstream. A later `[[server]]`
-/// for a domain replaces an earlier one wholesale, routes included.
+/// `EXAMPLE.com` and `example.com` hit the same upstream. Duplicate domains are
+/// refused at load time, so there is never a "last one wins" question.
 ///
-/// Each server gets its own routes plus the top-level `[[route]]` entries whose
-/// `hosts` cover it, resolved by [`Config::routes_for`].
+/// Each server carries its own routes; there is no shared route table.
 fn build_routes(cfg: &Config) -> Result<RouteTable> {
-    let mut sites = HashMap::new();
-    for s in &cfg.servers {
-        let catch_all = Target::from_config(&s.upstream, &s.root, &s.index, &cfg.root_dir)
-            .with_context(|| format!("building the catch-all for `{}`", s.domain))?;
-        let mut routes = Vec::new();
-        for r in cfg.routes_for(s) {
-            routes.push(
-                PathRoute::from_config(r, &cfg.root_dir)
-                    .with_context(|| format!("building route `{}` for `{}`", r.path, s.domain))?,
-            );
-        }
-        sites.insert(
-            s.domain.to_ascii_lowercase(),
-            SiteRoutes::new(catch_all, routes),
-        );
-    }
-    Ok(RouteTable::new(sites))
+    RouteTable::from_config(cfg)
 }
 
 const USAGE: &str = "usage: uping [config.toml] [--check|--dry-run]";
@@ -118,7 +107,7 @@ fn run_check(path: &str) -> ! {
 /// needing no privilege.
 ///
 /// It runs the load path the server would — [`Config::load`], then
-/// [`SniResolver::from_servers`] — because the failures that take production
+/// [`SniResolver::from_config`] — because the failures that take production
 /// down happen *before* a socket exists: a malformed address, a cert that
 /// cannot be read or parsed. A check that skipped the certs would pass the
 /// config that killed the service on 2026-10-25.
@@ -126,23 +115,17 @@ fn check_config(path: &str) -> Result<String> {
     let cfg = Config::load(path).with_context(|| format!("loading configuration from `{path}`"))?;
 
     // Same condition as `main`: an empty `[[server]]` list loads no TLS.
-    // `load_existing` parses every certificate that is already on disk and
-    // counts the `auto` ones that do not exist yet. It never touches the
-    // network and writes nothing, so `--check` stays a pure read.
-    let mut pending = 0;
-    if !cfg.servers.is_empty() {
-        let default_domain = cfg
-            .servers
-            .first()
-            .map(|s| s.domain.to_ascii_lowercase())
-            .unwrap_or_default();
-        let resolver = SniResolver::empty(default_domain, cfg.tls.fallback_cert);
-        let manager = CertManager::new(&cfg, resolver, ChallengeStore::new());
-        pending = manager
-            .load_existing(&cfg.servers)
+    // `from_config` parses every certificate that is already on disk and counts
+    // the `auto` ones that do not exist yet. It never touches the network and
+    // writes nothing, so `--check` stays a pure read.
+    let pending = if cfg.servers.is_empty() {
+        0
+    } else {
+        SniResolver::from_config(&cfg)
             .context("loading TLS certificates")?
-            .len();
-    }
+            .1
+            .len()
+    };
 
     let routes = build_routes(&cfg)?.route_count();
     Ok(format!(
@@ -164,77 +147,130 @@ fn main() -> Result<()> {
     let cfg = Config::load(&config_path)
         .with_context(|| format!("loading configuration from `{config_path}`"))?;
 
-    // domain -> targets
-    let routes = Arc::new(build_routes(&cfg)?);
+    // domain -> targets; the outer lock lets a reload swap the whole table.
+    let live_routes = Arc::new(RwLock::new(Arc::new(build_routes(&cfg)?)));
     info!(
         "{} path route(s) across {} domain(s)",
-        routes.route_count(),
+        live_routes
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .route_count(),
         cfg.servers.len()
     );
 
     let mut server = Server::new(None).context("creating Pingora server")?;
     server.bootstrap();
 
+    // Load manual pairs and count the `auto` ones that do not exist yet. Both
+    // are empty when there is no `[[server]]`, but the SIGHUP handler below
+    // still has to exist: the default action for an unhandled SIGHUP is exit.
+    let (resolver, pending) = SniResolver::from_config(&cfg).context("loading TLS certificates")?;
+    let challenges = ChallengeStore::new();
+    let certs = Arc::new(CertManager::new(&cfg, resolver.clone(), challenges.clone()));
+    // The renewal thread and the reload thread share this list: a domain added
+    // by a SIGHUP must still get its hourly renewal check.
+    let renewal_servers = Arc::new(RwLock::new(cfg.servers.clone()));
+
+    // A first start has no HTTP listener yet, so the challenge binds the
+    // configured HTTP address briefly and releases it before Pingora starts.
+    let http_addrs: Vec<String> = cfg
+        .listen
+        .http_addrs()
+        .context("reading `[listen]`")?
+        .iter()
+        .map(|addr| addr.to_string())
+        .collect();
+    certs
+        .obtain_missing(&pending, &http_addrs)
+        .context("preparing TLS certificates")?;
+
+    // Shared between the :80 and :443 listeners, so one client cannot use two
+    // ports to get two connection budgets.
+    let request_limiter = Arc::new(RequestLimiter::new(cfg.limits.per_ip_rps));
+    let conn_limiter = Arc::new(ConnLimiter::new(cfg.limits.per_ip_conns_per_sec));
+    let max_body = Arc::new(AtomicUsize::new(cfg.limits.max_body_bytes));
+    let conn_filter: Arc<dyn ConnectionFilter> = conn_limiter.clone();
+
+    // One HTTPS service per distinct listener, so a server that overrides
+    // `listen`/`listen6` really answers only there. All services share one
+    // route table and one certificate resolver; each one carries the set of
+    // domains it is allowed to serve.
+    let https_groups = cfg.https_groups().context("grouping the HTTPS listeners")?;
+    let mut allow_lists: Vec<(GroupKey, Allowed)> = Vec::new();
+
     if cfg.servers.is_empty() {
         info!("no [[server]] entries: HTTP and HTTPS listeners are not started");
     } else {
-        let default_domain = cfg
-            .servers
-            .first()
-            .map(|s| s.domain.to_ascii_lowercase())
-            .unwrap_or_default();
-        let resolver = SniResolver::empty(default_domain, cfg.tls.fallback_cert);
-        let challenges = ChallengeStore::new();
-        let certs = Arc::new(CertManager::new(&cfg, resolver.clone(), challenges.clone()));
+        // Bound per-connection memory: rotate H1 keepalives, and close idle H2
+        // connections. The H1 idle timeout itself is set per request below.
+        let mut server_options = HttpServerOptions::default();
+        server_options.keepalive_request_limit = Some(1_000);
+        server_options.h2_idle_timeout = Some(Duration::from_secs(300));
 
-        // Load manual pairs and request the `auto` ones that do not exist yet.
-        // On a first start this binds the HTTP address briefly for http-01,
-        // then releases it before pingora takes it over.
-        certs
-            .prepare(&cfg.servers, &cfg.listen.http_addrs())
-            .context("preparing TLS certificates")?;
-
-        // Shared between the :80 and :443 listeners, so one client cannot use two
-        // ports to get two connection budgets.
-        let conn_filter: Arc<dyn ConnectionFilter> =
-            Arc::new(ConnLimiter::new(cfg.limits.per_ip_conns_per_sec));
-
-        // --- HTTPS (TLS termination + reverse proxy) ---
-        let mut https_service = http_proxy_service(
-            &server.configuration,
-            HttpsProxy::new(
-                routes.clone(),
-                RequestLimiter::new(cfg.limits.per_ip_rps),
-                cfg.limits.max_body_bytes,
-            ),
-        );
-        https_service.set_connection_filter(conn_filter.clone());
-        for addr in cfg.listen.https_addrs() {
-            let tls_settings = TlsSettings::with_callbacks(Box::new(resolver.clone()))
-                .context("building TLS settings")?;
-            https_service.add_tls_with_settings(&addr, None, tls_settings);
-            info!("HTTPS listening on {addr}");
+        // --- HTTPS (TLS termination + reverse proxy), one service per group ---
+        for group in &https_groups {
+            let allowed: HashSet<String> = group.domains.iter().cloned().collect();
+            let allowed = Arc::new(RwLock::new(Arc::new(allowed)));
+            let mut https_service = ProxyServiceBuilder::new(
+                &server.configuration,
+                HttpsProxy::new(
+                    live_routes.clone(),
+                    request_limiter.clone(),
+                    max_body.clone(),
+                    allowed.clone(),
+                ),
+            )
+            .server_options(server_options.clone())
+            .build();
+            https_service.set_connection_filter(conn_filter.clone());
+            for addr in &group.addrs {
+                let tls_settings = TlsSettings::with_callbacks(Box::new(resolver.clone()))
+                    .context("building TLS settings")?;
+                https_service.add_tls_with_settings(&addr.to_string(), None, tls_settings);
+                info!("HTTPS listening on {addr} for {}", group.domains.join(", "));
+            }
+            server.add_service(https_service);
+            allow_lists.push((group.key.clone(), allowed));
         }
-        server.add_service(https_service);
 
         // --- HTTP (redirect to HTTPS, plus the ACME challenge path) ---
-        let mut http_service = http_proxy_service(
+        // One service for every domain: port 80 is where http-01 has to answer,
+        // and a redirect does not need to know which vhost it came from.
+        let mut http_service = ProxyServiceBuilder::new(
             &server.configuration,
             RedirectProxy::new(challenges.clone()),
-        );
+        )
+        .server_options(server_options)
+        .build();
         http_service.set_connection_filter(conn_filter);
-        for addr in cfg.listen.http_addrs() {
-            http_service.add_tcp(&addr);
+        for addr in &http_addrs {
+            http_service.add_tcp(addr);
             info!("HTTP listening on {addr} (redirecting to HTTPS)");
         }
         server.add_service(http_service);
-
-        certs
-            .spawn_renewal(cfg.servers.clone())
-            .context("starting certificate renewal")?;
     }
 
-    // --- Raw TCP streams (experimental in v0.2) ---
+    certs
+        .clone()
+        .spawn_renewal(renewal_servers.clone())
+        .context("starting certificate renewal")?;
+
+    let reloader = Arc::new(Reloader::new(
+        std::path::PathBuf::from(&config_path),
+        live_routes,
+        resolver,
+        certs,
+        request_limiter,
+        conn_limiter,
+        max_body,
+        allow_lists,
+        renewal_servers,
+        &cfg,
+    )?);
+    reloader.spawn().context("starting the reload thread")?;
+    info!("SIGHUP reloads the config; `systemctl --user reload uping`");
+
+    // --- Raw TCP streams (experimental in v0.3) ---
     // One listener per [[stream]]. The upstream is whatever holds the port on
     // loopback; uping neither starts nor watches it.
     if !cfg.streams.is_empty() {
@@ -305,10 +341,16 @@ fn main() -> Result<()> {
         && cfg
             .listen
             .http_addrs()
+            .unwrap_or_default()
             .into_iter()
-            .chain(cfg.listen.https_addrs())
+            .chain(cfg.listen.https_addrs().unwrap_or_default())
+            .chain(https_groups.iter().flat_map(|g| g.addrs.iter().copied()))
             .any(|addr| is_privileged(&addr));
-    let privileged_stream = cfg.streams.iter().any(|s| is_privileged(&s.listen));
+    let privileged_stream = cfg
+        .streams
+        .iter()
+        .filter_map(|s| s.listen.parse::<std::net::SocketAddr>().ok())
+        .any(|addr| is_privileged(&addr));
     if privileged_http || privileged_stream {
         warn!(
             "a port below 1024 needs CAP_NET_BIND_SERVICE, not root: \
@@ -320,12 +362,8 @@ fn main() -> Result<()> {
 }
 
 /// Does this bind address name a port below 1024?
-fn is_privileged(raw: &str) -> bool {
-    raw.trim()
-        .rsplit(':')
-        .next()
-        .and_then(|port| port.parse::<u16>().ok())
-        .is_some_and(|port| port < 1024)
+fn is_privileged(addr: &std::net::SocketAddr) -> bool {
+    addr.port() < 1024
 }
 
 #[cfg(test)]
@@ -337,6 +375,8 @@ mod tests {
     fn server(domain: &str, upstream: &str) -> ConfigServer {
         ConfigServer {
             domain: domain.to_string(),
+            listen: String::new(),
+            listen6: String::new(),
             keys: None,
             pub_key: "certs/test.local.crt".to_string(),
             priv_key: "certs/test.local.key".to_string(),
@@ -348,7 +388,7 @@ mod tests {
     }
 
     /// A config holding only the parts `build_routes` reads.
-    fn config(servers: Vec<ConfigServer>, routes: Vec<crate::config::Route>) -> Config {
+    fn config(servers: Vec<ConfigServer>) -> Config {
         Config {
             root_dir: std::env::temp_dir(),
             listen: Default::default(),
@@ -356,14 +396,13 @@ mod tests {
             tls: Default::default(),
             acme: Default::default(),
             servers,
-            routes,
             streams: Vec::new(),
         }
     }
 
     fn upstream(routes: &RouteTable, host: &str, path: &str) -> String {
         match routes.get(host).unwrap().resolve(path).target {
-            Target::Proxy(upstream) => upstream.clone(),
+            Target::Proxy(upstream) => upstream.to_string(),
             Target::Static(_) => panic!("expected a proxy target for {host}{path}"),
         }
     }
@@ -407,7 +446,7 @@ mod tests {
             server("Test.Local", "127.0.0.1:8080"),
             server("API.Example.COM", "127.0.0.1:9000"),
         ];
-        let routes = build_routes(&config(servers, Vec::new())).unwrap();
+        let routes = build_routes(&config(servers)).unwrap();
 
         assert_eq!(upstream(&routes, "test.local", "/"), "127.0.0.1:8080");
         assert_eq!(upstream(&routes, "api.example.com", "/"), "127.0.0.1:9000");
@@ -423,9 +462,8 @@ mod tests {
             root: String::new(),
             index: "index.html".to_string(),
             strip_prefix: true,
-            hosts: Vec::new(),
         }];
-        let routes = build_routes(&config(vec![s], Vec::new())).unwrap();
+        let routes = build_routes(&config(vec![s])).unwrap();
 
         assert_eq!(routes.route_count(), 1);
         let hit = routes.get("aaa.local").unwrap().resolve("/assets/app.css");
@@ -434,42 +472,5 @@ mod tests {
             upstream(&routes, "aaa.local", "/assets/app.css"),
             "127.0.0.1:8085"
         );
-    }
-
-    #[test]
-    fn a_global_route_reaches_every_server_in_the_table() {
-        let servers = vec![
-            server("a.example", "127.0.0.1:8080"),
-            server("b.example", "127.0.0.1:8090"),
-        ];
-        let global = crate::config::Route {
-            path: "/mcp".to_string(),
-            upstream: "127.0.0.1:9000".to_string(),
-            root: String::new(),
-            index: "index.html".to_string(),
-            strip_prefix: false,
-            hosts: Vec::new(),
-        };
-        let routes = build_routes(&config(servers, vec![global])).unwrap();
-
-        assert_eq!(routes.route_count(), 2);
-        for domain in ["a.example", "b.example"] {
-            assert_eq!(
-                upstream(&routes, domain, "/mcp/v1"),
-                "127.0.0.1:9000",
-                "{domain}"
-            );
-        }
-    }
-
-    #[test]
-    fn later_entries_win_on_duplicate_domains() {
-        let servers = vec![
-            server("test.local", "127.0.0.1:8080"),
-            server("TEST.LOCAL", "127.0.0.1:9090"),
-        ];
-        let routes = build_routes(&config(servers, Vec::new())).unwrap();
-
-        assert_eq!(upstream(&routes, "test.local", "/"), "127.0.0.1:9090");
     }
 }

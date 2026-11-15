@@ -1,6 +1,6 @@
 //! Raw TCP forwarding — the `[[stream]]` listener.
 //!
-//! **Experimental in v0.2.** This is the mail/database relay people asked for,
+//! **Experimental in v0.3.** This is the mail/database relay people asked for,
 //! but its configuration and semantics may still change. Do not build a
 //! production dependency on it yet without pinning the version.
 //!
