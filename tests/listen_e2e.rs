@@ -52,7 +52,7 @@ fn config(
          pub_key = \"{}\"\npriv_key = \"{}\"\nupstream = \"127.0.0.1:{main_backend}\"\n\
          [[server]]\ndomain = \"private.local\"\nkeys = \"manual\"\n\
          pub_key = \"{}\"\npriv_key = \"{}\"\nupstream = \"127.0.0.1:{private_backend}\"\n\
-         listen = \"127.0.0.2:{private_https}\"\n",
+         https_listen = \"127.0.0.2:{private_https}\"\n",
         cert.display(),
         key.display(),
         cert.display(),

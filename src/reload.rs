@@ -73,7 +73,7 @@ pub struct Reloader {
     conn_limiter: Arc<ConnLimiter>,
     max_body: Arc<AtomicUsize>,
     allow_lists: Vec<(GroupKey, Allowed)>,
-    /// Domains with `http = false`, swapped on reload.
+    /// Domains with `serve_http = false`, swapped on reload.
     http_disabled: Arc<RwLock<Arc<HashSet<String>>>>,
     /// Shared with the renewal thread; swapped on every successful reload.
     renewal_servers: Arc<RwLock<Vec<crate::config::Server>>>,
@@ -178,6 +178,12 @@ impl Reloader {
     fn try_reload(&self) -> Result<()> {
         let new = Config::load(&self.path)
             .with_context(|| format!("reading `{}`", self.path.display()))?;
+        if new.deprecated_server_map {
+            warn!(
+                "the `[server.\"domain\"]` map form is deprecated; use `[[server]]` with \
+                 `domain = \"...\"` instead"
+            );
+        }
         let next = Pinned::of(&new)?;
         let running = self.pinned.clone();
 
@@ -222,7 +228,7 @@ impl Reloader {
         let disabled: HashSet<String> = new
             .servers
             .iter()
-            .filter(|s| !s.http)
+            .filter(|s| !s.serve_http)
             .map(|s| s.domain.to_ascii_lowercase())
             .collect();
         *self

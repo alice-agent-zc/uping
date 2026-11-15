@@ -5,17 +5,17 @@
 # DNS:    uping --dns-zone config.toml       (hosts records for a VPN resolver)
 # Reload: systemctl --user reload uping     (SIGHUP, no restart)
 # Restart only after installing a new binary, or after changing [listen],
-# a server's listen/listen6, or [[stream]].
+# a server's https_listen/https_listen6, or [[stream]].
 #
 # Every relative path (certificates, static roots, cert_dir) is resolved from
 # the directory that holds this file.
 
 # Optional. The host-wide listeners. One address per family, one port per
 # protocol. There is no wildcard and no list: a domain that needs another
-# address or port overrides it with `listen` / `listen6` below.
+# address or port overrides it with `https_listen` / `https_listen6` below.
 # [listen]
 # ipv4  = "0.0.0.0"                # default
-# ipv6  = ""                       # e.g. "2607:f1c0:f031:4500::1"; empty = off
+# ipv6  = "2607:f1c0:f031:4500::1" # omit for no IPv6
 # http  = 80                       # default
 # https = 443                      # default
 
@@ -53,12 +53,14 @@ keys     = "auto"                 # default when no pub_key/priv_key are given
 upstream = "127.0.0.1:8080"       # catch-all: every path without its own route
 
 # Optional. Give this domain its own HTTPS listener instead of the global one.
-# `listen` is IPv4, `listen6` is IPv6; each may carry a port, which defaults to
-# `[listen] https`. HTTP stays host-wide: it is the redirect and the ACME
-# challenge listener.
-# listen  = "203.0.113.10"
-# listen6 = "[2001:db8::10]:8443"
-# http    = false                 # no :80 vhost (private/VPN site; needs manual keys)
+# `https_listen` is IPv4, `https_listen6` is IPv6; each may carry a port, which
+# defaults to `[listen] https`. HTTP stays host-wide: it is the redirect and the
+# ACME challenge listener, unless `serve_http = false` removes this domain from
+# port 80.
+# https_listen  = "203.0.113.10"
+# https_listen6 = "[2001:db8::10]:8443"
+# serve_http    = false           # no :80 vhost (private/VPN site; needs manual keys)
+# health        = false           # do not preemptively 503 this backend
 
 # Optional. Speak HTTPS to the backend instead of plain HTTP.
 # upstream_tls    = true
@@ -96,8 +98,8 @@ upstream = "127.0.0.1:8080"       # catch-all: every path without its own route
 # root         = "public/assets"
 # strip_prefix = true            # /assets/app.css -> public/assets/app.css
 
-# The map form names the domain in the table key; a route nested below it
-# belongs to exactly that domain. Useful when one domain has several routes.
+# The map form names the domain in the table key. It is DEPRECATED: it still
+# loads (with a warning), but new configs should use [[server]] + domain.
 #
 # [server."mcp.example.com"]
 # upstream = "127.0.0.1:9000"

@@ -13,8 +13,8 @@ change.
 - ✅ HTTPS reverse proxy with SNI, one cert per domain
 - ✅ Let's Encrypt certificates (`keys = "auto"`) and automatic renewal
 - ✅ Static files (`root`) and path routing, each route tied to its domain
-- ✅ One `[listen]` for the host, plus per-domain `listen` / `listen6`
-- ✅ Private sites: `listen` on a VPN address and `http = false` to stay off
+- ✅ One `[listen]` for the host, plus per-domain `https_listen` / `https_listen6`
+- ✅ Private sites: `https_listen` on a VPN address and `serve_http = false` to stay off
   port 80, plus `uping --dns-zone` for the VPN resolver's records
 - ✅ HTTP → HTTPS redirect, per-IP request/connection limits, body cap
 - ✅ Upstream health checks (`503` at once when a backend dies) and HTTPS to
@@ -47,7 +47,7 @@ sudo setcap 'cap_net_bind_service=+ep' target/release/uping
 ```
 
 A static site is the same block with `root = "public"` instead of `upstream`.
-For a second service on another address, add `listen = "203.0.113.10"` to it;
+For a second service on another address, add `https_listen = "203.0.113.10"` to it;
 the `[listen]` section covers everything else.
 
 For the systemd user unit, every option, the certificate layout, ACME details,

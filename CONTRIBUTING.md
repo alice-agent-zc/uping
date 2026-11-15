@@ -46,7 +46,7 @@ The suite needs no root, no network and no certificate checked into the tree:
   `200`, and a TCP-only listener is not a healthy TLS upstream;
 - upstream TLS (`tests/upstream_tls_e2e.rs`): private CA, verify opt-out, and a
   wrong SNI failing the handshake;
-- a private site (`tests/private_http_e2e.rs`): `http = false` is `404` on :80
+- a private site (`tests/private_http_e2e.rs`): `serve_http = false` is `404` on :80
   and still works on :443;
 - `--dns-zone` (`tests/dns_zone_e2e.rs`): records, a wildcard refusal, and the
   `--check` conflict;
@@ -65,7 +65,7 @@ the current directory.
 # Optional. One address per family, one port per protocol.
 [listen]
 ipv4  = "0.0.0.0"        # default; any IPv4 address
-ipv6  = ""               # e.g. "2607:f1c0:f031:4500::1"; empty = no IPv6
+# ipv6 = "2607:f1c0:f031:4500::1"   # omit for no IPv6
 http  = 80               # default
 https = 443              # default
 
@@ -102,8 +102,8 @@ upstream = "127.0.0.1:8080"
 
 # Optional. This domain gets its own HTTPS listener instead of the global one.
 # The port defaults to `[listen] https`; both families are independent.
-listen  = "203.0.113.10"
-listen6 = "[2001:db8::10]:8443"
+https_listen  = "203.0.113.10"
+https_listen6 = "[2001:db8::10]:8443"
 
 # Optional. For an HTTPS backend instead of the plain-HTTP one above:
 # upstream      = "10.0.0.5:8443"
@@ -118,7 +118,7 @@ root   = "public"                 # instead of upstream
 index  = "index.html"             # the default
 
 # A private site: only on the WireGuard address, and no public HTTP vhost.
-# `keys = "manual"` is required because http-01 cannot run with `http = false`;
+# `keys = "manual"` is required because http-01 cannot run with `serve_http = false`;
 # the certificate comes from an internal CA (step-ca) whose root the clients trust.
 #
 # [[server]]
@@ -127,8 +127,8 @@ index  = "index.html"             # the default
 # pub_key  = "cert/app.vpn.example/fullchain.pem"
 # priv_key = "cert/app.vpn.example/privkey.pem"
 # upstream = "127.0.0.1:8080"
-# listen   = "10.8.0.1"     # the wg0 address
-# http     = false          # no :80 redirect, no ACME challenge
+# https_listen = "10.8.0.1"     # the wg0 address
+# serve_http = false        # no :80 redirect, no ACME challenge
 
 # Map form: the table key is the domain. Routes nested below it belong to it.
 [server."mcp.example.com"]
@@ -145,18 +145,14 @@ root         = "public/assets"
 strip_prefix = true
 ```
 
-Both server forms are accepted and mean the same thing:
+`[[server]]` is the canonical form. The `[server."..."]` map form is
+**deprecated**: it still loads (with a warning) so existing configs keep
+working, but new configs should use the array form with `domain = "..."` and
+`[[server.route]]` nested under it.
 
-| form | domain comes from | routes |
-|---|---|---|
-| `[[server]]` + `domain = "..."` | the `domain` field | `[[server.route]]` |
-| `[server."..."]` | the table key | `[[server."...".route]]` |
-
-The map form is recommended when a domain has several routes: the table key
-names the domain, so a route cannot be attached to the wrong server by the
-order of the blocks. A `domain` field is optional in the map form; if present it
-must equal the table key. Two servers may not share a domain — the loader
-refuses the duplicate instead of silently keeping one.
+A `domain` field is optional in the map form; if present it must equal the table
+key. Two servers may not share a domain — the loader refuses the duplicate
+instead of silently keeping one.
 
 A server and a route each need **exactly one** of `upstream` or `root`.
 Unknown fields are refused, so a typo cannot silently become a default.
@@ -179,14 +175,15 @@ IPv6". An address the host does not own fails at bind time with
 `Cannot assign requested address` — uping cannot infer which IPv6 address you
 meant from an IPv4 one.
 
-A `[[server]]` may override its **HTTPS** listener with `listen` / `listen6`:
+A `[[server]]` may override its **HTTPS** listener with `https_listen` /
+`https_listen6`:
 
 ```toml
 [[server]]
 domain   = "www.example.com"
 upstream = "127.0.0.1:8080"
-listen   = "203.0.113.10"          # IPv4, default port = [listen] https
-listen6  = "[2001:db8::10]:8443"   # IPv6 with an explicit port
+https_listen  = "203.0.113.10"          # IPv4, default port = [listen] https
+https_listen6 = "[2001:db8::10]:8443"   # IPv6 with an explicit port
 ```
 
 - The port is optional; when omitted it is `[listen] https`.
@@ -194,13 +191,13 @@ listen6  = "[2001:db8::10]:8443"   # IPv6 with an explicit port
   `2001:db8::10:8443` is itself a valid IPv6 address, so the port would be
   swallowed into it.
 - Overriding one family does not imply the other: `listen` alone means IPv4
-  only, `listen6` alone means IPv6 only, both means both.
+  only, `https_listen6` alone means IPv6 only, both means both.
 - Each distinct combination is its own HTTPS listener and its own DNS entry
   point. A domain is only answered on its own sockets; a request for it on the
   global listener gets `421 Misdirected Request`.
 - HTTP is not per-server: it stays on `[listen] ipv4/ipv6` port 80, because that
   is where the ACME http-01 challenge answers and where the redirect lives.
-  A site that must not exist publicly sets `http = false` (see
+  A site that must not exist publicly sets `serve_http = false` (see
   [Private sites](#private-sites-and-dns) below).
 
 An overlap (e.g. a server overriding to `0.0.0.0:443` while the global listener
@@ -317,8 +314,17 @@ failures    = 2
 - With `interval_ms = 0`, no active probe runs; the address is still resolved at
   startup and on reload (and refreshed every minute), and an unresolvable
   upstream is still refused with `503`.
+- `health = false` on a server or `[[server.route]]` opts that backend out: the
+  address is still resolved (so a DNS name is refreshed) but the probe never
+  answers `503` for it. Useful for a backend that is slow to accept but must be
+  attempted anyway.
 - Only liveness is checked; there is no per-path HTTP health endpoint and no
   load balancing. One upstream per server/route, by design.
+
+`0` is always an explicit choice, never a default: in `[health]`,
+`interval_ms = 0` disables the active probe; in `[limits]`, any limit set to `0`
+is disabled (or, for `max_body_bytes`, unlimited). Out-of-range values are a
+config error, not silently clamped.
 
 ### Limits
 
@@ -371,15 +377,15 @@ keys     = "manual"
 pub_key  = "cert/app.vpn.example/fullchain.pem"
 priv_key = "cert/app.vpn.example/privkey.pem"
 upstream = "127.0.0.1:8080"
-listen   = "10.8.0.1"   # the wg0 address only
-http     = false        # no :80 redirect, no ACME challenge
+https_listen = "10.8.0.1"   # the wg0 address only
+serve_http   = false        # no :80 redirect, no ACME challenge
 ```
 
-- `listen` (and `listen6`) bind the site to the VPN interface; the public
+- `https_listen` (and `https_listen6`) bind the site to the VPN interface; the public
   listeners never see it.
-- `http = false` removes the domain from port 80 entirely: a request for it on
+- `serve_http = false` removes the domain from port 80 entirely: a request for it on
   :80 is `404`, not a redirect, so the name is not advertised.
-- `keys = "auto"` is refused with `http = false`: the http-01 challenge needs
+- `keys = "auto"` is refused with `serve_http = false`: the http-01 challenge needs
   port 80. Use `keys = "manual"` with a certificate from an internal CA
   (step-ca, `mkcert` for a lab) whose root is installed on the clients. Let's
   Encrypt's DNS-01 is not implemented yet.
@@ -404,7 +410,7 @@ $ uping --dns-zone config.toml
 2001:db8::1 www.example.com
 ```
 
-The address comes from the site's `listen`/`listen6`, or from `[listen] ipv4` /
+The address comes from the site's `https_listen`/`https_listen6`, or from `[listen] ipv4` /
 `ipv6` when it has no override. A wildcard address (`0.0.0.0`, `::`) is refused:
 a DNS record must name a real address. That is the whole point — the config is
 the single source of truth, and the resolver loads its output:
@@ -432,14 +438,14 @@ Applied live:
 - `[tls] fallback_cert`;
 - manual certificates already on disk, and existing `auto` ones;
 - which domains each already-bound HTTPS listener may answer;
-- which domains answer on port 80 (`http = false` is applied live);
+- which domains answer on port 80 (`serve_http = false` is applied live);
 - the health probe follows the new route table automatically;
 - a newly added `auto` domain is requested in the background through the
   running HTTP listener.
 
 Requires a restart, reported as such in the log while the rest is applied:
 
-- `[listen]`, `listen`/`listen6` (adding, removing or moving a socket) and
+- `[listen]`, `https_listen`/`https_listen6` (adding, removing or moving a socket) and
   `[[stream]]` — Pingora's listeners/forwarders are fixed;
 - `[acme]` (email, staging, directory, `cert_dir`, renewal window) — the renewal
   thread owns them; mixing old and new would split where certificates are read
@@ -534,7 +540,7 @@ tests/
   listen_e2e.rs    # a per-server listener and its 421 isolation
   health_e2e.rs    # backend down -> 503, recovered -> 200
   upstream_tls_e2e.rs  # private CA, verify opt-out, wrong-SNI failure
-  private_http_e2e.rs  # http = false on :80, HTTPS still served
+  private_http_e2e.rs  # serve_http = false on :80, HTTPS still served
   dns_zone_e2e.rs      # --dns-zone records and refusals
   reload_e2e.rs    # SIGHUP, bad config, listener warning
   static_e2e.rs    # static serving through the real binary

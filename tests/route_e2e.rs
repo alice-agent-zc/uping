@@ -60,13 +60,13 @@ fn config(dir: &Path, http: u16, https: u16, backends: [u16; 3], static_root: &P
     format!(
         "[listen]\nipv4 = \"127.0.0.1\"\nhttp = {http}\nhttps = {https}\n\
          [tls]\nfallback_cert = true\n\
-         [server.\"route.local\"]\nkeys = \"manual\"\n\
+         [[server]]\ndomain = \"route.local\"\nkeys = \"manual\"\n\
          pub_key = \"{}\"\npriv_key = \"{}\"\nupstream = \"127.0.0.1:{catch_all}\"\n\
-         [[server.\"route.local\".route]]\npath = \"/api\"\nupstream = \"127.0.0.1:{api}\"\nstrip_prefix = true\n\
-         [[server.\"route.local\".route]]\npath = \"/assets\"\nroot = \"{}\"\nstrip_prefix = true\n\
-         [server.\"other.local\"]\nkeys = \"manual\"\n\
+         [[server.route]]\npath = \"/api\"\nupstream = \"127.0.0.1:{api}\"\nstrip_prefix = true\n\
+         [[server.route]]\npath = \"/assets\"\nroot = \"{}\"\nstrip_prefix = true\n\
+         [[server]]\ndomain = \"other.local\"\nkeys = \"manual\"\n\
          pub_key = \"{}\"\npriv_key = \"{}\"\nupstream = \"127.0.0.1:{other_api}\"\n\
-         [[server.\"other.local\".route]]\npath = \"/api\"\nupstream = \"127.0.0.1:{other_api}\"\n",
+         [[server.route]]\npath = \"/api\"\nupstream = \"127.0.0.1:{other_api}\"\n",
         cert.display(),
         key.display(),
         static_root.display(),

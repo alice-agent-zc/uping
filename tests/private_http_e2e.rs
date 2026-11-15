@@ -1,4 +1,4 @@
-//! `http = false` removes a domain from port 80 without touching its HTTPS.
+//! `serve_http = false` removes a domain from port 80 without touching its HTTPS.
 //!
 //! A private site behind WireGuard should not answer on the public redirect
 //! listener at all: a request for it on :80 is a `404`, while :443 still works.
@@ -41,7 +41,7 @@ fn config(dir: &Path, http: u16, https: u16, backend: u16) -> String {
          pub_key = \"{}\"\npriv_key = \"{}\"\nupstream = \"127.0.0.1:{backend}\"\n\
          [[server]]\ndomain = \"private.local\"\nkeys = \"manual\"\n\
          pub_key = \"{}\"\npriv_key = \"{}\"\nupstream = \"127.0.0.1:{backend}\"\n\
-         http = false\n",
+         serve_http = false\n",
         cert.display(),
         key.display(),
         cert.display(),
@@ -71,7 +71,7 @@ fn curl_http(port: u16, host: &str, path: &str) -> (String, String) {
 }
 
 #[test]
-fn http_false_removes_the_domain_from_port_80_only() {
+fn serve_http_false_removes_the_domain_from_port_80_only() {
     let dir = workspace("private-http-e2e");
     let _ = cert_pair(&dir, "private.local");
     let backend = backend();

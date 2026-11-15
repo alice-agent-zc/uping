@@ -132,6 +132,9 @@ pub struct Upstream {
     pub verify: bool,
     /// Roots for that verification; `None` uses the system store.
     pub ca: Option<Arc<CaType>>,
+    /// Probe the backend and answer `503` when it is down. `false` makes the
+    /// registry resolve the address but never reject the request.
+    pub health: bool,
     /// Pre-built OpenSSL connector for the health probe. `None` means plain TCP.
     pub probe: Option<Arc<openssl::ssl::SslConnector>>,
     /// Identity used by the health registry (address + TLS settings).
@@ -162,6 +165,8 @@ pub struct UpstreamSpec<'a> {
     /// Used as the SNI when the backend is an IP literal and no `upstream_sni`
     /// is written: a loopback backend usually serves the public certificate.
     pub default_sni: &'a str,
+    /// Whether this backend takes part in the health gate.
+    pub health: bool,
 }
 
 impl Upstream {
@@ -222,6 +227,7 @@ impl Upstream {
             verify: tls.verify,
             ca,
             probe,
+            health: spec.health,
             key: std::sync::Arc::from(key.as_str()),
         })
     }
@@ -286,6 +292,7 @@ impl PathRoute {
             address: &route.upstream,
             tls: route.upstream_tls(),
             default_sni: domain,
+            health: route.health,
         };
         Ok(Self {
             prefix: route.prefix().to_string(),
@@ -362,6 +369,7 @@ impl RouteTable {
                 address: &s.upstream,
                 tls: s.upstream_tls(),
                 default_sni: &s.domain,
+                health: s.health,
             };
             let catch_all = Target::from_config(&spec, &s.root, &s.index, &cfg.root_dir)
                 .with_context(|| format!("building the catch-all for `{}`", s.domain))?;
@@ -418,6 +426,65 @@ pub struct ProxyCtx {
     strip_prefix: Option<String>,
     /// Bytes of request body seen so far, for chunked uploads.
     body_bytes: u64,
+}
+
+/// The page a healthy-looking request gets when its backend is down.
+///
+/// Static on purpose: no host, no upstream address, nothing a client could
+/// reflect back. It is served with `503` and `Retry-After`, and the probe keeps
+/// running, so the next request after recovery is proxied normally.
+const UNAVAILABLE_PAGE: &str = r#"<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Service temporarily unavailable</title>
+  <style>
+    :root { color-scheme: light dark; }
+    body {
+      margin: 0; min-height: 100vh; display: grid; place-items: center;
+      background: #0f1115; color: #e8eaf0;
+      font: 16px/1.6 system-ui, -apple-system, "Segoe UI", sans-serif;
+    }
+    main { max-width: 34rem; padding: 2.5rem 1.5rem; text-align: center; }
+    .badge {
+      display: inline-block; margin-bottom: 1.25rem; padding: .25rem .75rem;
+      border: 1px solid #3a4150; border-radius: 999px;
+      color: #9aa4b8; font-size: .8rem; letter-spacing: .08em;
+      text-transform: uppercase;
+    }
+    h1 { margin: 0 0 .75rem; font-size: 1.6rem; font-weight: 600; }
+    p { margin: .5rem 0; color: #b6bdcc; }
+    .hint { margin-top: 1.75rem; color: #7b8497; font-size: .9rem; }
+  </style>
+</head>
+<body>
+  <main>
+    <span class="badge">503 &middot; temporarily unavailable</span>
+    <h1>The service behind this domain is taking a break.</h1>
+    <p>uping cannot reach the application right now. It keeps checking in the
+       background and will route traffic again the moment the service answers.</p>
+    <p class="hint">Nothing to fix on your side &mdash; try again in a few seconds.</p>
+  </main>
+</body>
+</html>
+"#;
+
+/// Write the 503 page, honouring `HEAD` like the rest of the proxy.
+async fn respond_unavailable(session: &mut Session) -> Result<()> {
+    let head = session.req_header().method == http::Method::HEAD;
+    let mut resp = ResponseHeader::build(503, Some(4))?;
+    resp.insert_header("Content-Type", "text/html; charset=utf-8")?;
+    resp.insert_header("Content-Length", UNAVAILABLE_PAGE.len().to_string())?;
+    resp.insert_header("Cache-Control", "no-store")?;
+    resp.insert_header("Retry-After", "5")?;
+    session.write_response_header(Box::new(resp), head).await?;
+    if !head {
+        session
+            .write_response_body(Some(Bytes::from_static(UNAVAILABLE_PAGE.as_bytes())), true)
+            .await?;
+    }
+    Ok(())
 }
 
 /// Terminates TLS and forwards to the upstream of the matching domain and path.
@@ -528,7 +595,7 @@ impl ProxyHttp for HttpsProxy {
                         "upstream {} is down; answering 503 for {}",
                         upstream.address, host
                     );
-                    session.respond_error(503).await?;
+                    respond_unavailable(session).await?;
                     return Ok(true);
                 }
                 ctx.upstream = Some(upstream.clone());
@@ -673,7 +740,7 @@ impl ProxyHttp for HttpsProxy {
 /// the ACME http-01 path, which must be served in the clear.
 pub struct RedirectProxy {
     challenges: ChallengeStore,
-    /// Domains configured with `http = false`: they exist only behind HTTPS, so
+    /// Domains configured with `serve_http = false`: they exist only behind HTTPS, so
     /// a request for one on port 80 is a plain `404`, not a redirect.
     disabled: Arc<RwLock<Arc<HashSet<String>>>>,
 }
@@ -712,7 +779,7 @@ impl ProxyHttp for RedirectProxy {
             set.contains(&host)
         };
         if disabled {
-            debug!("no HTTP vhost for `{host}` (`http = false`), answering 404");
+            debug!("no HTTP vhost for `{host}` (`serve_http = false`), answering 404");
             session.respond_error(404).await?;
             return Ok(true);
         }
@@ -822,6 +889,7 @@ mod tests {
                 ca: "",
             },
             default_sni: "test.local",
+            health: true,
         };
         Target::Proxy(Arc::new(
             Upstream::from_config(&spec, Path::new(".")).unwrap(),

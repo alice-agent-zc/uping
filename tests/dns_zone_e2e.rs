@@ -39,8 +39,8 @@ keys     = "manual"
 pub_key  = "p.crt"
 priv_key = "p.key"
 upstream = "127.0.0.1:9000"
-listen   = "10.8.0.1"
-http     = false
+https_listen = "10.8.0.1"
+serve_http = false
 "#;
 
 #[test]

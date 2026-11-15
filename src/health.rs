@@ -71,6 +71,9 @@ impl HealthTracker {
     /// Is this backend currently unavailable? An unprobed backend counts as
     /// down; startup and reload prime the table before serving traffic.
     pub fn down(&self, upstream: &Upstream) -> bool {
+        if !upstream.health {
+            return false;
+        }
         let states = self.states.lock().unwrap_or_else(|e| e.into_inner());
         states.get(upstream.key()).map(|s| !s.up).unwrap_or(true)
     }
@@ -115,7 +118,7 @@ impl HealthTracker {
             return;
         }
 
-        if !self.enabled {
+        if !self.enabled || !upstream.health {
             self.record(upstream, Some(addrs[0]), true, None);
             return;
         }

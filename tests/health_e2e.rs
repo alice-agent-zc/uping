@@ -146,6 +146,52 @@ fn a_dead_backend_is_503_and_recovers_when_it_returns() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
+/// `health = false` and `interval_ms = 0` both leave the request to be tried:
+/// the answer is the proxy's own `502`, never the health page's `503`.
+#[test]
+fn a_disabled_probe_still_attempts_the_backend() {
+    let dir = workspace("health-off-e2e");
+    let _ = cert_pair(&dir, "health.local");
+
+    let dead = free_port();
+    let cert = dir.join("health.local.crt");
+    let key = dir.join("health.local.key");
+    let http = free_port();
+    let https = free_port();
+    let cfg = dir.join("config.toml");
+    write(
+        &cfg,
+        &format!(
+            "[listen]\nipv4 = \"127.0.0.1\"\nhttp = {http}\nhttps = {https}\n\
+             [health]\ninterval_ms = 0\n\
+             [[server]]\ndomain = \"off.local\"\nkeys = \"manual\"\n\
+             pub_key = \"{}\"\npriv_key = \"{}\"\nupstream = \"127.0.0.1:{dead}\"\n\
+             health = false\n\
+             [[server]]\ndomain = \"noprobe.local\"\nkeys = \"manual\"\n\
+             pub_key = \"{}\"\npriv_key = \"{}\"\nupstream = \"127.0.0.1:{dead}\"\n",
+            cert.display(),
+            key.display(),
+            cert.display(),
+            key.display(),
+        ),
+    );
+    let log = dir.join("health-off.log");
+    let mut server = start(&cfg, &log, https);
+
+    for host in ["off.local", "noprobe.local"] {
+        let (status, text) = curl(https, host, "/", &[]);
+        assert_eq!(status, "502", "{host}: {text}");
+        assert!(
+            !text.to_ascii_lowercase().contains("taking a break"),
+            "{host}: the 503 page must not be served when health is off: {text}"
+        );
+    }
+
+    assert!(server.is_alive());
+    drop(server);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
 /// The probe must not be fooled by a TCP-only listener: an HTTPS upstream that
 /// cannot complete a handshake is down.
 #[test]

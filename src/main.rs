@@ -221,6 +221,12 @@ fn main() -> Result<()> {
     let config_path = args.path;
     let cfg = Config::load(&config_path)
         .with_context(|| format!("loading configuration from `{config_path}`"))?;
+    if cfg.deprecated_server_map {
+        warn!(
+            "the `[server.\"domain\"]` map form is deprecated; use `[[server]]` with \
+             `domain = \"...\"` instead"
+        );
+    }
 
     // domain -> targets; the outer lock lets a reload swap the whole table.
     let live_routes = Arc::new(RwLock::new(Arc::new(build_routes(&cfg)?)));
@@ -261,7 +267,7 @@ fn main() -> Result<()> {
     let http_disabled: Arc<RwLock<Arc<HashSet<String>>>> = Arc::new(RwLock::new(Arc::new(
         cfg.servers
             .iter()
-            .filter(|s| !s.http)
+            .filter(|s| !s.serve_http)
             .map(|s| s.domain.to_ascii_lowercase())
             .collect(),
     )));
@@ -472,9 +478,10 @@ mod tests {
     fn server(domain: &str, upstream: &str) -> ConfigServer {
         ConfigServer {
             domain: domain.to_string(),
-            listen: String::new(),
-            listen6: String::new(),
-            http: true,
+            https_listen: String::new(),
+            https_listen6: String::new(),
+            serve_http: true,
+            health: true,
             keys: None,
             pub_key: "certs/test.local.crt".to_string(),
             priv_key: "certs/test.local.key".to_string(),
@@ -498,6 +505,7 @@ mod tests {
             tls: Default::default(),
             health: Default::default(),
             acme: Default::default(),
+            deprecated_server_map: false,
             servers,
             streams: Vec::new(),
         }
@@ -577,6 +585,7 @@ mod tests {
         s.routes = vec![crate::config::Route {
             path: "/assets/".to_string(),
             upstream: "127.0.0.1:8085".to_string(),
+            health: true,
             upstream_tls: false,
             upstream_sni: String::new(),
             upstream_verify: true,

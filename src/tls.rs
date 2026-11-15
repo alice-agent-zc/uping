@@ -306,9 +306,10 @@ mod tests {
         let (cert, key) = pair();
         Server {
             domain: domain.to_string(),
-            listen: String::new(),
-            listen6: String::new(),
-            http: true,
+            https_listen: String::new(),
+            https_listen6: String::new(),
+            serve_http: true,
+            health: true,
             keys: None,
             pub_key: cert.clone(),
             priv_key: key.clone(),
