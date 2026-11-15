@@ -20,8 +20,10 @@
 //! trade-off Pingora's own rate-limiting example makes, and it is fine for
 //! stopping a flood.
 
+use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::RwLock;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -33,27 +35,49 @@ use pingora_limits::rate::Rate;
 const WINDOW: Duration = Duration::from_secs(1);
 
 /// Per-IP HTTP request limiter. A budget of `0` disables it.
+///
+/// One counter table per domain: a busy high-limit domain must not spend a
+/// quiet low-limit domain's budget. The map is keyed by the domains in the
+/// config, so its size is bounded by the config, not by client traffic.
 pub struct RequestLimiter {
-    rate: Rate,
+    rates: RwLock<HashMap<String, Rate>>,
     max_per_window: AtomicUsize,
 }
 
 impl RequestLimiter {
     pub fn new(max_per_window: usize) -> Self {
         Self {
-            rate: Rate::new(WINDOW),
+            rates: RwLock::new(HashMap::new()),
             max_per_window: AtomicUsize::new(max_per_window),
         }
     }
 
-    /// Count this request and report whether it is within budget.
+    /// Count this request against the configured budget. Test-only: the proxy
+    /// always uses `check_with` so a domain can carry its own ceiling.
+    #[cfg(test)]
     pub fn check(&self, ip: &IpAddr) -> bool {
-        let budget = self.max_per_window.load(Ordering::Relaxed);
+        self.check_with("", ip, self.budget())
+    }
+
+    /// Count this request against one domain's budget. An empty `domain` is the
+    /// shared bucket for unknown Host headers.
+    pub fn check_with(&self, domain: &str, ip: &IpAddr, budget: usize) -> bool {
         if budget == 0 {
             return true;
         }
-        let seen = self.rate.observe(ip, 1);
-        seen <= budget as isize
+        if let Some(rate) = self
+            .rates
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(domain)
+        {
+            return rate.observe(ip, 1) <= budget as isize;
+        }
+        let mut rates = self.rates.write().unwrap_or_else(|e| e.into_inner());
+        let rate = rates
+            .entry(domain.to_string())
+            .or_insert_with(|| Rate::new(WINDOW));
+        rate.observe(ip, 1) <= budget as isize
     }
 
     /// The configured budget, for logging.

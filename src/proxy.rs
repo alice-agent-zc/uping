@@ -5,6 +5,7 @@ use std::net::IpAddr;
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
+use std::time::Duration;
 
 use anyhow::Context;
 use async_trait::async_trait;
@@ -17,7 +18,7 @@ use pingora::upstreams::peer::HttpPeer;
 use pingora::{Error, ErrorType, Result};
 
 use crate::acme::{ChallengeStore, CHALLENGE_PREFIX};
-use crate::config::UpstreamTls;
+use crate::config::{EffectiveHealth, Limits, UpstreamTls};
 use crate::health::HealthTracker;
 use crate::limits::RequestLimiter;
 use crate::static_files::{self, StaticSite};
@@ -135,6 +136,12 @@ pub struct Upstream {
     /// Probe the backend and answer `503` when it is down. `false` makes the
     /// registry resolve the address but never reject the request.
     pub health: bool,
+    /// Run the active TCP/TLS probe. `false` keeps only the resolver refresh.
+    pub active_probe: bool,
+    /// How often this backend is probed (or its DNS refreshed).
+    pub health_interval: Duration,
+    pub health_timeout: Duration,
+    pub health_failures: usize,
     /// Pre-built OpenSSL connector for the health probe. `None` means plain TCP.
     pub probe: Option<Arc<openssl::ssl::SslConnector>>,
     /// Identity used by the health registry (address + TLS settings).
@@ -165,14 +172,15 @@ pub struct UpstreamSpec<'a> {
     /// Used as the SNI when the backend is an IP literal and no `upstream_sni`
     /// is written: a loopback backend usually serves the public certificate.
     pub default_sni: &'a str,
-    /// Whether this backend takes part in the health gate.
-    pub health: bool,
+    /// The effective `[health]` settings for this backend.
+    pub health: EffectiveHealth,
 }
 
 impl Upstream {
     fn from_config(spec: &UpstreamSpec<'_>, root_dir: &Path) -> anyhow::Result<Self> {
         let address = spec.address.trim();
         let tls = spec.tls;
+        let health = spec.health;
         let host = host_of(address);
         let sni = if !tls.sni.trim().is_empty() {
             tls.sni.trim().to_string()
@@ -219,7 +227,21 @@ impl Upstream {
             None
         };
 
-        let key = format!("{address}|tls={}|sni={sni}|verify={}", tls.tls, tls.verify);
+        let active_probe = health.gate && health.interval_ms != 0;
+        let key = format!(
+            "{address}|tls={}|sni={sni}|verify={}|gate={}|interval={}|timeout={}|failures={}",
+            tls.tls,
+            tls.verify,
+            health.gate,
+            health.interval_ms,
+            health.timeout_ms,
+            health.failures
+        );
+        let refresh_ms = if active_probe {
+            health.interval_ms
+        } else {
+            60_000
+        };
         Ok(Self {
             address: std::sync::Arc::from(address),
             tls: tls.tls,
@@ -227,7 +249,11 @@ impl Upstream {
             verify: tls.verify,
             ca,
             probe,
-            health: spec.health,
+            health: health.gate,
+            active_probe,
+            health_interval: Duration::from_millis(refresh_ms),
+            health_timeout: Duration::from_millis(health.timeout_ms),
+            health_failures: health.failures,
             key: std::sync::Arc::from(key.as_str()),
         })
     }
@@ -287,12 +313,13 @@ impl PathRoute {
         route: &crate::config::Route,
         domain: &str,
         root_dir: &std::path::Path,
+        inherited: EffectiveHealth,
     ) -> anyhow::Result<Self> {
         let spec = UpstreamSpec {
             address: &route.upstream,
             tls: route.upstream_tls(),
             default_sni: domain,
-            health: route.health,
+            health: route.health.resolve(inherited),
         };
         Ok(Self {
             prefix: route.prefix().to_string(),
@@ -311,19 +338,33 @@ pub struct Resolved<'a> {
 }
 
 /// The routes of one domain: a catch-all target plus optional path routes,
-/// longest prefix first.
+/// longest prefix first, and the limits that apply to this domain.
 #[derive(Debug)]
 pub struct SiteRoutes {
     catch_all: Target,
     routes: Vec<PathRoute>,
+    pub limits: Limits,
 }
 
 impl SiteRoutes {
+    #[cfg(test)]
     pub fn new(catch_all: Target, routes: impl IntoIterator<Item = PathRoute>) -> Self {
+        Self::with_limits(catch_all, routes, Limits::default())
+    }
+
+    pub fn with_limits(
+        catch_all: Target,
+        routes: impl IntoIterator<Item = PathRoute>,
+        limits: Limits,
+    ) -> Self {
         let mut routes: Vec<PathRoute> = routes.into_iter().collect();
         // Longest first: `/assets/` is looked at before `/`.
         routes.sort_by_key(|r| std::cmp::Reverse(r.prefix.len()));
-        Self { catch_all, routes }
+        Self {
+            catch_all,
+            routes,
+            limits,
+        }
     }
 
     /// Every target this domain can reach, catch-all included.
@@ -365,25 +406,27 @@ impl RouteTable {
     pub fn from_config(cfg: &crate::config::Config) -> anyhow::Result<Self> {
         let mut sites = HashMap::new();
         for s in &cfg.servers {
+            let health = cfg.health_for(s);
             let spec = UpstreamSpec {
                 address: &s.upstream,
                 tls: s.upstream_tls(),
                 default_sni: &s.domain,
-                health: s.health,
+                health,
             };
             let catch_all = Target::from_config(&spec, &s.root, &s.index, &cfg.root_dir)
                 .with_context(|| format!("building the catch-all for `{}`", s.domain))?;
             let mut routes = Vec::new();
-            for r in cfg.routes_for(s) {
+            for r in &s.routes {
                 routes.push(
-                    PathRoute::from_config(r, &s.domain, &cfg.root_dir).with_context(|| {
-                        format!("building route `{}` for `{}`", r.path, s.domain)
-                    })?,
+                    PathRoute::from_config(r, &s.domain, &cfg.root_dir, health).with_context(
+                        || format!("building route `{}` for `{}`", r.path, s.domain),
+                    )?,
                 );
             }
+            let limits = cfg.limits_for(s);
             sites.insert(
                 s.domain.to_ascii_lowercase(),
-                SiteRoutes::new(catch_all, routes),
+                SiteRoutes::with_limits(catch_all, routes, limits),
             );
         }
         Ok(Self::new(sites))
@@ -424,6 +467,9 @@ pub struct ProxyCtx {
     host: Option<String>,
     /// Prefix the matched route wants removed before forwarding.
     strip_prefix: Option<String>,
+    /// Effective `max_body_bytes` for this domain; `None` means "not resolved
+    /// yet", not "unlimited".
+    max_body: Option<usize>,
     /// Bytes of request body seen so far, for chunked uploads.
     body_bytes: u64,
 }
@@ -530,33 +576,32 @@ impl ProxyHttp for HttpsProxy {
         ProxyCtx::default()
     }
 
-    /// Runs before the request is forwarded: rate limit, route, size check.
+    /// Runs before the request is forwarded: route, rate limit, size check.
     async fn request_filter(&self, session: &mut Session, ctx: &mut Self::CTX) -> Result<bool> {
         session.set_keepalive(Some(KEEPALIVE_TIMEOUT_SECS));
 
-        // 1. Per-IP request budget. Counted for every request, including the
-        //    ones we are about to reject, so a flood never gets a free pass.
-        if let Some(addr) = session.client_addr().and_then(|a| a.as_inet()) {
-            if !self.limiter.check(&addr.ip()) {
-                warn!(
-                    "rate limit: {} exceeded {} req/s, answering 429",
-                    addr.ip(),
-                    self.limiter.budget()
-                );
-                session.respond_error(429).await?;
-                return Ok(true);
-            }
-        }
-
-        // 2. Resolve the upstream now so an unrouted host gets a clean 404
-        //    instead of a 500 from `upstream_peer`. An unknown *path* is not an
-        //    error: it falls through to the server's catch-all upstream.
+        // 1. Resolve the domain first: its own `limits` may differ from the
+        //    global budget. An unknown host still gets the global budget, so a
+        //    flood of bogus Host headers is not free.
         let host = request_host(session).unwrap_or_default();
         let routes = {
             let live = self.routes.read().unwrap_or_else(|e| e.into_inner());
             live.clone()
         };
-        let Some(site) = routes.get(&host) else {
+        let site = routes.get(&host);
+        if let Some(addr) = session.client_addr().and_then(|a| a.as_inet()) {
+            let budget = site.map_or_else(|| self.limiter.budget(), |s| s.limits.per_ip_rps);
+            let domain = if site.is_some() { host.as_str() } else { "" };
+            if !self.limiter.check_with(domain, &addr.ip(), budget) {
+                warn!(
+                    "rate limit: {} exceeded {budget} req/s, answering 429",
+                    addr.ip()
+                );
+                session.respond_error(429).await?;
+                return Ok(true);
+            }
+        }
+        let Some(site) = site else {
             debug!("no [[server]] entry for host `{host}`, answering 404");
             session.respond_error(404).await?;
             return Ok(true);
@@ -573,6 +618,11 @@ impl ProxyHttp for HttpsProxy {
             session.respond_error(421).await?;
             return Ok(true);
         }
+
+        // The body cap is per domain too. Remember it for the chunked-body
+        // filter, where there is no `Content-Length` to check upfront.
+        let max_body = site.limits.max_body_bytes;
+        ctx.max_body = Some(max_body);
 
         // `Resolved` borrows only the route table, so the request path can stay
         // borrowed from the session until the static branch clones it.
@@ -604,8 +654,7 @@ impl ProxyHttp for HttpsProxy {
             }
         }
 
-        // 3. Reject obviously oversized bodies before reading anything.
-        let max_body = self.max_body_bytes.load(Ordering::Relaxed);
+        // 2. Reject obviously oversized bodies before reading anything.
         if max_body > 0 {
             if let Some(len) = declared_content_length(session) {
                 if len > max_body as u64 {
@@ -720,7 +769,9 @@ impl ProxyHttp for HttpsProxy {
         _end_of_stream: bool,
         ctx: &mut Self::CTX,
     ) -> Result<()> {
-        let max_body = self.max_body_bytes.load(Ordering::Relaxed);
+        let max_body = ctx
+            .max_body
+            .unwrap_or_else(|| self.max_body_bytes.load(Ordering::Relaxed));
         if max_body == 0 {
             return Ok(());
         }
@@ -889,7 +940,7 @@ mod tests {
                 ca: "",
             },
             default_sni: "test.local",
-            health: true,
+            health: EffectiveHealth::default(),
         };
         Target::Proxy(Arc::new(
             Upstream::from_config(&spec, Path::new(".")).unwrap(),

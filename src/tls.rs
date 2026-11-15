@@ -90,7 +90,7 @@ impl SniResolver {
                         cert.display(),
                         key.display()
                     ),
-                    KeyMode::Auto => pending.push(s.clone()),
+                    KeyMode::Auto | KeyMode::Internal => pending.push(s.clone()),
                 }
             }
         }
@@ -309,7 +309,8 @@ mod tests {
             https_listen: String::new(),
             https_listen6: String::new(),
             serve_http: true,
-            health: true,
+            health: Default::default(),
+            limits: None,
             keys: None,
             pub_key: cert.clone(),
             priv_key: key.clone(),

@@ -154,6 +154,10 @@ fn server(domain: &str, upstream: &str) -> String {
     )
 }
 
+fn server_with_routes(domain: &str, upstream: &str, routes: &str) -> String {
+    format!("{}routes = [{routes}]\n", server(domain, upstream))
+}
+
 // ---------------------------------------------------------------------------
 // The upstream must name one dialable peer.
 // ---------------------------------------------------------------------------
@@ -391,22 +395,16 @@ fn a_wildcard_stream_listen_is_refused() {
     );
 }
 
-/// The deprecated map form still works, but `--check` says so on stderr while
-/// keeping stdout machine-readable.
+/// The map server form was removed; the error must say what to write.
 #[test]
-fn the_deprecated_map_form_is_accepted_with_a_warning() {
-    let (cert, key) = cert_pair();
-    let body = format!(
-        "[server.\"map.local\"]\nkeys = \"manual\"\n\
-         pub_key = \"{cert}\"\npriv_key = \"{key}\"\nupstream = \"127.0.0.1:8080\"\n"
-    );
-    let path = write("map-form.toml", &body);
+fn the_map_server_form_is_refused() {
+    let body = "[server.\"map.local\"]\nupstream = \"127.0.0.1:8080\"\n";
+    let path = write("map-form.toml", body);
     let out = check(&path);
 
-    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr(&out));
-    assert!(stdout(&out).starts_with("ok: 1 [[server]]"));
+    assert_ne!(out.status.code(), Some(0), "stdout: {}", stdout(&out));
     assert!(
-        stderr(&out).contains("map form is deprecated"),
+        stderr(&out).contains("map form was removed"),
         "stderr: {}",
         stderr(&out)
     );
@@ -419,11 +417,19 @@ fn a_realistic_three_server_config_is_accepted() {
     // route table where a route could apply to the wrong domain.
     let body = format!(
         "[listen]\nipv4 = \"0.0.0.0\"\nhttp = 80\nhttps = 443\n{}\
-         \n[[server.route]]\npath = \"/mcp\"\nupstream = \"127.0.0.1:8081\"\n{}\
-         \n[[server.route]]\npath = \"/api\"\nupstream = \"127.0.0.1:9001\"\n{}\
+         {}\
+         {}\
          \n[[stream]]\nname = \"smtp\"\nlisten = \"0.0.0.0:2525\"\nupstream = \"127.0.0.1:10025\"\n",
-        server("a.example", "127.0.0.1:8080"),
-        server("b.example", "127.0.0.1:8090"),
+        server_with_routes(
+            "a.example",
+            "127.0.0.1:8080",
+            r#"{ path = "/mcp", upstream = "127.0.0.1:8081" }"#,
+        ),
+        server_with_routes(
+            "b.example",
+            "127.0.0.1:8090",
+            r#"{ path = "/api", upstream = "127.0.0.1:9001" }"#,
+        ),
         server("c.example", "127.0.0.1:8095"),
     );
     let path = write("good-three-servers.toml", &body);

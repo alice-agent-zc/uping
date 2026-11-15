@@ -17,17 +17,18 @@ use std::collections::HashMap;
 use std::io;
 use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
 use std::sync::{Arc, Mutex, RwLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use log::{info, warn};
 
-use crate::config::Health as HealthConfig;
 use crate::proxy::{RouteTable, Upstream};
 
 struct State {
     addr: Option<SocketAddr>,
     fails: usize,
     up: bool,
+    /// When the last probe (or resolver refresh) finished.
+    last_probe: Option<Instant>,
 }
 
 impl State {
@@ -36,28 +37,18 @@ impl State {
             addr: None,
             fails: 0,
             up: false,
+            last_probe: None,
         }
     }
 }
 
 pub struct HealthTracker {
-    enabled: bool,
-    interval: Duration,
-    timeout: Duration,
-    failures: usize,
     states: Mutex<HashMap<Arc<str>, State>>,
 }
 
 impl HealthTracker {
-    pub fn new(cfg: &HealthConfig) -> Arc<Self> {
-        let enabled = cfg.interval_ms != 0;
+    pub fn new() -> Arc<Self> {
         Arc::new(Self {
-            enabled,
-            // With the probe off, still refresh a DNS-backed upstream now and
-            // then; a renamed backend should not stay stale forever.
-            interval: Duration::from_millis(if enabled { cfg.interval_ms } else { 60_000 }),
-            timeout: Duration::from_millis(cfg.timeout_ms),
-            failures: cfg.failures.max(1),
             states: Mutex::new(HashMap::new()),
         })
     }
@@ -86,7 +77,9 @@ impl HealthTracker {
         }
     }
 
-    /// Start the periodic probe thread. It reads the live table on every pass.
+    /// Start the periodic probe thread. It reads the live table on every pass
+    /// and checks each backend against its own `health` interval, so one slow
+    /// backend can be probed every 30 s while another is checked every 2 s.
     pub fn spawn(self: Arc<Self>, routes: Arc<RwLock<Arc<RouteTable>>>) {
         let thread = std::thread::Builder::new()
             .name("uping-health".into())
@@ -95,14 +88,32 @@ impl HealthTracker {
                     let live = routes.read().unwrap_or_else(|e| e.into_inner());
                     live.clone()
                 };
+                let mut tick = Duration::from_secs(60);
                 for upstream in table.upstreams() {
-                    self.probe(&upstream);
+                    tick = tick.min(upstream.health_interval);
+                    if self.due(&upstream) {
+                        self.probe(&upstream);
+                    }
                 }
-                std::thread::sleep(self.interval);
+                // A no-op config must not turn this into a busy loop. Cap the
+                // sleep so a reload that adds a short interval is noticed soon.
+                let tick = tick
+                    .min(Duration::from_secs(5))
+                    .max(Duration::from_millis(50));
+                std::thread::sleep(tick);
             });
         if let Err(e) = thread {
             warn!("health: cannot start the probe thread: {e}");
         }
+    }
+
+    /// Has this backend's own interval elapsed since its last pass?
+    fn due(&self, upstream: &Upstream) -> bool {
+        let states = self.states.lock().unwrap_or_else(|e| e.into_inner());
+        states
+            .get(upstream.key())
+            .and_then(|s| s.last_probe)
+            .is_none_or(|at| at.elapsed() >= upstream.health_interval)
     }
 
     fn probe(&self, upstream: &Upstream) {
@@ -118,14 +129,14 @@ impl HealthTracker {
             return;
         }
 
-        if !self.enabled || !upstream.health {
+        if !upstream.active_probe {
             self.record(upstream, Some(addrs[0]), true, None);
             return;
         }
 
         let mut last = None;
         for addr in addrs {
-            match probe_connect(upstream, addr, self.timeout) {
+            match probe_connect(upstream, addr, upstream.health_timeout) {
                 Ok(()) => {
                     self.record(upstream, Some(addr), true, None);
                     return;
@@ -159,12 +170,13 @@ impl HealthTracker {
                 state.addr = Some(addr);
             }
         }
+        state.last_probe = Some(Instant::now());
         let down = if healthy {
             state.fails = 0;
             false
         } else {
             state.fails += 1;
-            state.fails >= self.failures || !self.enabled
+            state.fails >= upstream.health_failures.max(1) || !upstream.active_probe
         };
 
         let changed = !was_known || state.up != !down;

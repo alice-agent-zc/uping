@@ -1,9 +1,9 @@
-name: release
+name: publish
 
 # A release is identified by its tag, so the run is named for the tag rather
 # than for whatever commit subject happened to be merged. `github.event.inputs`
 # is the form that stays empty instead of erroring when no dispatch ran.
-run-name: release ${{ github.event.inputs.tag || github.ref_name }}
+run-name: publish ${{ github.event.inputs.tag || github.ref_name }}
 
 # A tag is the only thing that publishes, so the asset a user downloads is
 # always the code the tag names. `workflow_dispatch` rebuilds an existing tag in
@@ -29,8 +29,11 @@ env:
   TARGET: x86_64-unknown-linux-gnu
 
 jobs:
-  release:
+  publish:
     runs-on: ubuntu-24.04
+    environment:
+      name: publish
+      url: ${{ github.server_url }}/${{ github.repository }}/releases
     steps:
       - uses: actions/checkout@v4
         with:
@@ -85,7 +88,7 @@ jobs:
           ls -l uping-"$TARGET".tar.gz*
           cat uping-"$TARGET".tar.gz.sha256
 
-      - name: publish
+      - name: upload the release
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ steps.tag.outputs.name }}

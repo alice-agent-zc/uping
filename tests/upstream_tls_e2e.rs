@@ -71,13 +71,13 @@ fn config(dir: &Path, http: u16, https: u16, backend: u16) -> String {
     format!(
         "[listen]\nipv4 = \"127.0.0.1\"\nhttp = {http}\nhttps = {https}\n\
          [health]\ninterval_ms = 0\n\
-         [server.\"verify.local\"]\nkeys = \"manual\"\n\
+         [[server]]\ndomain = \"verify.local\"\nkeys = \"manual\"\n\
          pub_key = \"{}\"\npriv_key = \"{}\"\nupstream = \"127.0.0.1:{backend}\"\n\
          upstream_tls = true\nupstream_sni = \"tls.local\"\nupstream_ca = \"{}\"\n\
-         [server.\"insecure.local\"]\nkeys = \"manual\"\n\
+         [[server]]\ndomain = \"insecure.local\"\nkeys = \"manual\"\n\
          pub_key = \"{}\"\npriv_key = \"{}\"\nupstream = \"127.0.0.1:{backend}\"\n\
          upstream_tls = true\nupstream_sni = \"wrong.local\"\nupstream_verify = false\n\
-         [server.\"mismatch.local\"]\nkeys = \"manual\"\n\
+         [[server]]\ndomain = \"mismatch.local\"\nkeys = \"manual\"\n\
          pub_key = \"{}\"\npriv_key = \"{}\"\nupstream = \"127.0.0.1:{backend}\"\n\
          upstream_tls = true\nupstream_sni = \"wrong.local\"\nupstream_ca = \"{}\"\n",
         cert.display(),

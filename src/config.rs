@@ -2,71 +2,61 @@
 //!
 //! The whole config stays small. Relative paths — manual key files, static
 //! roots, the certificate directory — are resolved against the directory that
-//! holds `config.toml`, so the process can be started from anywhere.
+//! holds `config.toml`; an absolute path is used exactly as written.
+//!
+//! `[listen]`, `[limits]`, `[tls]` and `[health]` are defaults for every
+//! `[[server]]`. `limits` and `health` can be overridden per server:
 //!
 //! ```toml
-//! # Optional. The host-wide listeners: one address per family, one port per
-//! # protocol. A server can override its HTTPS socket with
-//! # https_listen/https_listen6.
 //! [listen]
 //! ipv4  = "0.0.0.0"                    # default
 //! # ipv6 = "2001:db8::1"               # omit for no IPv6
 //! http  = 80                           # default
 //! https = 443                          # default
 //!
-//! # Optional. ACME / Let's Encrypt, used by `keys = "auto"`.
-//! [acme]
-//! email             = "ops@example.com"
-//! staging           = false
-//! cert_dir          = "cert"          # <config dir>/cert/<domain>/
-//! renew_before_days = 30              # clamped to 1..=89
-//!
-//! # Optional. Abuse protection. Each limit can be disabled with 0.
 //! [limits]
-//! per_ip_rps         = 300        # sustained requests/sec from one client IP
-//! per_ip_conns_per_sec = 100      # new TCP connections/sec from one client IP
-//! max_body_bytes     = 10485760   # largest accepted request body (0 = unlimited)
+//! per_ip_rps           = 300           # requests/sec per client IP
+//! per_ip_conns_per_sec = 100           # new TCP connections/sec per client IP
+//! max_body_bytes       = 10485760      # largest request body (0 = unlimited)
 //!
-//! # Optional. TLS behaviour.
 //! [tls]
-//! fallback_cert = true            # serve the first cert when SNI is absent/unknown
+//! fallback_cert = true                 # listener-wide, not per domain
 //!
-//! # Optional. Upstream liveness: 0 disables the probe, never a default.
 //! [health]
-//! interval_ms = 5000
+//! interval_ms = 5000                   # 0 disables the active probe
 //! timeout_ms  = 2000
 //! failures    = 2
 //!
+//! [acme]
+//! email             = "ops@example.com"
+//! cert_dir          = "cert"           # <config dir>/cert/<domain>/
+//! renew_before_days = 30               # clamped to 1..=89
+//!
+//! # Optional: a private ACME CA. `keys = "internal"` selects it, and step-ca
+//! # works as-is because it speaks ACME. The directory is the provisioner URL.
+//! [acme.internal]
+//! directory = "https://step-ca.internal/acme/acme/directory"
+//! ca_bundle = "certs/root_ca.pem"
+//!
 //! [[server]]
 //! domain   = "www.example.com"
-//! keys     = "auto"                    # default when no key paths are given
+//! keys     = "auto"                    # auto | internal | manual
 //! upstream = "127.0.0.1:8080"          # catch-all
+//! limits   = { per_ip_rps = 1220 }     # override [limits] for this domain
+//! health   = { interval_ms = 10000 }   # or `health = false` to skip the 503 gate
 //! # https_listen = "203.0.113.10"     # own HTTPS socket instead of the global one
 //! # serve_http   = false              # no :80 redirect/ACME (manual keys only)
-//! # health       = false              # never fail this backend with 503
 //!
-//! # Or serve files instead of proxying; one of upstream/root.
-//! [[server]]
-//! domain = "static.example.com"
-//! root   = "public"                    # relative to config.toml
-//! index  = "index.html"
+//! # One target per path prefix; the longest prefix wins.
+//! routes = [
+//!   { path = "/mcp", upstream = "127.0.0.1:8081" },
+//!   { path = "/assets", root = "public/assets", strip_prefix = true },
+//! ]
 //!
-//! # Optional. One target per path prefix; the longest prefix wins. Routes are
-//! # nested under the server that owns them, so there is no shared route table.
-//! [[server.route]]
-//! path     = "/mcp"
-//! upstream = "127.0.0.1:8081"
-//!
-//! [[server.route]]
-//! path         = "/assets"
-//! root         = "public/assets"
-//! strip_prefix = true
-//!
-//! # Experimental. Raw TCP forwarding, one listener per entry.
 //! [[stream]]
 //! name     = "smtp"                    # log label, optional
 //! listen   = "0.0.0.0:25"              # one concrete IP:port; no wildcard
-//! upstream = "127.0.0.1:10025"         # the port the service really listens on
+//! upstream = "127.0.0.1:10025"
 //! connect_timeout_ms = 5000            # default 5000, clamped to 100..30000
 //! ```
 
@@ -115,11 +105,6 @@ pub struct Config {
     /// every byte to `upstream` — no HTTP, no TLS termination.
     #[serde(rename = "stream", default)]
     pub streams: Vec<Stream>,
-
-    /// Set when the deprecated `[server."domain"]` map form was used. Not
-    /// deserialized; the loader records it so the runtime can warn once.
-    #[serde(skip)]
-    pub deprecated_server_map: bool,
 }
 
 /// Where uping binds, globally.
@@ -182,25 +167,26 @@ impl Listen {
             .map_err(|e| anyhow::anyhow!("`[listen] ipv6` `{raw}` is not an IPv6 address: {e}"))
     }
 
-    /// The HTTP sockets: the global IPv4 address and, when configured, the
-    /// global IPv6 one. `http` is never per-server: port 80 is what the ACME
-    /// http-01 challenge needs, so it stays in one place.
-    pub fn http_addrs(&self) -> Result<Vec<SocketAddr>> {
-        let mut out = vec![SocketAddr::new(IpAddr::V4(self.ipv4_addr()?), self.http)];
+    /// The sockets on one port: the global IPv4 address and, when configured,
+    /// the global IPv6 one.
+    fn addrs(&self, port: u16) -> Result<Vec<SocketAddr>> {
+        let mut out = vec![SocketAddr::new(IpAddr::V4(self.ipv4_addr()?), port)];
         if let Some(v6) = self.ipv6_addr()? {
-            out.push(SocketAddr::new(IpAddr::V6(v6), self.http));
+            out.push(SocketAddr::new(IpAddr::V6(v6), port));
         }
         Ok(out)
+    }
+
+    /// `http` is never per-server: port 80 is what the ACME http-01 challenge
+    /// needs, so it stays in one place.
+    pub fn http_addrs(&self) -> Result<Vec<SocketAddr>> {
+        self.addrs(self.http)
     }
 
     /// The sockets of the default HTTPS group, for servers that do not
     /// override `https_listen`/`https_listen6`.
     pub fn https_addrs(&self) -> Result<Vec<SocketAddr>> {
-        let mut out = vec![SocketAddr::new(IpAddr::V4(self.ipv4_addr()?), self.https)];
-        if let Some(v6) = self.ipv6_addr()? {
-            out.push(SocketAddr::new(IpAddr::V6(v6), self.https));
-        }
-        Ok(out)
+        self.addrs(self.https)
     }
 }
 
@@ -401,6 +387,80 @@ fn default_health_failures() -> usize {
     2
 }
 
+/// The resolved health settings of one backend: the global `[health]` table
+/// with the server's and then the route's overrides applied.
+#[derive(Debug, Clone, Copy)]
+pub struct EffectiveHealth {
+    /// Answer `503` when the backend is down. `health = false` clears it.
+    pub gate: bool,
+    /// `0` keeps the resolver refresh but disables the active TCP/TLS probe.
+    pub interval_ms: u64,
+    pub timeout_ms: u64,
+    pub failures: usize,
+}
+
+impl Default for EffectiveHealth {
+    fn default() -> Self {
+        Health::default().effective()
+    }
+}
+
+impl Health {
+    pub fn effective(&self) -> EffectiveHealth {
+        EffectiveHealth {
+            gate: true,
+            interval_ms: self.interval_ms,
+            timeout_ms: self.timeout_ms,
+            failures: self.failures,
+        }
+    }
+}
+
+/// `health = false`, `health = true`, or `health = { ... }`.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+pub enum HealthOverride {
+    Enabled(bool),
+    Settings(HealthFields),
+}
+
+impl Default for HealthOverride {
+    fn default() -> Self {
+        Self::Enabled(true)
+    }
+}
+
+/// A partial `[health]` table on a server or route.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HealthFields {
+    #[serde(default)]
+    pub interval_ms: Option<u64>,
+    #[serde(default)]
+    pub timeout_ms: Option<u64>,
+    #[serde(default)]
+    pub failures: Option<usize>,
+}
+
+impl HealthOverride {
+    /// Resolve this override against the inherited settings. A settings table
+    /// re-enables the gate: writing `health = { ... }` is an opt-in.
+    pub fn resolve(&self, base: EffectiveHealth) -> EffectiveHealth {
+        match self {
+            Self::Enabled(enabled) => EffectiveHealth {
+                gate: *enabled,
+                ..base
+            },
+            Self::Settings(fields) => EffectiveHealth {
+                gate: true,
+                interval_ms: fields.interval_ms.unwrap_or(base.interval_ms),
+                timeout_ms: fields.timeout_ms.unwrap_or(base.timeout_ms),
+                failures: fields.failures.unwrap_or(base.failures),
+            },
+        }
+    }
+}
+
 /// The upstream-TLS knobs of one server or route, borrowed for validation.
 #[derive(Debug, Clone, Copy)]
 pub struct UpstreamTls<'a> {
@@ -471,6 +531,37 @@ impl Default for Limits {
     }
 }
 
+/// The per-server form, `limits = { per_ip_rps = 1220 }`. Every field is
+/// optional: omitted ones keep the `[limits]` value. `per_ip_conns_per_sec` is
+/// accepted only to explain why it cannot work here — it is enforced at TCP
+/// accept time, before the `Host` header exists.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LimitsOverride {
+    #[serde(default)]
+    pub per_ip_rps: Option<usize>,
+    #[serde(default)]
+    pub per_ip_conns_per_sec: Option<usize>,
+    #[serde(default)]
+    pub max_body_bytes: Option<usize>,
+}
+
+impl Limits {
+    /// Apply a `[[server]] limits = { ... }` table on top of the global values.
+    pub fn merged(&self, over: Option<&LimitsOverride>) -> Limits {
+        let Some(over) = over else {
+            return self.clone();
+        };
+        Limits {
+            per_ip_rps: over.per_ip_rps.unwrap_or(self.per_ip_rps),
+            per_ip_conns_per_sec: over
+                .per_ip_conns_per_sec
+                .unwrap_or(self.per_ip_conns_per_sec),
+            max_body_bytes: over.max_body_bytes.unwrap_or(self.max_body_bytes),
+        }
+    }
+}
+
 fn default_per_ip_rps() -> usize {
     300
 }
@@ -513,15 +604,27 @@ fn default_true() -> bool {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum KeyMode {
-    /// Request and renew the certificate through ACME. This is the default for
-    /// a `[[server]]` that names no key paths.
+    /// Request and renew through the default ACME directory (Let's Encrypt, or
+    /// `[acme] directory`). This is the default when no key paths are given.
     Auto,
+    /// Request and renew through `[acme.internal]` — a private ACME CA such as
+    /// step-ca or Pebble. `step-ca` is accepted as an alias.
+    #[serde(alias = "step-ca", alias = "step_ca")]
+    Internal,
     /// Read the two PEM files named by `pub_key` and `priv_key`; renew them
     /// yourself (certbot, an ACME client, a paid CA, …).
     Manual,
 }
 
-/// Let's Encrypt / ACME settings, used when a `[[server]]` is in `auto` mode.
+impl KeyMode {
+    /// True for the modes that talk ACME and therefore may need a certificate
+    /// requested at startup.
+    pub fn is_acme(self) -> bool {
+        matches!(self, Self::Auto | Self::Internal)
+    }
+}
+
+/// Let's Encrypt / ACME settings.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Acme {
@@ -547,6 +650,11 @@ pub struct Acme {
     #[serde(default)]
     pub ca_bundle: String,
 
+    /// A private ACME CA, selected by `keys = "internal"`. `step-ca` and
+    /// `step_ca` are accepted as aliases for the table name.
+    #[serde(default, alias = "step-ca", alias = "step_ca")]
+    pub internal: Option<AcmeCa>,
+
     /// Where generated certificates live, relative to the config file (or
     /// absolute). One subdirectory per domain:
     /// `<cert_dir>/<domain>/{fullchain,privkey}.pem`. Default `cert`.
@@ -559,6 +667,19 @@ pub struct Acme {
     pub renew_before_days: u64,
 }
 
+/// One private ACME directory: `[acme.internal]` (or `[acme.step-ca]`).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AcmeCa {
+    /// The provisioner's ACME directory URL, e.g.
+    /// `https://step-ca.internal/acme/acme/directory`.
+    pub directory: String,
+    /// PEM root that signs the ACME server's certificate. Empty inherits the
+    /// top-level `ca_bundle`.
+    #[serde(default)]
+    pub ca_bundle: String,
+}
+
 impl Default for Acme {
     fn default() -> Self {
         Acme {
@@ -566,14 +687,23 @@ impl Default for Acme {
             staging: false,
             directory: String::new(),
             ca_bundle: String::new(),
+            internal: None,
             cert_dir: default_cert_dir(),
             renew_before_days: default_renew_before_days(),
         }
     }
 }
 
+/// The directory, trust root and contact an ACME order uses. Built once per
+/// certificate request, so a process can serve public and internal names.
+#[derive(Debug, Clone)]
+pub struct AcmeProfile {
+    pub directory: String,
+    pub ca_bundle: String,
+}
+
 impl Acme {
-    /// The directory URL the client should talk to.
+    /// The directory URL of the default (public) profile.
     pub fn directory_url(&self) -> &str {
         let custom = self.directory.trim();
         if !custom.is_empty() {
@@ -582,6 +712,34 @@ impl Acme {
             "https://acme-staging-v02.api.letsencrypt.org/directory"
         } else {
             "https://acme-v02.api.letsencrypt.org/directory"
+        }
+    }
+
+    /// The ACME profile a server's key mode selects.
+    pub fn profile(&self, mode: KeyMode) -> Result<AcmeProfile> {
+        match mode {
+            KeyMode::Auto => Ok(AcmeProfile {
+                directory: self.directory_url().to_string(),
+                ca_bundle: self.ca_bundle.clone(),
+            }),
+            KeyMode::Internal => {
+                let ca = self.internal.as_ref().context(
+                    "`keys = \"internal\"` needs an `[acme.internal]` (or \
+                     `[acme.step-ca]`) table",
+                )?;
+                if ca.directory.trim().is_empty() {
+                    anyhow::bail!("`[acme.internal] directory` is empty");
+                }
+                Ok(AcmeProfile {
+                    directory: ca.directory.trim().to_string(),
+                    ca_bundle: if ca.ca_bundle.trim().is_empty() {
+                        self.ca_bundle.clone()
+                    } else {
+                        ca.ca_bundle.trim().to_string()
+                    },
+                })
+            }
+            KeyMode::Manual => anyhow::bail!("`manual` mode has no ACME directory"),
         }
     }
 }
@@ -602,10 +760,8 @@ fn default_index() -> String {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Server {
-    /// The public domain name, e.g. `www.example.com`. Matched case-insensitively
-    /// against the TLS SNI name and the HTTP `Host` header. In the map form
-    /// (`[server."www.example.com"]`) it is the table key, and this field may be
-    /// omitted; if both are present they must agree.
+    /// The public domain name, e.g. `www.example.com`. Matched
+    /// case-insensitively against the TLS SNI name and the HTTP `Host` header.
     #[serde(default)]
     pub domain: String,
 
@@ -624,7 +780,7 @@ pub struct Server {
 
     /// Answer plain HTTP for this domain (the redirect and the ACME http-01
     /// challenge). Default `true`. `false` means the domain exists only behind
-    /// HTTPS: a request for it on port 80 gets `404`, and `keys = "auto"` is
+    /// HTTPS: a request for it on port 80 gets `404`, and any ACME mode is
     /// refused because http-01 needs that listener.
     ///
     /// Named `serve_http`, not `http`: `[listen] http` is a port, and one word
@@ -632,14 +788,24 @@ pub struct Server {
     #[serde(default = "default_true")]
     pub serve_http: bool,
 
-    /// Probe this server's backend and fail fast with `503` when it is down.
-    /// Default `true`. `false` disables both the probe outcome and the `503`
-    /// for this backend; the request is attempted regardless.
-    #[serde(default = "default_true")]
-    pub health: bool,
+    /// `false` opts this backend out of the `503` gate; a table overrides
+    /// `[health] interval_ms`/`timeout_ms`/`failures` for this domain:
+    ///
+    /// ```toml
+    /// health = false
+    /// health = { interval_ms = 10000, failures = 3 }
+    /// ```
+    #[serde(default)]
+    pub health: HealthOverride,
 
-    /// `auto` (ACME) or `manual` (read `pub_key`/`priv_key`). When omitted,
-    /// naming both key paths selects `manual`; naming neither selects `auto`.
+    /// Per-domain `[limits]` override. `per_ip_conns_per_sec` is refused here:
+    /// it runs at TCP accept, before the `Host` header is known.
+    #[serde(default)]
+    pub limits: Option<LimitsOverride>,
+
+    /// `auto` (default ACME), `internal` (private ACME, e.g. step-ca) or
+    /// `manual` (read `pub_key`/`priv_key`). When omitted, naming both key
+    /// paths selects `manual`; naming neither selects `auto`.
     #[serde(default)]
     pub keys: Option<KeyMode>,
 
@@ -688,9 +854,10 @@ pub struct Server {
     #[serde(default = "default_index")]
     pub index: String,
 
-    /// Optional path routes (`[[server.route]]`). The longest matching `path`
-    /// wins; everything else falls through to this server's `upstream`/`root`.
-    #[serde(rename = "route", default)]
+    /// Optional path routes. The longest matching `path` wins; everything else
+    /// falls through to this server's `upstream`/`root`. Always an inline
+    /// array: `routes = [{ path = "/mcp", upstream = "..." }]`.
+    #[serde(rename = "routes", default)]
     pub routes: Vec<Route>,
 }
 
@@ -708,7 +875,7 @@ impl Server {
     }
 }
 
-/// One path-prefix route of one server (`[[server.route]]`).
+/// One path-prefix route of one server (`routes = [...]`).
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Route {
@@ -721,9 +888,9 @@ pub struct Route {
     pub upstream: String,
 
     /// Probe this route's backend and fail fast with `503` when it is down.
-    /// See the server-level `health` field.
-    #[serde(default = "default_true")]
-    pub health: bool,
+    /// Inherits the server's effective `[health]` settings; see `health`.
+    #[serde(default)]
+    pub health: HealthOverride,
 
     /// Speak HTTPS to this route's upstream. See the server-level fields.
     #[serde(default)]
@@ -808,13 +975,6 @@ impl Stream {
 }
 
 impl Config {
-    /// The effective route table for one server. Routes are nested under the
-    /// server (`[[server.route]]` or `[[server."domain".route]]`), so there is
-    /// never a question of which domain a route belongs to.
-    pub fn routes_for<'a>(&'a self, server: &'a Server) -> &'a [Route] {
-        &server.routes
-    }
-
     /// True when nothing would be served: no domain to terminate TLS for and no
     /// raw stream to forward. Uping refuses to start in that state.
     pub fn is_empty(&self) -> bool {
@@ -827,13 +987,23 @@ impl Config {
         resolve_path(&self.root_dir, raw)
     }
 
-    /// Where `keys = "auto"` writes certificates.
+    /// Where `keys = "auto"` / `keys = "internal"` write certificates.
     pub fn cert_dir(&self) -> PathBuf {
         self.resolve(&self.acme.cert_dir)
     }
 
-    /// The certificate and key paths for one server. In `auto` mode they are
-    /// either the optional `pub_key`/`priv_key` overrides or
+    /// The effective `[health]` defaults for one server.
+    pub fn health_for(&self, server: &Server) -> EffectiveHealth {
+        server.health.resolve(self.health.effective())
+    }
+
+    /// The effective `[limits]` for one server.
+    pub fn limits_for(&self, server: &Server) -> Limits {
+        self.limits.merged(server.limits.as_ref())
+    }
+
+    /// The certificate and key paths for one server. In `auto`/`internal` mode
+    /// they are either the optional `pub_key`/`priv_key` overrides or
     /// `<cert_dir>/<domain>/{fullchain,privkey}.pem`.
     pub fn key_paths(&self, server: &Server) -> (PathBuf, PathBuf) {
         if !server.pub_key.trim().is_empty() {
@@ -854,16 +1024,18 @@ impl Config {
         let path = path.as_ref();
         let raw = std::fs::read_to_string(path)
             .with_context(|| format!("reading config file `{}`", path.display()))?;
-        let mut value: toml::Value = toml::from_str(&raw)
+        let value: toml::Value = toml::from_str(&raw)
             .with_context(|| format!("parsing TOML in `{}`", path.display()))?;
-        // `[server."domain"]` is deserialized as a table; turn it into the same
-        // array the `[[server]]` form produces, with the key as `domain`.
-        let deprecated_server_map = normalize_server_tables(&mut value)?;
+        if matches!(value.get("server"), Some(toml::Value::Table(_))) {
+            anyhow::bail!(
+                "the `[server.\"domain\"]` map form was removed; use `[[server]]` with \
+                 `domain = \"...\"` instead"
+            );
+        }
         let mut cfg: Config = value
             .try_into()
             .with_context(|| format!("parsing TOML in `{}`", path.display()))?;
         cfg.root_dir = absolute_parent(path)?;
-        cfg.deprecated_server_map = deprecated_server_map;
 
         if cfg.is_empty() {
             anyhow::bail!(
@@ -872,6 +1044,8 @@ impl Config {
             );
         }
         validate_listen(&cfg.listen)?;
+        let health_defaults = cfg.health.effective();
+        validate_health(&health_defaults, "`[health]`")?;
         let mut seen = std::collections::HashSet::new();
         for s in &mut cfg.servers {
             // The same trimmed value must be what routing stores, not just
@@ -884,81 +1058,19 @@ impl Config {
                 r.path = r.path.trim().to_string();
                 r.index = r.index.trim().to_string();
             }
-            validate_server(s, &cfg.root_dir, cfg.listen.https)?;
+            let health = s.health.resolve(health_defaults);
+            validate_health(&health, &format!("`{}`", s.domain))?;
+            validate_server(s, &cfg.root_dir, cfg.listen.https, &cfg.acme, health)?;
             if !seen.insert(s.domain.to_ascii_lowercase()) {
                 anyhow::bail!("two [[server]] entries share the domain `{}`", s.domain);
             }
         }
         cfg.acme.renew_before_days = cfg.acme.renew_before_days.clamp(1, 89);
-        if cfg.health.interval_ms != 0 && !(100..=3_600_000).contains(&cfg.health.interval_ms) {
-            anyhow::bail!(
-                "`[health] interval_ms = {}` is out of range: use 0 to disable the \
-                 probe, or a value between 100 and 3600000",
-                cfg.health.interval_ms
-            );
-        }
-        if !(50..=30_000).contains(&cfg.health.timeout_ms) {
-            anyhow::bail!(
-                "`[health] timeout_ms = {}` is out of range: use 50..=30000",
-                cfg.health.timeout_ms
-            );
-        }
-        if !(1..=100).contains(&cfg.health.failures) {
-            anyhow::bail!(
-                "`[health] failures = {}` is out of range: use 1..=100 \
-                 (a backend must fail at least once to be marked down)",
-                cfg.health.failures
-            );
-        }
         validate_acme(&cfg.acme, &cfg.root_dir)?;
         validate_streams(&mut cfg)?;
         validate_listeners(&cfg)?;
         Ok(cfg)
     }
-}
-
-/// Accept both server forms.
-///
-/// ```toml
-/// [[server]]                 # array form: the domain is a field
-/// domain = "www.example.com"
-///
-/// [server."www.example.com"] # map form: the domain is the table key
-/// ```
-///
-/// The map form is rewritten into the array form before deserialization, so
-/// every later stage sees exactly one representation. The key is authoritative;
-/// a `domain` field that disagrees is refused instead of silently winning.
-fn normalize_server_tables(value: &mut toml::Value) -> Result<bool> {
-    let Some(server) = value.get_mut("server") else {
-        return Ok(false);
-    };
-    let Some(table) = server.as_table_mut() else {
-        return Ok(false);
-    };
-    let table = std::mem::take(table);
-    let mut array = Vec::with_capacity(table.len());
-    for (key, mut entry) in table {
-        let Some(entry_table) = entry.as_table_mut() else {
-            anyhow::bail!("`[server.{key}]` must be a table");
-        };
-        match entry_table.get("domain") {
-            Some(toml::Value::String(domain)) if domain != &key => anyhow::bail!(
-                "`[server.{key}]` also sets `domain = \"{domain}\"`; the table key and the field must agree"
-            ),
-            Some(toml::Value::String(_)) => {}
-            Some(other) => anyhow::bail!(
-                "`[server.{key}] domain` must be a string, not {}",
-                other.type_str()
-            ),
-            None => {
-                entry_table.insert("domain".to_string(), toml::Value::String(key.clone()));
-            }
-        }
-        array.push(entry);
-    }
-    *server = toml::Value::Array(array);
-    Ok(true)
 }
 
 /// The global listener must name one valid address and two valid ports.
@@ -1002,7 +1114,13 @@ fn resolve_path(root_dir: &Path, raw: &str) -> PathBuf {
 }
 
 /// One `[[server]]`: a domain, a certificate mode, and one catch-all target.
-fn validate_server(s: &Server, root_dir: &Path, https_port: u16) -> Result<()> {
+fn validate_server(
+    s: &Server,
+    root_dir: &Path,
+    https_port: u16,
+    acme: &Acme,
+    health: EffectiveHealth,
+) -> Result<()> {
     if s.domain.trim().is_empty() {
         anyhow::bail!("a [[server]] entry has an empty `domain`");
     }
@@ -1026,27 +1144,42 @@ fn validate_server(s: &Server, root_dir: &Path, https_port: u16) -> Result<()> {
     s.binds(https_port)
         .with_context(|| format!("`{domain}` listener override"))?;
 
+    if s.limits
+        .as_ref()
+        .and_then(|l| l.per_ip_conns_per_sec)
+        .is_some()
+    {
+        anyhow::bail!(
+            "`{domain}`: `limits.per_ip_conns_per_sec` is host-wide — it runs at TCP \
+             accept, before the Host header is known; set it in `[limits]`"
+        );
+    }
+
     let mode = s.key_mode();
     let pub_set = !s.pub_key.trim().is_empty();
     let priv_set = !s.priv_key.trim().is_empty();
     match mode {
         KeyMode::Manual if !pub_set => anyhow::bail!("`{domain}` has an empty `pub_key`"),
         KeyMode::Manual if !priv_set => anyhow::bail!("`{domain}` has an empty `priv_key`"),
-        KeyMode::Auto if pub_set != priv_set => anyhow::bail!(
+        KeyMode::Auto | KeyMode::Internal if pub_set != priv_set => anyhow::bail!(
             "`{domain}`: give both `pub_key` and `priv_key` to override the certificate paths, or neither"
         ),
         _ => {}
     }
+    if mode.is_acme() {
+        acme.profile(mode)
+            .with_context(|| format!("`{domain}` certificate mode"))?;
+    }
 
-    if !s.serve_http && mode == KeyMode::Auto {
+    if !s.serve_http && mode.is_acme() {
         anyhow::bail!(
-            "`{domain}` sets `serve_http = false` but uses `keys = \"auto\"`: the ACME \
+            "`{domain}` sets `serve_http = false` but uses an ACME key mode: the ACME \
              http-01 challenge needs the HTTP listener. Use `keys = \"manual\"` \
              with a certificate from an internal CA, or keep `serve_http = true`."
         );
     }
 
-    validate_routes(&s.routes, &format!("`{domain}`"), root_dir)?;
+    validate_routes(&s.routes, &format!("`{domain}`"), root_dir, health)?;
     Ok(())
 }
 
@@ -1143,31 +1276,96 @@ fn validate_index(index: &str, owner: &str) -> Result<()> {
 }
 
 fn validate_acme(acme: &Acme, root_dir: &Path) -> Result<()> {
-    let url = acme.directory.trim();
-    if !url.is_empty() && !(url.starts_with("https://") || url.starts_with("http://")) {
-        anyhow::bail!("`[acme] directory = \"{url}\"` must be an http(s) URL");
+    validate_acme_ca(
+        acme.directory.trim(),
+        acme.ca_bundle.trim(),
+        acme.email.trim(),
+        "`[acme]`",
+        root_dir,
+    )?;
+    if let Some(ca) = &acme.internal {
+        if ca.directory.trim().is_empty() {
+            anyhow::bail!("`[acme.internal] directory` is empty");
+        }
+        // Empty per-CA values inherit the top-level ones, exactly as
+        // `Acme::profile` does when it builds an order.
+        validate_acme_ca(
+            ca.directory.trim(),
+            if ca.ca_bundle.trim().is_empty() {
+                acme.ca_bundle.trim()
+            } else {
+                ca.ca_bundle.trim()
+            },
+            acme.email.trim(),
+            "`[acme.internal]`",
+            root_dir,
+        )?;
     }
-    let bundle = acme.ca_bundle.trim();
+    Ok(())
+}
+
+/// One ACME directory/bundle/contact triple. `directory` may be empty only for
+/// the default profile, where it means "Let's Encrypt".
+fn validate_acme_ca(
+    directory: &str,
+    bundle: &str,
+    email: &str,
+    owner: &str,
+    root_dir: &Path,
+) -> Result<()> {
+    if !directory.is_empty()
+        && !(directory.starts_with("https://") || directory.starts_with("http://"))
+    {
+        anyhow::bail!("{owner} `directory = \"{directory}\"` must be an http(s) URL");
+    }
     if !bundle.is_empty() {
         let path = resolve_path(root_dir, bundle);
         if !path.is_file() {
             anyhow::bail!(
-                "`[acme] ca_bundle = \"{bundle}\"` is not a readable PEM file (`{}`)",
+                "{owner} `ca_bundle = \"{bundle}\"` is not a readable PEM file (`{}`)",
                 path.display()
             );
         }
     }
-    if !acme.email.trim().is_empty() && !acme.email.contains('@') {
+    if !email.is_empty() && !email.contains('@') {
+        anyhow::bail!("{owner} `email = \"{email}\"` does not look like an address");
+    }
+    Ok(())
+}
+
+/// The `[health]` ranges are checked on the *effective* values, so a bad
+/// per-server override is reported with its domain and never silently clamped.
+fn validate_health(health: &EffectiveHealth, owner: &str) -> Result<()> {
+    if health.interval_ms != 0 && !(100..=3_600_000).contains(&health.interval_ms) {
         anyhow::bail!(
-            "`[acme] email = \"{}\"` does not look like an address",
-            acme.email
+            "{owner}: `health.interval_ms = {}` is out of range: use 0 to disable the \
+             probe, or a value between 100 and 3600000",
+            health.interval_ms
+        );
+    }
+    if !(50..=30_000).contains(&health.timeout_ms) {
+        anyhow::bail!(
+            "{owner}: `health.timeout_ms = {}` is out of range: use 50..=30000",
+            health.timeout_ms
+        );
+    }
+    if !(1..=100).contains(&health.failures) {
+        anyhow::bail!(
+            "{owner}: `health.failures = {}` is out of range: use 1..=100 \
+             (a backend must fail at least once to be marked down)",
+            health.failures
         );
     }
     Ok(())
 }
 
 /// Reject route tables that would be ambiguous or unusable at request time.
-fn validate_routes(routes: &[Route], owner: &str, root_dir: &Path) -> Result<()> {
+fn validate_routes(
+    routes: &[Route],
+    owner: &str,
+    root_dir: &Path,
+    server_health: EffectiveHealth,
+) -> Result<()> {
     let mut seen = std::collections::HashSet::new();
 
     for r in routes {
@@ -1176,6 +1374,7 @@ fn validate_routes(routes: &[Route], owner: &str, root_dir: &Path) -> Result<()>
 
         validate_target(&r.upstream, &r.root, root_dir, &where_, r.upstream_tls())?;
         validate_index(&r.index, &where_)?;
+        validate_health(&r.health.resolve(server_health), &where_)?;
         if !path.starts_with('/') {
             anyhow::bail!("{where_}: `path` must start with `/`");
         }
@@ -1576,21 +1775,20 @@ upstream = "127.0.0.1:8080"
         let _ = std::fs::remove_file(path);
     }
 
+    fn with_routes(entries: &str) -> String {
+        format!("{MINIMAL}routes = [{entries}]\n")
+    }
+
     const WITH_ROUTES: &str = r#"
 [[server]]
 domain   = "aaa.local"
 pub_key  = "certs/test.local.crt"
 priv_key = "certs/test.local.key"
 upstream = "127.0.0.1:8080"
-
-[[server.route]]
-path     = "/mcp"
-upstream = "127.0.0.1:8081"
-
-[[server.route]]
-path         = "/assets/"
-upstream     = "127.0.0.1:8085"
-strip_prefix = true
+routes = [
+  { path = "/mcp", upstream = "127.0.0.1:8081" },
+  { path = "/assets/", upstream = "127.0.0.1:8085", strip_prefix = true },
+]
 "#;
 
     #[test]
@@ -1609,6 +1807,22 @@ strip_prefix = true
     }
 
     #[test]
+    fn the_removed_route_table_form_is_refused() {
+        let path = write_temp(
+            "route-table.toml",
+            &format!(
+                "{MINIMAL}\n[[server.route]]\npath = \"/mcp\"\nupstream = \"127.0.0.1:8081\"\n"
+            ),
+        );
+        let err = format!("{:#}", Config::load(&path).unwrap_err());
+        assert!(
+            err.contains("unknown field `route`"),
+            "unexpected error: {err}"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
     fn a_server_without_routes_has_an_empty_list() {
         let path = write_temp("no-routes.toml", MINIMAL);
         assert!(Config::load(&path).unwrap().servers[0].routes.is_empty());
@@ -1619,9 +1833,7 @@ strip_prefix = true
     fn rejects_a_route_path_without_a_leading_slash() {
         let path = write_temp(
             "route-noslash.toml",
-            &format!(
-                "{MINIMAL}\n[[server.route]]\npath = \"mcp\"\nupstream = \"127.0.0.1:8081\"\n"
-            ),
+            &with_routes(r#"{ path = "mcp", upstream = "127.0.0.1:8081" }"#),
         );
         let err = Config::load(&path).unwrap_err().to_string();
 
@@ -1636,7 +1848,7 @@ strip_prefix = true
     fn rejects_the_root_path_as_a_route() {
         let path = write_temp(
             "route-root.toml",
-            &format!("{MINIMAL}\n[[server.route]]\npath = \"/\"\nupstream = \"127.0.0.1:8081\"\n"),
+            &with_routes(r#"{ path = "/", upstream = "127.0.0.1:8081" }"#),
         );
         let err = Config::load(&path).unwrap_err().to_string();
 
@@ -1648,8 +1860,9 @@ strip_prefix = true
     fn rejects_two_routes_for_the_same_prefix() {
         let path = write_temp(
             "route-dup.toml",
-            &format!(
-                "{MINIMAL}\n[[server.route]]\npath = \"/assets\"\nupstream = \"127.0.0.1:8085\"\n                 \n[[server.route]]\npath = \"/assets/\"\nupstream = \"127.0.0.1:8086\"\n"
+            &with_routes(
+                r#"{ path = "/assets", upstream = "127.0.0.1:8085" },
+  { path = "/assets/", upstream = "127.0.0.1:8086" }"#,
             ),
         );
         let err = Config::load(&path).unwrap_err().to_string();
@@ -1665,7 +1878,7 @@ strip_prefix = true
     fn rejects_a_route_with_an_empty_upstream() {
         let path = write_temp(
             "route-empty.toml",
-            &format!("{MINIMAL}\n[[server.route]]\npath = \"/mcp\"\nupstream = \"  \"\n"),
+            &with_routes(r#"{ path = "/mcp", upstream = "  " }"#),
         );
         let err = Config::load(&path).unwrap_err().to_string();
 
@@ -1680,9 +1893,7 @@ strip_prefix = true
     fn rejects_a_route_path_that_carries_a_query() {
         let path = write_temp(
             "route-query.toml",
-            &format!(
-                "{MINIMAL}\n[[server.route]]\npath = \"/mcp?x=1\"\nupstream = \"127.0.0.1:8081\"\n"
-            ),
+            &with_routes(r#"{ path = "/mcp?x=1", upstream = "127.0.0.1:8081" }"#),
         );
         let err = Config::load(&path).unwrap_err().to_string();
 
@@ -1712,43 +1923,19 @@ strip_prefix = true
     }
 
     #[test]
-    fn a_server_can_be_addressed_by_its_table_key() {
+    fn the_map_server_form_is_refused() {
         let path = write_temp(
             "server-map.toml",
             r#"
 [server."www.example.com"]
 upstream = "127.0.0.1:8080"
-
-[[server."www.example.com".route]]
-path = "/mcp"
-upstream = "127.0.0.1:8081"
 "#,
         );
-        let cfg = Config::load(&path).unwrap();
-
-        assert!(cfg.deprecated_server_map, "the map form must be flagged");
-        assert_eq!(cfg.servers.len(), 1);
-        assert_eq!(cfg.servers[0].domain, "www.example.com");
-        assert_eq!(cfg.servers[0].upstream, "127.0.0.1:8080");
-        // The route is nested under the domain: there is no ambiguity about
-        // which server it belongs to.
-        assert_eq!(cfg.servers[0].routes.len(), 1);
-        assert_eq!(cfg.servers[0].routes[0].path, "/mcp");
-        let _ = std::fs::remove_file(path);
-    }
-
-    #[test]
-    fn a_map_key_and_a_domain_field_must_agree() {
-        let path = write_temp(
-            "server-map-conflict.toml",
-            r#"
-[server."www.example.com"]
-domain = "api.example.com"
-upstream = "127.0.0.1:8080"
-"#,
+        let err = format!("{:#}", Config::load(&path).unwrap_err());
+        assert!(
+            err.contains("map form was removed"),
+            "unexpected error: {err}"
         );
-        let err = Config::load(&path).unwrap_err().to_string();
-        assert!(err.contains("must agree"), "unexpected error: {err}");
         let _ = std::fs::remove_file(path);
     }
 
@@ -1965,8 +2152,8 @@ https_listen6 = "2001:db8::1:9443"
         let path = write_temp(
             "route-tls.toml",
             "[[server]]\ndomain = \"s.local\"\nupstream = \"127.0.0.1:8080\"\n\
-             [[server.route]]\npath = \"/api\"\nupstream = \"127.0.0.1:8443\"\n\
-             upstream_tls = true\nupstream_sni = \"api.local\"\n",
+             routes = [{ path = \"/api\", upstream = \"127.0.0.1:8443\", \
+                         upstream_tls = true, upstream_sni = \"api.local\" }]\n",
         );
         let cfg = Config::load(&path).unwrap();
         assert!(!cfg.servers[0].upstream_tls);
@@ -2344,16 +2531,38 @@ upstream = "127.0.0.1:8080"
         let root = static_root("route");
         let path = write_temp(
             "static-route.toml",
-            &format!(
-                "{MINIMAL}\n[[server.route]]\npath = \"/assets\"\nroot = \"{}\"\nstrip_prefix = true\n",
+            &with_routes(&format!(
+                r#"{{ path = "/assets", root = "{}", strip_prefix = true }}"#,
                 root.display()
-            ),
+            )),
         );
         let cfg = Config::load(&path).unwrap();
         let route = &cfg.servers[0].routes[0];
         assert_eq!(route.prefix(), "/assets");
         assert!(route.upstream.is_empty());
         assert!(route.strip_prefix);
+        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn absolute_paths_are_kept_and_relative_ones_follow_the_config() {
+        let root = static_root("absolute");
+        let path = write_temp(
+            "absolute.toml",
+            &format!(
+                "[[server]]\ndomain = \"static.local\"\nroot = \"{}\"\n",
+                root.display()
+            ),
+        );
+        let cfg = Config::load(&path).unwrap();
+
+        assert_eq!(cfg.resolve(&root.display().to_string()), root);
+        assert_eq!(
+            cfg.resolve("public"),
+            std::env::temp_dir().join("public"),
+            "a relative path follows the config file"
+        );
         let _ = std::fs::remove_file(path);
         let _ = std::fs::remove_dir_all(root);
     }
@@ -2522,6 +2731,156 @@ upstream = "127.0.0.1:8080"
             &format!("[listen]\nipv6 = true\n{MINIMAL}"),
         );
         assert!(Config::load(&path).is_err());
+        let _ = std::fs::remove_file(path);
+    }
+
+    // -----------------------------------------------------------------------
+    // Per-server overrides, private ACME and the route spellings
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn per_server_limits_and_health_override_the_global_tables() {
+        let path = write_temp(
+            "server-overrides.toml",
+            r#"
+[limits]
+per_ip_rps = 100
+per_ip_conns_per_sec = 10
+max_body_bytes = 4096
+
+[health]
+interval_ms = 5000
+timeout_ms = 2000
+failures = 2
+
+[[server]]
+domain = "a.local"
+upstream = "127.0.0.1:8080"
+limits = { per_ip_rps = 1220 }
+health = { interval_ms = 10000, failures = 3 }
+"#,
+        );
+        let cfg = Config::load(&path).unwrap();
+        let s = &cfg.servers[0];
+
+        let limits = cfg.limits_for(s);
+        assert_eq!(limits.per_ip_rps, 1220);
+        assert_eq!(limits.per_ip_conns_per_sec, 10);
+        assert_eq!(limits.max_body_bytes, 4096);
+
+        let health = cfg.health_for(s);
+        assert!(health.gate);
+        assert_eq!(health.interval_ms, 10_000);
+        assert_eq!(health.timeout_ms, 2_000);
+        assert_eq!(health.failures, 3);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn health_false_and_a_settings_table_are_both_accepted() {
+        let path = write_temp(
+            "health-forms.toml",
+            r#"
+[health]
+interval_ms = 6000
+
+[[server]]
+domain = "off.local"
+upstream = "127.0.0.1:8080"
+health = false
+
+[[server]]
+domain = "table.local"
+upstream = "127.0.0.1:8081"
+health = { timeout_ms = 1000 }
+routes = [{ path = "/x", upstream = "127.0.0.1:8082", health = false }]
+"#,
+        );
+        let cfg = Config::load(&path).unwrap();
+        assert!(!cfg.health_for(&cfg.servers[0]).gate);
+
+        let server_health = cfg.health_for(&cfg.servers[1]);
+        assert!(server_health.gate);
+        assert_eq!(server_health.interval_ms, 6000);
+        assert_eq!(server_health.timeout_ms, 1000);
+        assert!(!cfg.servers[1].routes[0].health.resolve(server_health).gate);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn a_per_server_connection_limit_is_refused() {
+        let path = write_temp(
+            "server-conns.toml",
+            r#"
+[[server]]
+domain = "a.local"
+upstream = "127.0.0.1:8080"
+limits = { per_ip_conns_per_sec = 1 }
+"#,
+        );
+        let err = Config::load(&path).unwrap_err().to_string();
+        assert!(err.contains("host-wide"), "unexpected error: {err}");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn internal_mode_selects_the_private_acme_profile() {
+        let path = write_temp(
+            "internal.toml",
+            r#"
+[acme.step-ca]
+directory = "https://ca.local/acme/acme/directory"
+
+[[server]]
+domain = "private.local"
+keys = "step-ca"
+upstream = "127.0.0.1:8080"
+"#,
+        );
+        let cfg = Config::load(&path).unwrap();
+        assert_eq!(cfg.servers[0].key_mode(), KeyMode::Internal);
+        let profile = cfg.acme.profile(KeyMode::Internal).unwrap();
+        assert_eq!(profile.directory, "https://ca.local/acme/acme/directory");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn internal_mode_without_a_private_ca_is_refused() {
+        let path = write_temp(
+            "internal-missing.toml",
+            r#"
+[[server]]
+domain = "private.local"
+keys = "internal"
+upstream = "127.0.0.1:8080"
+"#,
+        );
+        let err = format!("{:#}", Config::load(&path).unwrap_err());
+        assert!(err.contains("acme.internal"), "unexpected error: {err}");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn routes_stay_inside_their_server() {
+        let path = write_temp(
+            "route-forms.toml",
+            r#"
+[[server]]
+domain = "www.example.com"
+upstream = "127.0.0.1:8080"
+routes = [{ path = "/mcp", upstream = "127.0.0.1:8081" }]
+
+[[server]]
+domain = "inline.example.com"
+upstream = "127.0.0.1:9000"
+routes = [{ path = "/api", upstream = "127.0.0.1:9001" }]
+"#,
+        );
+        let cfg = Config::load(&path).unwrap();
+        assert_eq!(cfg.servers[0].routes.len(), 1);
+        assert_eq!(cfg.servers[0].routes[0].path, "/mcp");
+        assert_eq!(cfg.servers[1].routes.len(), 1);
+        assert_eq!(cfg.servers[1].routes[0].path, "/api");
         let _ = std::fs::remove_file(path);
     }
 }

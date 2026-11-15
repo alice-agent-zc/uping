@@ -1,4 +1,4 @@
-//! End-to-end checks for `[[server.route]]` and the `[server."domain"]` form.
+//! End-to-end checks for `routes = [...]` inside their server.
 //!
 //! Three throwaway HTTP backends on loopback and one TLS front: what is proven
 //! is the operator-visible behaviour — the catch-all, a prefix route, prefix
@@ -55,18 +55,20 @@ fn config(dir: &Path, http: u16, https: u16, backends: [u16; 3], static_root: &P
     let [catch_all, api, other_api] = backends;
     let cert = dir.join("route.local.crt");
     let key = dir.join("route.local.key");
-    // The map form names the domain in the table key, so a route nested below
-    // it cannot be mistaken for another domain's route.
+    // The routes array lives inside the server it belongs to, so it cannot be
+    // mistaken for another domain's route.
     format!(
         "[listen]\nipv4 = \"127.0.0.1\"\nhttp = {http}\nhttps = {https}\n\
          [tls]\nfallback_cert = true\n\
          [[server]]\ndomain = \"route.local\"\nkeys = \"manual\"\n\
          pub_key = \"{}\"\npriv_key = \"{}\"\nupstream = \"127.0.0.1:{catch_all}\"\n\
-         [[server.route]]\npath = \"/api\"\nupstream = \"127.0.0.1:{api}\"\nstrip_prefix = true\n\
-         [[server.route]]\npath = \"/assets\"\nroot = \"{}\"\nstrip_prefix = true\n\
+         routes = [\n\
+           {{ path = \"/api\", upstream = \"127.0.0.1:{api}\", strip_prefix = true }},\n\
+           {{ path = \"/assets\", root = \"{}\", strip_prefix = true }},\n\
+         ]\n\
          [[server]]\ndomain = \"other.local\"\nkeys = \"manual\"\n\
          pub_key = \"{}\"\npriv_key = \"{}\"\nupstream = \"127.0.0.1:{other_api}\"\n\
-         [[server.route]]\npath = \"/api\"\nupstream = \"127.0.0.1:{other_api}\"\n",
+         routes = [{{ path = \"/api\", upstream = \"127.0.0.1:{other_api}\" }}]\n",
         cert.display(),
         key.display(),
         static_root.display(),

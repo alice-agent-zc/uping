@@ -26,9 +26,10 @@ fn workspace() -> PathBuf {
         .join("target")
         .join(format!("static-e2e-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(dir.join("site/assets")).unwrap();
+    std::fs::create_dir_all(dir.join("site/assets/sub")).unwrap();
     std::fs::write(dir.join("site/index.html"), b"<h1>static home</h1>").unwrap();
     std::fs::write(dir.join("site/assets/app.css"), b"body { color: red }").unwrap();
+    std::fs::write(dir.join("site/assets/sub/index.html"), b"<h1>sub</h1>").unwrap();
     std::fs::write(dir.join("site/hello.txt"), b"hello").unwrap();
     std::fs::write(dir.join("site/empty.txt"), b"").unwrap();
     dir
@@ -144,7 +145,7 @@ fn static_files_are_served_with_mime_types_and_a_traversal_guard() {
              [tls]\nfallback_cert = true\n\
              [[server]]\ndomain = \"static.local\"\nkeys = \"manual\"\n\
              pub_key = \"{}\"\npriv_key = \"{}\"\nroot = \"{}\"\n\
-             [[server.route]]\npath = \"/files\"\nroot = \"{}\"\nstrip_prefix = true\n",
+             routes = [{{ path = \"/files\", root = \"{}\", strip_prefix = true }}]\n",
             cert.display(),
             key.display(),
             site.display(),
@@ -177,6 +178,23 @@ fn static_files_are_served_with_mime_types_and_a_traversal_guard() {
     let (status, text) = get(https, "/files/app.css", &[]);
     assert_eq!(status, "200", "{text}");
     assert!(text.contains("body { color: red }"), "{text}");
+
+    // A directory redirect must keep the route prefix, not the stripped path.
+    let (status, text) = get(https, "/files/sub", &[]);
+    assert_eq!(status, "301", "{text}");
+    assert!(
+        text.to_lowercase().contains("location: /files/sub/"),
+        "{text}"
+    );
+    let (status, text) = get(https, "/files/sub/", &[]);
+    assert_eq!(status, "200", "{text}");
+    assert!(text.contains("<h1>sub</h1>"), "{text}");
+    let (status, text) = get(https, "/files/sub?x=1", &[]);
+    assert_eq!(status, "301", "{text}");
+    assert!(
+        text.to_lowercase().contains("location: /files/sub/?x=1"),
+        "{text}"
+    );
 
     // A zero-byte file must still terminate the response.
     let (status, text) = get(https, "/empty.txt", &[]);

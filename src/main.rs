@@ -40,15 +40,6 @@ use crate::reload::{Allowed, Reloader};
 use crate::stream::StreamForwarder;
 use crate::tls::SniResolver;
 
-/// Build the `domain -> routes` table, lowercasing domains so that
-/// `EXAMPLE.com` and `example.com` hit the same upstream. Duplicate domains are
-/// refused at load time, so there is never a "last one wins" question.
-///
-/// Each server carries its own routes; there is no shared route table.
-fn build_routes(cfg: &Config) -> Result<RouteTable> {
-    RouteTable::from_config(cfg)
-}
-
 const USAGE: &str = "usage: uping [config.toml] [--check|--dry-run|--dns-zone]";
 
 /// A parsed command line: one optional config path and one flag.
@@ -100,17 +91,6 @@ fn parse_args(raw: impl Iterator<Item = String>) -> Result<Args> {
     })
 }
 
-/// `--check` and `--dns-zone` have no logger yet, so the deprecation goes to
-/// stderr; stdout stays machine-readable.
-fn warn_deprecated_map(cfg: &Config) {
-    if cfg.deprecated_server_map {
-        eprintln!(
-            "warning: the `[server.\"domain\"]` map form is deprecated; use `[[server]]` \
-             with `domain = \"...\"` instead"
-        );
-    }
-}
-
 /// Run [`check_config`] and exit: `0` with one line on stdout, `1` with the
 /// whole cause chain on stderr.
 fn run_check(path: &str) -> ! {
@@ -147,7 +127,6 @@ fn run_dns_zone(path: &str) -> ! {
 
 fn dns_zone(path: &str) -> Result<String> {
     let cfg = Config::load(path).with_context(|| format!("loading configuration from `{path}`"))?;
-    warn_deprecated_map(&cfg);
     let mut records: Vec<(String, std::net::IpAddr)> = Vec::new();
     for server in &cfg.servers {
         let (v4, v6) = server.binds(cfg.listen.https)?;
@@ -197,7 +176,6 @@ fn dns_zone(path: &str) -> Result<String> {
 /// config that killed the service on 2026-10-25.
 fn check_config(path: &str) -> Result<String> {
     let cfg = Config::load(path).with_context(|| format!("loading configuration from `{path}`"))?;
-    warn_deprecated_map(&cfg);
 
     // Same condition as `main`: an empty `[[server]]` list loads no TLS.
     // `from_config` parses every certificate that is already on disk and counts
@@ -212,7 +190,7 @@ fn check_config(path: &str) -> Result<String> {
             .len()
     };
 
-    let routes = build_routes(&cfg)?.route_count();
+    let routes = RouteTable::from_config(&cfg)?.route_count();
     Ok(format!(
         "ok: {} [[server]], {} [[stream]], {routes} route(s), {pending} certificate(s) to request · {path}",
         cfg.servers.len(),
@@ -234,15 +212,9 @@ fn main() -> Result<()> {
     let config_path = args.path;
     let cfg = Config::load(&config_path)
         .with_context(|| format!("loading configuration from `{config_path}`"))?;
-    if cfg.deprecated_server_map {
-        warn!(
-            "the `[server.\"domain\"]` map form is deprecated; use `[[server]]` with \
-             `domain = \"...\"` instead"
-        );
-    }
 
     // domain -> targets; the outer lock lets a reload swap the whole table.
-    let live_routes = Arc::new(RwLock::new(Arc::new(build_routes(&cfg)?)));
+    let live_routes = Arc::new(RwLock::new(Arc::new(RouteTable::from_config(&cfg)?)));
     info!(
         "{} path route(s) across {} domain(s)",
         live_routes
@@ -253,7 +225,7 @@ fn main() -> Result<()> {
     );
 
     // Resolve and probe every backend before the first request can reach it.
-    let health = HealthTracker::new(&cfg.health);
+    let health = HealthTracker::new();
     {
         let table = live_routes
             .read()
@@ -415,7 +387,7 @@ fn main() -> Result<()> {
             format!("static:{}", s.root.trim())
         };
         info!("  {} -> {destination}", s.domain);
-        for r in cfg.routes_for(s) {
+        for r in &s.routes {
             let destination = if !r.upstream.trim().is_empty() {
                 r.upstream.trim().to_string()
             } else {
@@ -485,7 +457,7 @@ fn is_privileged(addr: &std::net::SocketAddr) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::Server as ConfigServer;
+    use crate::config::{HealthOverride, Server as ConfigServer};
     use crate::proxy::Target;
 
     fn server(domain: &str, upstream: &str) -> ConfigServer {
@@ -494,7 +466,8 @@ mod tests {
             https_listen: String::new(),
             https_listen6: String::new(),
             serve_http: true,
-            health: true,
+            health: HealthOverride::default(),
+            limits: None,
             keys: None,
             pub_key: "certs/test.local.crt".to_string(),
             priv_key: "certs/test.local.key".to_string(),
@@ -518,7 +491,6 @@ mod tests {
             tls: Default::default(),
             health: Default::default(),
             acme: Default::default(),
-            deprecated_server_map: false,
             servers,
             streams: Vec::new(),
         }
@@ -585,7 +557,7 @@ mod tests {
             server("Test.Local", "127.0.0.1:8080"),
             server("API.Example.COM", "127.0.0.1:9000"),
         ];
-        let routes = build_routes(&config(servers)).unwrap();
+        let routes = RouteTable::from_config(&config(servers)).unwrap();
 
         assert_eq!(upstream(&routes, "test.local", "/"), "127.0.0.1:8080");
         assert_eq!(upstream(&routes, "api.example.com", "/"), "127.0.0.1:9000");
@@ -598,7 +570,7 @@ mod tests {
         s.routes = vec![crate::config::Route {
             path: "/assets/".to_string(),
             upstream: "127.0.0.1:8085".to_string(),
-            health: true,
+            health: HealthOverride::default(),
             upstream_tls: false,
             upstream_sni: String::new(),
             upstream_verify: true,
@@ -607,7 +579,7 @@ mod tests {
             index: "index.html".to_string(),
             strip_prefix: true,
         }];
-        let routes = build_routes(&config(vec![s])).unwrap();
+        let routes = RouteTable::from_config(&config(vec![s])).unwrap();
 
         assert_eq!(routes.route_count(), 1);
         let hit = routes.get("aaa.local").unwrap().resolve("/assets/app.css");

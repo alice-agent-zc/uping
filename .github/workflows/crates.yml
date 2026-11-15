@@ -1,13 +1,14 @@
 name: crates
 
-# Publishing is tag-driven, like the release workflow: a tag names the exact
+# Publishing is tag-driven, like the publish workflow: a tag names the exact
 # commit that becomes the crate, so the version on crates.io and the source on
 # GitHub can never drift apart.
 #
-# The repository must hold a `CARGO_REGISTRY_TOKEN` secret (a crates.io API
-# token scoped to `uping`). `cargo publish` packages the tracked tree and
-# compiles it once in a scratch directory, so a broken tag fails here instead of
-# publishing something that does not build.
+# The `publish` environment (or the repository) must hold a
+# `CARGO_REGISTRY_TOKEN` secret: a crates.io API token scoped to `uping`.
+# `cargo publish` packages the tracked tree and compiles it once in a scratch
+# directory, so a broken tag fails here instead of publishing something that
+# does not build.
 on:
   push:
     tags: ["v*"]
@@ -23,6 +24,9 @@ permissions:
 jobs:
   publish:
     runs-on: ubuntu-24.04
+    environment:
+      name: publish
+      url: https://crates.io/crates/uping
     steps:
       - uses: actions/checkout@v4
         with:

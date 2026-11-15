@@ -1,20 +1,18 @@
-# Contributing and reference
+# Contributing and architecture
 
-This is the detailed manual: build, test, every config field, certificate
-handling, IPv6, reload semantics and deployment. The [README](README.md) is the
-short overview.
+This is the developer manual. The user manual — every config field, defaults,
+examples, certificate modes, private sites and DNS — is the
+[README](README.md).
 
 ## Prerequisites
 
 uping is a single Rust binary. Building it needs:
 
 - A Rust toolchain — edition 2021, any reasonably recent stable.
-- A C toolchain (`cc` / `gcc` / `clang`) — the TLS and compression libraries it
-  links against are C.
+- A C toolchain (`cc` / `gcc` / `clang`) — TLS and compression are C libraries.
 - **CMake.** Pingora's HTTP stack pins `flate2` to the `zlib-ng` backend, and
-  `libz-ng-sys` builds that backend with CMake at compile time. Without `cmake`
-  on `PATH` the build stops several crates deep, with an error that never
-  mentions CMake.
+  `libz-ng-sys` builds that backend with CMake. Without `cmake` on `PATH` the
+  build stops several crates deep, with an error that never mentions CMake.
 - OpenSSL development headers (`libssl-dev` on Debian/Ubuntu).
 
 TLS is on the **OpenSSL** backend deliberately: dynamic per-SNI certificate
@@ -33,462 +31,135 @@ cargo clippy --all-targets -- -D warnings
 
 The suite needs no root, no network and no certificate checked into the tree:
 
-- config parsing, validation, listener groups, IPv4/IPv6, certificate modes;
-- host/path routing, the per-IP limiters, SNI resolution and fullchain chains;
-- static-file traversal and symlink guards;
+- config parsing, validation, listener groups, IPv4/IPv6, certificate modes,
+  per-server limits/health, absolute paths;
+- host/path routing, prefix stripping, the per-domain limiters, SNI resolution
+  and fullchain chains;
+- static-file traversal and symlink guards, directory redirects with
+  `strip_prefix`;
 - `--check` against a corpus of bad configs (`tests/config_check.rs`);
 - a throwaway ACME **CA over TLS** (`tests/acme_e2e.rs`) that drives a real
   first start: account, http-01 publication/fetch, finalization, written pair;
-- a route end-to-end test (`tests/route_e2e.rs`): two domains, one route each;
+- a route end-to-end test (`tests/route_e2e.rs`): two domains, routes in
+  `routes = [...]`;
 - a per-server listener test (`tests/listen_e2e.rs`): its own socket answers,
   the global one returns `421`;
-- health checks (`tests/health_e2e.rs`): a backend dies -> `503`, comes back ->
+- health checks (`tests/health_e2e.rs`): a backend dies → `503`, comes back →
   `200`, and a TCP-only listener is not a healthy TLS upstream;
 - upstream TLS (`tests/upstream_tls_e2e.rs`): private CA, verify opt-out, and a
   wrong SNI failing the handshake;
-- a private site (`tests/private_http_e2e.rs`): `serve_http = false` is `404` on :80
-  and still works on :443;
+- a private site (`tests/private_http_e2e.rs`): `serve_http = false` is `404` on
+  :80 and still works on :443;
 - `--dns-zone` (`tests/dns_zone_e2e.rs`): records, a wildcard refusal, and the
   `--check` conflict;
 - a SIGHUP reload test (`tests/reload_e2e.rs`): new root, invalid TOML, listener
   change;
 - end-to-end static serving and raw TCP forwarding.
 
-## Configuration
+## Architecture
 
-`config.toml` in the current directory is the default; pass another path as the
-first argument. Every relative path — manual key files, static roots,
-`cert_dir` — is resolved from the directory that holds the config file, not from
-the current directory.
+`src/` is deliberately small and split by responsibility:
 
-```toml
-# Optional. One address per family, one port per protocol.
-[listen]
-ipv4  = "0.0.0.0"        # default; any IPv4 address
-# ipv6 = "2607:f1c0:f031:4500::1"   # omit for no IPv6
-http  = 80               # default
-https = 443              # default
-
-# Optional. Used by keys = "auto".
-[acme]
-email             = "ops@example.com"   # optional, but you lose expiry warnings
-staging           = false
-cert_dir          = "cert"              # <config dir>/cert/<domain>/
-renew_before_days = 30                  # clamped to 1..=89
-directory         = ""                  # custom ACME directory URL
-ca_bundle         = ""                  # PEM root for a private ACME CA
-
-# Optional. Any limit set to 0 is off.
-[limits]
-per_ip_rps           = 300
-per_ip_conns_per_sec = 100
-max_body_bytes       = 10485760
-
-# Optional.
-[tls]
-fallback_cert = true
-
-# Optional. Upstream liveness. interval_ms = 0 disables the active probe.
-[health]
-interval_ms = 5000
-timeout_ms  = 2000
-failures    = 2
-
-# Array form: the domain is a field.
-[[server]]
-domain   = "www.example.com"
-keys     = "auto"                 # default when no key paths are given
-upstream = "127.0.0.1:8080"
-
-# Optional. This domain gets its own HTTPS listener instead of the global one.
-# The port defaults to `[listen] https`; both families are independent.
-https_listen  = "203.0.113.10"
-https_listen6 = "[2001:db8::10]:8443"
-
-# Optional. For an HTTPS backend instead of the plain-HTTP one above:
-# upstream      = "10.0.0.5:8443"
-# upstream_tls  = true
-# upstream_sni  = "app.internal"
-# upstream_ca   = "certs/internal-ca.pem"
-# upstream_verify = false            # accepts any certificate: private nets only
-
-[[server]]
-domain = "static.example.com"
-root   = "public"                 # instead of upstream
-index  = "index.html"             # the default
-
-# A private site: only on the WireGuard address, and no public HTTP vhost.
-# `keys = "manual"` is required because http-01 cannot run with `serve_http = false`;
-# the certificate comes from an internal CA (step-ca) whose root the clients trust.
-#
-# [[server]]
-# domain   = "app.vpn.example"
-# keys     = "manual"
-# pub_key  = "cert/app.vpn.example/fullchain.pem"
-# priv_key = "cert/app.vpn.example/privkey.pem"
-# upstream = "127.0.0.1:8080"
-# https_listen = "10.8.0.1"     # the wg0 address
-# serve_http = false        # no :80 redirect, no ACME challenge
-
-# Map form: the table key is the domain. Routes nested below it belong to it.
-[server."mcp.example.com"]
-upstream = "127.0.0.1:9000"
-
-[[server."mcp.example.com".route]]
-path     = "/api"
-upstream = "127.0.0.1:8081"
-strip_prefix = false
-
-[[server."mcp.example.com".route]]
-path         = "/assets"
-root         = "public/assets"
-strip_prefix = true
+```
+src/
+  main.rs          # CLI, bootstrap, wiring, --check, --dns-zone
+  config.rs        # TOML schema, validation, listener groups, paths
+  reload.rs        # SIGHUP -> swap routes/certs/limits/domains
+  tls.rs           # SNI resolver; renewals replace entries live
+  acme.rs          # account, http-01 orders, storage, renewal thread
+  static_files.rs  # safe path resolution + streamed files
+  health.rs        # upstream probes, 503 when a backend is down
+  limits.rs        # per-IP, per-domain rate + connection limiters
+  proxy.rs         # HTTPS proxy, HTTP redirect + ACME challenge path
+  stream.rs        # experimental raw TCP forwarder
+tests/
+  config_check.rs  # bad-config corpus and --check
+  acme_e2e.rs      # fake ACME CA over TLS, real first start
+  route_e2e.rs     # routes inside their server
+  listen_e2e.rs    # a per-server listener and its 421 isolation
+  health_e2e.rs    # backend down -> 503, recovered -> 200
+  upstream_tls_e2e.rs  # private CA, verify opt-out, wrong-SNI failure
+  private_http_e2e.rs  # serve_http = false on :80, HTTPS still served
+  dns_zone_e2e.rs      # --dns-zone records and refusals
+  reload_e2e.rs    # SIGHUP, bad config, listener warning
+  static_e2e.rs    # static serving through the real binary
+  stream_e2e.rs    # raw TCP through the real binary
+uping.service      # user unit
 ```
 
-`[[server]]` is the canonical form. The `[server."..."]` map form is
-**deprecated**: it still loads (with a warning) so existing configs keep
-working, but new configs should use the array form with `domain = "..."` and
-`[[server.route]]` nested under it.
+### Config
 
-A `domain` field is optional in the map form; if present it must equal the table
-key. Two servers may not share a domain — the loader refuses the duplicate
-instead of silently keeping one.
+`config.rs` is the schema and the whole validation pass. The invariants that
+matter to a contributor:
 
-A server and a route each need **exactly one** of `upstream` or `root`.
-Unknown fields are refused, so a typo cannot silently become a default.
+- `[[server]]` is the only server form; `[server."domain"]` is refused with a
+  clear error instead of being silently normalized.
+- Routes are **only** the inline `routes = [...]` array inside their server.
+  There is no global route table: a route cannot drift to another domain.
+- Every path is resolved against the config file's directory unless it is
+  absolute. `index` is a bare file name, not a path.
+- A server and a route need exactly one of `upstream` / `root`.
+- `keys` is inferred when omitted: no key paths → `auto`; both → `manual`.
+  `auto` and `internal` are the only ACME modes and require `serve_http = true`.
+- `per_ip_conns_per_sec` is host-wide; a per-server value is an error. The
+  request rate and body cap are per server.
+- Unknown fields are refused, so a typo cannot silently become a default.
 
-### Listeners and IPv6
+All defaults and examples are in the [README](README.md); do not duplicate that
+table here.
 
-`[listen]` is the host-wide default. Each family gets **one** address, and each
-protocol **one** port — there is no wildcard syntax and no address list:
+### TLS
 
-```toml
-[listen]
-ipv4  = "203.0.113.10"
-ipv6  = "2607:f1c0:f031:4500::1"
-http  = 80
-https = 443
-```
+Pingora 0.9 dropped `TlsSettings::add_cert`, so a multi-domain listener picks
+its certificate during the handshake through the `TlsAccept` callback. The
+resolver starts with no certificate installed; the callback supplies the leaf,
+chain and key. `fallback_cert` exists because scanners connect without SNI: it
+is a listener-wide choice made before a domain exists, not a per-server field.
 
-`ipv6` is written bare (no brackets, no port); empty means "do not listen on
-IPv6". An address the host does not own fails at bind time with
-`Cannot assign requested address` — uping cannot infer which IPv6 address you
-meant from an IPv4 one.
+### ACME
 
-A `[[server]]` may override its **HTTPS** listener with `https_listen` /
-`https_listen6`:
+`CertManager` owns the certificate files, the account and the renewal thread.
+An order is http-01 only: create/load an account, order, publish the token
+through the challenge store, wait for the CA, write the pair atomically, then
+install it into the live resolver. The startup path binds the HTTP address
+itself (`obtain_missing`); a reload uses the already-running listener
+(`obtain_missing_live`).
 
-```toml
-[[server]]
-domain   = "www.example.com"
-upstream = "127.0.0.1:8080"
-https_listen  = "203.0.113.10"          # IPv4, default port = [listen] https
-https_listen6 = "[2001:db8::10]:8443"   # IPv6 with an explicit port
-```
-
-- The port is optional; when omitted it is `[listen] https`.
-- An IPv6 address with an explicit port **must** be bracketed —
-  `2001:db8::10:8443` is itself a valid IPv6 address, so the port would be
-  swallowed into it.
-- Overriding one family does not imply the other: `listen` alone means IPv4
-  only, `https_listen6` alone means IPv6 only, both means both.
-- Each distinct combination is its own HTTPS listener and its own DNS entry
-  point. A domain is only answered on its own sockets; a request for it on the
-  global listener gets `421 Misdirected Request`.
-- HTTP is not per-server: it stays on `[listen] ipv4/ipv6` port 80, because that
-  is where the ACME http-01 challenge answers and where the redirect lives.
-  A site that must not exist publicly sets `serve_http = false` (see
-  [Private sites](#private-sites-and-dns) below).
-
-An overlap (e.g. a server overriding to `0.0.0.0:443` while the global listener
-already binds it) is refused when the config loads, with both sides named.
-
-### Certificate modes
-
-| `keys` | Meaning |
-|---|---|
-| omitted, no `pub_key`/`priv_key` | **`auto`** — obtain and renew through ACME |
-| omitted, both key paths given | **`manual`** — read the two PEM files |
-| `"auto"` | ACME; `pub_key`/`priv_key` optionally override *where* the pair is written |
-| `"manual"` | Both PEM paths are required; uping never writes them |
-
-Manual pairs are read at startup and on reload; restart after replacing a manual
-file. An `auto` renewal is installed into the live resolver immediately.
-
-### Let's Encrypt / ACME
-
-`keys = "auto"` uses the **http-01** challenge, so the configured HTTP listener
-must be reachable from the internet on port 80.
-
-- First start, certificate missing: uping binds the HTTP address itself for the
-  length of the order, answers the token, then releases the port before Pingora
-  starts. Nothing else may hold `:80` during that moment.
-- Afterwards the ordinary HTTP listener answers
-  `/.well-known/acme-challenge/<token>` and redirects everything else.
-- Files: `{config dir}/cert/<domain>/fullchain.pem` and `privkey.pem` (key
-  `0600`), atomically replaced. The account is
-  `cert/acme-account-<hash>.json`, hashed by directory URL so production and
-  staging do not collide.
-- Renewal is checked hourly; a pair inside `renew_before_days` is reissued and
-  swapped into the live SNI resolver. No restart, no dropped connection.
-- `staging = true` uses Let's Encrypt staging. `directory` points at another
-  ACME server; `ca_bundle` adds its PEM root (step-ca, an internal CA, or the
-  test CA). Creating an account means accepting that CA's terms.
-- Adding an `auto` domain in a reload requests its certificate in the
-  background through the already-running HTTP listener.
-
-Use `uping --check config.toml` first: it parses the whole load path, writes
-nothing, contacts no CA, and reports how many certificates a start would
-request. Do not point `auto` at a name that does not resolve to the host.
-
-### Static files
-
-`root` replaces `upstream`; both is an error. Requests are resolved under the
-canonical root, so `..`, `%2e%2e` and a symlink pointing outside are refused. A
-directory without its trailing slash gets `301`; `index` is served for a
-directory. A missing file is `404` and never falls through to a proxy.
-
-`GET` and `HEAD` are served; other methods get `405`. Bodies are streamed in
-64 KiB chunks with `Content-Type` from the extension and
-`X-Content-Type-Options: nosniff`. A zero-byte file terminates cleanly.
-
-### Path routing
-
-A route belongs to exactly one server. It is nested under that server — either
-in the array form (`[[server.route]]`) or under the domain key in the map form
-(`[[server."example.com".route]]`). There is no shared/global route table.
-
-`[[server.route]]` serves one prefix of that domain; the server's own
-`upstream`/`root` stays the catch-all.
-
-- The longest matching prefix wins; prefixes match whole segments (`/mcp` covers
-  `/mcp` and `/mcp/sse`, not `/mcpx`).
-- `strip_prefix = true` removes the prefix before forwarding/resolving, keeping
-  the query string.
-- `path = "/"` is rejected: use the server's catch-all.
-
-### Upstream TLS
-
-By default uping talks plain HTTP to the backend. Set `upstream_tls = true` to
-speak HTTPS instead:
-
-```toml
-[[server]]
-domain       = "www.example.com"
-upstream     = "10.0.0.5:8443"
-upstream_tls = true
-upstream_sni = "app.internal"          # optional
-upstream_ca  = "certs/internal-ca.pem" # optional, replaces the system roots
-# upstream_verify = false              # accepts any certificate: private nets only
-```
-
-- `upstream_sni` is the SNI sent to the backend and the name verified. When it
-  is empty, a DNS upstream host is used; for an IP literal the server's own
-  `domain` is used (a loopback backend usually serves the public certificate).
-- `upstream_ca` is a PEM bundle of roots; it replaces the system store rather
-  than adding to it, so a private CA cannot be silently bypassed by a public one.
-- `upstream_verify = false` disables both certificate and hostname verification.
-  It is for backends on a trusted network with self-signed certificates; never
-  use it with a backend reached over the public internet.
-- The settings are per server and per `[[server.route]]`: a route can forward to
-  a TLS backend while the catch-all stays plain HTTP.
-
-### Health checks
-
-uping probes every distinct backend: a TCP connect, plus a TLS handshake when
-`upstream_tls` is on. A backend is marked down after `failures` consecutive
-failed probes and up on the first success. A down backend is answered with
-`503 Service Unavailable` immediately, instead of making the client wait for a
-connect timeout.
-
-```toml
-[health]
-interval_ms = 5000   # 0 disables the active probe
-timeout_ms  = 2000
-failures    = 2
-```
-
-- The probe runs in one background thread and follows reloads: adding a domain
-  or changing an upstream is picked up on the next pass, and the reload itself
-  probes the new table before it becomes live.
-- With `interval_ms = 0`, no active probe runs; the address is still resolved at
-  startup and on reload (and refreshed every minute), and an unresolvable
-  upstream is still refused with `503`.
-- `health = false` on a server or `[[server.route]]` opts that backend out: the
-  address is still resolved (so a DNS name is refreshed) but the probe never
-  answers `503` for it. Useful for a backend that is slow to accept but must be
-  attempted anyway.
-- Only liveness is checked; there is no per-path HTTP health endpoint and no
-  load balancing. One upstream per server/route, by design.
-
-`0` is always an explicit choice, never a default: in `[health]`,
-`interval_ms = 0` disables the active probe; in `[limits]`, any limit set to `0`
-is disabled (or, for `max_body_bytes`, unlimited). Out-of-range values are a
-config error, not silently clamped.
+Two profiles exist: the public `[acme]` directory and the private
+`[acme.internal]` directory. The account file is hashed by directory URL, so
+public and private CAs never share one. `ca_bundle` is the trust anchor for
+uping's connection to the ACME server; client trust is separate and is the
+operator's responsibility.
 
 ### Limits
 
-| Setting | Where | Over budget |
-|---|---|---|
-| `per_ip_conns_per_sec` | TCP accept, pre-TLS | connection dropped |
-| `per_ip_rps` | after HTTP parse | `429 Too Many Requests` |
-| `max_body_bytes` | `Content-Length` + streamed body | `413 Payload Too Large` |
+`RequestLimiter` keeps one fixed-size estimator table per domain (bounded by
+the config, not by client traffic) and shares the counters across reloads.
+`ConnLimiter` runs at TCP accept and is host-wide. `max_body_bytes` is checked
+on `Content-Length` and again while streaming a chunked body; the effective
+value is carried in `ProxyCtx`.
 
-Both rate limiters use a fixed-size estimator table, so many source IPs cannot
-grow memory without bound. Windows are one second and fixed: a client straddling
-a boundary can briefly reach twice its budget. A reload changes the budget but
-keeps the counters.
+### Health
 
-### Headers
+One background thread reads the live route table, checks each upstream against
+its own interval, and probes only what is due. The reload path primes the new
+table synchronously, so the first request after a reload never sees an
+unresolved address. A down backend is answered with a static `503` page and
+`Retry-After`, with no host or upstream echoed back.
 
-Client headers are forwarded unchanged except hop-by-hop fields (RFC 9110,
-including `Connection`-nominated fields); nominating `Host` or an
-`X-Forwarded-*` field is rejected. The original `Host` is preserved. uping adds
-`X-Forwarded-For` (appended to an existing chain), `X-Forwarded-Proto: https`
-and `X-Forwarded-Host`. Response headers and body framing are streamed back
-unchanged.
+### Reload
 
-### Raw TCP forwarding — experimental
+`Reloader` re-reads the same file and validates the whole candidate before
+touching live state. Routes, limits, health, `[tls] fallback_cert`, manual
+certificates and listener domain sets are applied live. `[listen]`,
+`https_listen`/`https_listen6`, `[[stream]]`, `[acme]` and `[acme.internal]`
+require a restart and are reported as such.
 
-`[[stream]]` binds a port and copies bytes to one upstream — SMTP, IMAP, MySQL,
-anything not HTTP. It is **experimental**: config and behaviour may change.
+### Streams
 
-```toml
-[[stream]]
-name     = "smtp"
-listen   = "0.0.0.0:25"
-upstream = "127.0.0.1:10025"
-connect_timeout_ms = 5000
-```
-
-One listener per entry; duplicate sockets are a config error. Half-close is
-forwarded so the upstream can drain. There is no idle timeout (IMAP IDLE needs
-long silence) and no TLS termination — terminate it in the upstream.
-
-## Private sites and DNS
-
-A VPS that also runs WireGuard can host services that exist only inside the
-tunnel. Two settings make that explicit:
-
-```toml
-[[server]]
-domain   = "app.vpn.example"
-keys     = "manual"
-pub_key  = "cert/app.vpn.example/fullchain.pem"
-priv_key = "cert/app.vpn.example/privkey.pem"
-upstream = "127.0.0.1:8080"
-https_listen = "10.8.0.1"   # the wg0 address only
-serve_http   = false        # no :80 redirect, no ACME challenge
-```
-
-- `https_listen` (and `https_listen6`) bind the site to the VPN interface; the public
-  listeners never see it.
-- `serve_http = false` removes the domain from port 80 entirely: a request for it on
-  :80 is `404`, not a redirect, so the name is not advertised.
-- `keys = "auto"` is refused with `serve_http = false`: the http-01 challenge needs
-  port 80. Use `keys = "manual"` with a certificate from an internal CA
-  (step-ca, `mkcert` for a lab) whose root is installed on the clients. Let's
-  Encrypt's DNS-01 is not implemented yet.
-- `uping.service` must start after `wg-quick@wg0`, otherwise the address does
-  not exist at bind time. Firewall the port on `wg0` only.
-
-### `uping --dns-zone`
-
-uping does **not** serve DNS. The WireGuard-side resolver owns that: a resolver
-coupled to the proxy would have its own attack surface (UDP/TCP 53,
-amplification) and would stop answering whenever uping restarts.
-
-Instead, `uping --dns-zone` renders the records its config already knows, in
-`hosts(5)` format — one line per configured domain and family:
-
-```sh
-$ uping --dns-zone config.toml
-# uping --dns-zone: one record per configured domain and family.
-# Load with dnsmasq `addn-hosts=`, CoreDNS `hosts`, or /etc/hosts.
-10.8.0.1 app.vpn.example
-203.0.113.10 www.example.com
-2001:db8::1 www.example.com
-```
-
-The address comes from the site's `https_listen`/`https_listen6`, or from `[listen] ipv4` /
-`ipv6` when it has no override. A wildcard address (`0.0.0.0`, `::`) is refused:
-a DNS record must name a real address. That is the whole point — the config is
-the single source of truth, and the resolver loads its output:
-
-```sh
-uping --dns-zone config.toml > /etc/dnsmasq.d/uping.hosts
-# dnsmasq.conf: addn-hosts=/etc/dnsmasq.d/uping.hosts
-#                local=/vpn.example/
-#                interface=wg0
-#                bind-interfaces
-```
-
-On the client, `DNS = 10.8.0.1` in the WireGuard config. Public names keep
-resolving through the forwarder; `vpn.example` only exists in the tunnel.
-
-## Reloading
-
-`systemctl --user reload uping` sends `SIGHUP`; uping re-reads the same config
-and validates the whole path first.
-
-Applied live:
-
-- `[[server]]`, `[[server.route]]`, upstreams, static roots, indexes;
-- `[limits]` budgets (counters are kept);
-- `[tls] fallback_cert`;
-- manual certificates already on disk, and existing `auto` ones;
-- which domains each already-bound HTTPS listener may answer;
-- which domains answer on port 80 (`serve_http = false` is applied live);
-- the health probe follows the new route table automatically;
-- a newly added `auto` domain is requested in the background through the
-  running HTTP listener.
-
-Requires a restart, reported as such in the log while the rest is applied:
-
-- `[listen]`, `https_listen`/`https_listen6` (adding, removing or moving a socket) and
-  `[[stream]]` — Pingora's listeners/forwarders are fixed;
-- `[acme]` (email, staging, directory, `cert_dir`, renewal window) — the renewal
-  thread owns them; mixing old and new would split where certificates are read
-  and written.
-
-A config that fails to load is logged (`reload failed, keeping the running
-configuration`) and changes nothing. A reload never replaces the process; check
-the PID stays the same.
-
-Manual alternative:
-
-```sh
-kill -HUP "$(pgrep -u "$USER" -x uping)"
-```
-
-## Running it as a service
-
-uping runs as an ordinary user. The only privileged thing is binding ports below
-1024, one file capability — `CAP_NET_BIND_SERVICE` — not root.
-
-```sh
-cargo build --release
-sudo setcap 'cap_net_bind_service=+ep' target/release/uping
-mkdir -p ~/.config/systemd/user
-cp uping.service ~/.config/systemd/user/
-systemctl --user daemon-reload
-systemctl --user enable --now uping
-loginctl enable-linger "$USER"        # start at boot, not only at login
-```
-
-`uping.service` assumes a source checkout at `~/uping` and
-`~/uping/config.toml`; edit `WorkingDirectory`/`ExecStart` if yours differs.
-Certificates and the ACME account live under `~/uping/cert/`, so no root-owned
-directory is involved. The capability is on the binary and is **lost on every
-rebuild**; re-apply `setcap` after `cargo build --release`.
-
-The old installer and certbot hook were removed in v0.2.1: ACME renews
-in-process. For `manual`, point `pub_key`/`priv_key` at any readable pair; a
-certbot copy under the same tree is fine, but uping reloads it only on reload or
-restart.
-
-The planned apt layout — `/etc/uping/config.toml`, `/bin/uping`,
-`/etc/uping/cert` — is for the future crates.io/apt release.
+`[[stream]]` is a Pingora `ServerApp` listener that copies bytes both ways and
+forwards half-close. It is experimental: keep that label in config, docs and
+error messages.
 
 ## Running it locally
 
@@ -519,38 +190,61 @@ curl -i  --resolve test.local:8088:127.0.0.1 http://test.local:8088/   # 301
 `-k` for the self-signed cert, `--resolve` because `test.local` is not in DNS
 (the handshake needs an SNI hostname).
 
-## Project layout
+## Deployment
 
+`uping.service` assumes a source checkout at `~/uping` and
+`~/uping/config.toml`; edit `WorkingDirectory`/`ExecStart` if yours differs.
+Certificates and the ACME account live under `~/uping/cert/`, so no root-owned
+directory is involved.
+
+```sh
+cargo build --release
+sudo setcap 'cap_net_bind_service=+ep' target/release/uping
+mkdir -p ~/.config/systemd/user
+cp uping.service ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable --now uping
+loginctl enable-linger "$USER"
 ```
-src/
-  main.rs          # bootstrap, wiring, run, --check
-  config.rs        # TOML schema, server forms, listener groups, validation
-  reload.rs        # SIGHUP -> swap routes/certs/limits/domain sets
-  tls.rs           # SNI resolver; renewals replace entries live
-  acme.rs          # account, http-01 orders, storage, renewal thread
-  static_files.rs  # safe path resolution + streamed files
-  health.rs        # upstream probes, 503 when a backend is down
-  limits.rs        # per-IP rate + connection limiters
-  proxy.rs         # HTTPS proxy, HTTP redirect + ACME challenge path
-  stream.rs        # experimental raw TCP forwarder
-tests/
-  config_check.rs  # bad-config corpus and --check
-  acme_e2e.rs      # fake ACME CA over TLS, real first start
-  route_e2e.rs     # one route per domain
-  listen_e2e.rs    # a per-server listener and its 421 isolation
-  health_e2e.rs    # backend down -> 503, recovered -> 200
-  upstream_tls_e2e.rs  # private CA, verify opt-out, wrong-SNI failure
-  private_http_e2e.rs  # serve_http = false on :80, HTTPS still served
-  dns_zone_e2e.rs      # --dns-zone records and refusals
-  reload_e2e.rs    # SIGHUP, bad config, listener warning
-  static_e2e.rs    # static serving through the real binary
-  stream_e2e.rs    # raw TCP through the real binary
-uping.service      # user unit
+
+The capability is on the binary and is **lost on every rebuild**; re-apply
+`setcap` after `cargo build --release`.
+
+The planned apt layout — `/etc/uping/config.toml`, `/bin/uping`,
+`/etc/uping/cert` — is for the future apt release.
+
+## Release
+
+Publishing is tag-driven. A tag names the exact commit that becomes the
+release, so the asset and the crate cannot drift from the source:
+
+```sh
+git tag v0.3.0
+git push origin v0.3.0
 ```
+
+Two workflows run on `v*` tags:
+
+- `.github/workflows/publish.yml` — builds the Linux binary, runs the tests,
+  packages `uping-<target>.tar.gz` + `.sha256`, and creates/updates the GitHub
+  release. It uses the built-in `GITHUB_TOKEN`; `permissions: contents: write`
+  is already set, so there is no secret to add.
+- `.github/workflows/crates.yml` — publishes the crate to crates.io. It needs
+  **`CARGO_REGISTRY_TOKEN`**, holding a crates.io API token scoped to `uping`.
+  Put it in the GitHub Environment named **`publish`** (Settings →
+  Environments → publish → Environment secrets), or as a repository secret;
+  both jobs run in that environment, so you can add required reviewers there
+  before anything is published. `cargo publish` compiles the tagged tree in a
+  scratch directory, so a broken tag fails there instead of publishing
+  something that does not build.
+
+Both workflows also expose a `workflow_dispatch` input named `tag` to rebuild
+an existing tag. The tag must match `Cargo.toml`'s version.
 
 ## Before you open a pull request
 
 - `cargo fmt --all -- --check`, `cargo clippy --all-targets -- -D warnings` and
   `cargo test` are clean.
 - New behaviour comes with a test; keep the diff scoped.
-- Anything touching `[[stream]]` must keep it labelled experimental.
+- Config changes update the README (defaults and examples) and `config.toml`.
+- Anything touching `[[stream]]` keeps it labelled experimental.

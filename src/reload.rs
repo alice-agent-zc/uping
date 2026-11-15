@@ -4,7 +4,7 @@
 //! file, validate the whole load path, and swap the pieces that can change
 //! without rebinding a socket:
 //!
-//! * domains, upstreams, static roots, indexes, `[[server.route]]`
+//! * domains, upstreams, static roots, indexes, `routes = [...]`
 //! * request rate, connection rate and body-size limits (counters are kept)
 //! * `[tls] fallback_cert`
 //! * manual certificates and existing `auto` ones (a new `auto` domain is
@@ -29,7 +29,7 @@ use signal_hook::consts::SIGHUP;
 use signal_hook::iterator::Signals;
 
 use crate::acme::CertManager;
-use crate::config::{Config, GroupKey, KeyMode};
+use crate::config::{Config, GroupKey};
 use crate::health::HealthTracker;
 use crate::limits::{ConnLimiter, RequestLimiter};
 use crate::proxy::RouteTable;
@@ -178,12 +178,6 @@ impl Reloader {
     fn try_reload(&self) -> Result<()> {
         let new = Config::load(&self.path)
             .with_context(|| format!("reading `{}`", self.path.display()))?;
-        if new.deprecated_server_map {
-            warn!(
-                "the `[server.\"domain\"]` map form is deprecated; use `[[server]]` with \
-                 `domain = \"...\"` instead"
-            );
-        }
         let next = Pinned::of(&new)?;
         let running = self.pinned.clone();
 
@@ -305,7 +299,7 @@ impl Reloader {
             new.limits.per_ip_conns_per_sec,
             new.limits.per_ip_rps
         );
-        if new.servers.iter().any(|s| s.key_mode() == KeyMode::Auto) && pending_count == 0 {
+        if new.servers.iter().any(|s| s.key_mode().is_acme()) && pending_count == 0 {
             info!("reload: all auto certificates are present on disk");
         }
         Ok(())

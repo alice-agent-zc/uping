@@ -117,12 +117,15 @@ pub async fn serve(
 
     if canonical.is_dir() {
         if !wants_dir {
+            // Redirect to the *original* path: with `strip_prefix`, `raw` is
+            // the upstream path (`/sub`), but the client still lives under the
+            // route prefix (`/files/sub`). The slash comes before the query.
+            let location = format!("{path}/");
             let location = match query {
-                Some(query) => format!("{raw}?{query}"),
-                None => raw.to_string(),
+                Some(query) => format!("{location}?{query}"),
+                None => location,
             };
-            let location = format!("{location}/");
-            debug!("static: redirecting `{raw}` to `{location}`");
+            debug!("static: redirecting `{path}` to `{location}`");
             let mut resp = ResponseHeader::build(301, Some(1))?;
             resp.insert_header("Location", location)?;
             session.write_response_header(Box::new(resp), true).await?;

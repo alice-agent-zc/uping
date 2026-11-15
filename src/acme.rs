@@ -33,7 +33,7 @@ use log::{debug, error, info, warn};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
-use crate::config::{Acme as AcmeConfig, Config, KeyMode, Server};
+use crate::config::{Acme as AcmeConfig, AcmeProfile, Config, Server};
 use crate::tls::SniResolver;
 
 /// Challenge tokens currently expected, token -> key authorization.
@@ -142,10 +142,16 @@ impl CertManager {
             let mut first_error: Option<anyhow::Error> = None;
 
             for s in pending {
+                let profile = match self.acme.profile(s.key_mode()) {
+                    Ok(profile) => profile,
+                    Err(e) => {
+                        error!("acme: {}: {e:#}", s.domain);
+                        continue;
+                    }
+                };
                 info!(
                     "acme: requesting a certificate for {} ({})",
-                    s.domain,
-                    self.acme.directory_url()
+                    s.domain, profile.directory
                 );
                 if let Err(e) = self.issue(s).await {
                     error!("acme: {} failed: {e:#}", s.domain);
@@ -184,10 +190,16 @@ impl CertManager {
 
         runtime.block_on(async {
             for s in pending {
+                let profile = match self.acme.profile(s.key_mode()) {
+                    Ok(profile) => profile,
+                    Err(e) => {
+                        error!("acme: {}: {e:#}", s.domain);
+                        continue;
+                    }
+                };
                 info!(
                     "acme: requesting a certificate for {} ({})",
-                    s.domain,
-                    self.acme.directory_url()
+                    s.domain, profile.directory
                 );
                 if let Err(e) = self.issue(s).await {
                     error!("acme: {} failed: {e:#}", s.domain);
@@ -236,7 +248,7 @@ impl CertManager {
 
     async fn renew_due(&self, servers: &[Server]) {
         for s in servers {
-            if s.key_mode() != KeyMode::Auto {
+            if !s.key_mode().is_acme() {
                 continue;
             }
             let (cert_path, key_path) = self.key_paths(s);
@@ -294,6 +306,7 @@ impl CertManager {
     /// Run one order end to end and install the result.
     async fn issue(&self, server: &Server) -> Result<()> {
         let _guard = self.issue_lock.lock().await;
+        let profile = self.acme.profile(server.key_mode())?;
         let domain = server.domain.trim().to_ascii_lowercase();
 
         // Another thread may have issued this pair while we waited for the
@@ -322,7 +335,7 @@ impl CertManager {
             }
         }
 
-        let account = self.account().await?;
+        let account = self.account(&profile).await?;
         let identifiers = [Identifier::Dns(domain.clone())];
         let mut order = account
             .new_order(&NewOrder::new(&identifiers))
@@ -405,7 +418,7 @@ impl CertManager {
     }
 
     /// Load the stored account for this directory, or create one.
-    async fn account(&self) -> Result<Account> {
+    async fn account(&self, profile: &AcmeProfile) -> Result<Account> {
         let dir = &self.cert_dir;
         tokio::fs::create_dir_all(dir)
             .await
@@ -413,7 +426,7 @@ impl CertManager {
 
         let path = dir.join(format!(
             "acme-account-{:016x}.json",
-            stable_hash(self.acme.directory_url())
+            stable_hash(&profile.directory)
         ));
 
         if path.is_file() {
@@ -423,7 +436,7 @@ impl CertManager {
             let credentials: AccountCredentials = serde_json::from_slice(&raw)
                 .with_context(|| format!("parsing `{}`", path.display()))?;
             return self
-                .builder()?
+                .builder(profile)?
                 .from_credentials(credentials)
                 .await
                 .with_context(|| format!("restoring the ACME account from `{}`", path.display()));
@@ -432,14 +445,14 @@ impl CertManager {
         let contact = self.contact();
         let contact_refs: Vec<&str> = contact.iter().map(String::as_str).collect();
         let (account, credentials) = self
-            .builder()?
+            .builder(profile)?
             .create(
                 &NewAccount {
                     contact: &contact_refs,
                     terms_of_service_agreed: true,
                     only_return_existing: false,
                 },
-                self.acme.directory_url().to_string(),
+                profile.directory.clone(),
                 None,
             )
             .await
@@ -462,8 +475,8 @@ impl CertManager {
     }
 
     /// The account builder, trusting `ca_bundle` when one is configured.
-    fn builder(&self) -> Result<instant_acme::AccountBuilder> {
-        let bundle = self.acme.ca_bundle.trim();
+    fn builder(&self, profile: &AcmeProfile) -> Result<instant_acme::AccountBuilder> {
+        let bundle = profile.ca_bundle.trim();
         if bundle.is_empty() {
             return Account::builder().context("creating the ACME client");
         }

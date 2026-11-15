@@ -31,10 +31,12 @@ ipv6  = "2001:db8::1"
 http  = 80
 https = 443
 
-[server."public.example"]
+[[server]]
+domain   = "public.example"
 upstream = "127.0.0.1:8080"
 
-[server."private.example"]
+[[server]]
+domain   = "private.example"
 keys     = "manual"
 pub_key  = "p.crt"
 priv_key = "p.key"
