@@ -15,12 +15,14 @@ change.
 - ✅ Static files (`root`) and path routing, each route tied to its domain
 - ✅ One `[listen]` for the host, plus per-domain `listen` / `listen6`
 - ✅ HTTP → HTTPS redirect, per-IP request/connection limits, body cap
+- ✅ Upstream health checks (`503` at once when a backend dies) and HTTPS to
+  the backend, with a private CA, SNI and an explicit verify opt-out
 - ✅ Live config reload on `SIGHUP`
 - ⚠️ `[[stream]]` raw TCP forwarding is **experimental** — the mail/database
   relay. `server.route` is HTTP path routing, not the mail feature.
 
-Not here: hot-reload of listeners or `[[stream]]`, load balancing, health
-checks, upstream TLS. Those need a restart (or are future work).
+Not here: hot-reload of listeners or `[[stream]]`, load balancing, upstream
+mutual TLS. Those need a restart (or are future work).
 
 ## Quick start
 

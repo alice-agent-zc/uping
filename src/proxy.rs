@@ -1,6 +1,8 @@
 //! The two `ProxyHttp` implementations that make up uping.
 
 use std::collections::{HashMap, HashSet};
+use std::net::IpAddr;
+use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
 
@@ -9,11 +11,14 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use log::{debug, error, warn};
 use pingora::http::{RequestHeader, ResponseHeader};
+use pingora::protocols::tls::CaType;
 use pingora::proxy::{ProxyHttp, Session};
 use pingora::upstreams::peer::HttpPeer;
 use pingora::{Error, ErrorType, Result};
 
 use crate::acme::{ChallengeStore, CHALLENGE_PREFIX};
+use crate::config::UpstreamTls;
+use crate::health::HealthTracker;
 use crate::limits::RequestLimiter;
 use crate::static_files::{self, StaticSite};
 
@@ -114,25 +119,144 @@ fn rewrite_path_and_query(path: &str, query: Option<&str>, prefix: &str) -> Stri
     }
 }
 
+/// One HTTP backend. Shared behind an `Arc`, so a request clone is an atomic
+/// increment rather than a string copy.
+pub struct Upstream {
+    /// The configured `host:port`, as written.
+    pub address: Arc<str>,
+    /// Speak HTTPS to the backend.
+    pub tls: bool,
+    /// SNI sent in the upstream handshake (also the name verified).
+    pub sni: Arc<str>,
+    /// Verify the backend certificate.
+    pub verify: bool,
+    /// Roots for that verification; `None` uses the system store.
+    pub ca: Option<Arc<CaType>>,
+    /// Pre-built OpenSSL connector for the health probe. `None` means plain TCP.
+    pub probe: Option<Arc<openssl::ssl::SslConnector>>,
+    /// Identity used by the health registry (address + TLS settings).
+    key: Arc<str>,
+}
+
+impl std::fmt::Debug for Upstream {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Upstream")
+            .field("address", &self.address)
+            .field("tls", &self.tls)
+            .field("sni", &self.sni)
+            .field("verify", &self.verify)
+            .finish()
+    }
+}
+
+impl Upstream {
+    pub fn key(&self) -> &Arc<str> {
+        &self.key
+    }
+}
+
+/// The parts of a server/route that describe its backend.
+pub struct UpstreamSpec<'a> {
+    pub address: &'a str,
+    pub tls: UpstreamTls<'a>,
+    /// Used as the SNI when the backend is an IP literal and no `upstream_sni`
+    /// is written: a loopback backend usually serves the public certificate.
+    pub default_sni: &'a str,
+}
+
+impl Upstream {
+    fn from_config(spec: &UpstreamSpec<'_>, root_dir: &Path) -> anyhow::Result<Self> {
+        let address = spec.address.trim();
+        let tls = spec.tls;
+        let host = host_of(address);
+        let sni = if !tls.sni.trim().is_empty() {
+            tls.sni.trim().to_string()
+        } else if host.parse::<IpAddr>().is_ok() {
+            spec.default_sni.trim().to_string()
+        } else {
+            host.to_string()
+        };
+
+        let path = if tls.ca.trim().is_empty() {
+            None
+        } else if Path::new(tls.ca.trim()).is_absolute() {
+            Some(std::path::PathBuf::from(tls.ca.trim()))
+        } else {
+            Some(root_dir.join(tls.ca.trim()))
+        };
+
+        let ca = match &path {
+            None => None,
+            Some(path) => {
+                let pem = std::fs::read(path)
+                    .with_context(|| format!("reading `upstream_ca` `{}`", path.display()))?;
+                let certs = openssl::x509::X509::stack_from_pem(&pem)
+                    .with_context(|| format!("parsing `upstream_ca` `{}`", path.display()))?;
+                if certs.is_empty() {
+                    anyhow::bail!("`upstream_ca` `{}` holds no certificate", path.display());
+                }
+                Some(std::sync::Arc::new(certs.into_boxed_slice()))
+            }
+        };
+
+        let probe = if tls.tls {
+            let mut builder = openssl::ssl::SslConnector::builder(openssl::ssl::SslMethod::tls())
+                .context("building the upstream TLS probe")?;
+            if !tls.verify {
+                builder.set_verify(openssl::ssl::SslVerifyMode::NONE);
+            } else if let Some(path) = &path {
+                builder
+                    .set_ca_file(path)
+                    .with_context(|| format!("loading `upstream_ca` `{}`", path.display()))?;
+            }
+            Some(std::sync::Arc::new(builder.build()))
+        } else {
+            None
+        };
+
+        let key = format!("{address}|tls={}|sni={sni}|verify={}", tls.tls, tls.verify);
+        Ok(Self {
+            address: std::sync::Arc::from(address),
+            tls: tls.tls,
+            sni: std::sync::Arc::from(sni.as_str()),
+            verify: tls.verify,
+            ca,
+            probe,
+            key: std::sync::Arc::from(key.as_str()),
+        })
+    }
+}
+
+/// The host part of a `host:port` or `[v6]:port` string.
+fn host_of(address: &str) -> &str {
+    if let Some(rest) = address.strip_prefix('[') {
+        return rest.split(']').next().unwrap_or(rest);
+    }
+    address
+        .rsplit_once(':')
+        .map(|(host, _)| host)
+        .unwrap_or(address)
+}
+
 /// Where one request goes.
 #[derive(Debug, Clone)]
 pub enum Target {
-    /// Forward it to a `host:port` upstream. Shared so the per-request clone
-    /// is an atomic increment, not an allocation.
-    Proxy(Arc<str>),
+    /// Forward it to an HTTP(S) backend.
+    Proxy(std::sync::Arc<Upstream>),
     /// Serve it from a directory on this host.
     Static(StaticSite),
 }
 
 impl Target {
     pub fn from_config(
-        upstream: &str,
+        spec: &UpstreamSpec<'_>,
         root: &str,
         index: &str,
         root_dir: &std::path::Path,
     ) -> anyhow::Result<Self> {
-        if !upstream.trim().is_empty() {
-            return Ok(Target::Proxy(Arc::from(upstream.trim())));
+        if !spec.address.trim().is_empty() {
+            return Upstream::from_config(spec, root_dir)
+                .map(|u| Target::Proxy(std::sync::Arc::new(u)));
         }
         let path = if std::path::Path::new(root.trim()).is_absolute() {
             std::path::PathBuf::from(root.trim())
@@ -155,11 +279,17 @@ pub struct PathRoute {
 impl PathRoute {
     pub fn from_config(
         route: &crate::config::Route,
+        domain: &str,
         root_dir: &std::path::Path,
     ) -> anyhow::Result<Self> {
+        let spec = UpstreamSpec {
+            address: &route.upstream,
+            tls: route.upstream_tls(),
+            default_sni: domain,
+        };
         Ok(Self {
             prefix: route.prefix().to_string(),
-            target: Target::from_config(&route.upstream, &route.root, &route.index, root_dir)?,
+            target: Target::from_config(&spec, &route.root, &route.index, root_dir)?,
             strip_prefix: route.strip_prefix,
         })
     }
@@ -187,6 +317,11 @@ impl SiteRoutes {
         // Longest first: `/assets/` is looked at before `/`.
         routes.sort_by_key(|r| std::cmp::Reverse(r.prefix.len()));
         Self { catch_all, routes }
+    }
+
+    /// Every target this domain can reach, catch-all included.
+    pub fn targets(&self) -> impl Iterator<Item = &Target> {
+        std::iter::once(&self.catch_all).chain(self.routes.iter().map(|r| &r.target))
     }
 
     /// Pick the route for `path`. Always succeeds: the catch-all is the floor.
@@ -223,12 +358,17 @@ impl RouteTable {
     pub fn from_config(cfg: &crate::config::Config) -> anyhow::Result<Self> {
         let mut sites = HashMap::new();
         for s in &cfg.servers {
-            let catch_all = Target::from_config(&s.upstream, &s.root, &s.index, &cfg.root_dir)
+            let spec = UpstreamSpec {
+                address: &s.upstream,
+                tls: s.upstream_tls(),
+                default_sni: &s.domain,
+            };
+            let catch_all = Target::from_config(&spec, &s.root, &s.index, &cfg.root_dir)
                 .with_context(|| format!("building the catch-all for `{}`", s.domain))?;
             let mut routes = Vec::new();
             for r in cfg.routes_for(s) {
                 routes.push(
-                    PathRoute::from_config(r, &cfg.root_dir).with_context(|| {
+                    PathRoute::from_config(r, &s.domain, &cfg.root_dir).with_context(|| {
                         format!("building route `{}` for `{}`", r.path, s.domain)
                     })?,
                 );
@@ -249,13 +389,29 @@ impl RouteTable {
     pub fn route_count(&self) -> usize {
         self.sites.values().map(|s| s.routes.len()).sum()
     }
+
+    /// Every distinct proxy backend in the table, for health checks.
+    pub fn upstreams(&self) -> Vec<Arc<Upstream>> {
+        let mut seen = HashSet::new();
+        let mut out = Vec::new();
+        for site in self.sites.values() {
+            for target in site.targets() {
+                if let Target::Proxy(upstream) = target {
+                    if seen.insert(upstream.key().clone()) {
+                        out.push(upstream.clone());
+                    }
+                }
+            }
+        }
+        out
+    }
 }
 
 /// Per-request state carried between the `ProxyHttp` phases.
 #[derive(Default)]
 pub struct ProxyCtx {
     /// Upstream chosen for this request in `request_filter`.
-    upstream: Option<Arc<str>>,
+    upstream: Option<Arc<Upstream>>,
     /// Normalized host, so `upstream_peer` does not parse the header again.
     host: Option<String>,
     /// Prefix the matched route wants removed before forwarding.
@@ -277,6 +433,8 @@ pub struct HttpsProxy {
     /// another group is misdirected, even though routes and certificates are
     /// shared. Swapped on reload with the rest of the config.
     allowed: Arc<RwLock<Arc<HashSet<String>>>>,
+    /// Upstream liveness, shared by every listener and the probe thread.
+    health: Arc<HealthTracker>,
 }
 
 impl HttpsProxy {
@@ -285,12 +443,14 @@ impl HttpsProxy {
         limiter: Arc<RequestLimiter>,
         max_body_bytes: Arc<AtomicUsize>,
         allowed: Arc<RwLock<Arc<HashSet<String>>>>,
+        health: Arc<HealthTracker>,
     ) -> Self {
         Self {
             routes,
             limiter,
             max_body_bytes,
             allowed,
+            health,
         }
     }
 }
@@ -363,6 +523,14 @@ impl ProxyHttp for HttpsProxy {
                 return Ok(true);
             }
             Target::Proxy(upstream) => {
+                if self.health.down(upstream) {
+                    warn!(
+                        "upstream {} is down; answering 503 for {}",
+                        upstream.address, host
+                    );
+                    session.respond_error(503).await?;
+                    return Ok(true);
+                }
                 ctx.upstream = Some(upstream.clone());
                 ctx.host = Some(host);
                 ctx.strip_prefix = resolved.strip.map(str::to_string);
@@ -397,10 +565,24 @@ impl ProxyHttp for HttpsProxy {
             Error::new_str("internal error: no upstream resolved for this request")
         })?;
         let host = ctx.host.take().unwrap_or_default();
+        let addr = self.health.addr(&upstream).ok_or_else(|| {
+            Error::new_str("internal error: the upstream has no resolved address")
+        })?;
 
-        debug!("proxying {host} -> {upstream}");
-        // `tls = false`: we forward to a plain-HTTP upstream.
-        Ok(Box::new(HttpPeer::new(&*upstream, false, host)))
+        debug!(
+            "proxying {host} -> {}{}",
+            upstream.address,
+            if upstream.tls { " over TLS" } else { "" }
+        );
+        let mut peer = HttpPeer::new(addr, upstream.tls, upstream.sni.to_string());
+        if upstream.tls {
+            peer.options.verify_cert = upstream.verify;
+            peer.options.verify_hostname = upstream.verify;
+            if let Some(ca) = &upstream.ca {
+                peer.options.ca = Some(ca.clone());
+            }
+        }
+        Ok(Box::new(peer))
     }
 
     /// Tell the backend where the request really came from.
@@ -615,7 +797,19 @@ mod tests {
     }
 
     fn proxy(upstream: &str) -> Target {
-        Target::Proxy(Arc::from(upstream))
+        let spec = UpstreamSpec {
+            address: upstream,
+            tls: UpstreamTls {
+                tls: false,
+                sni: "",
+                verify: true,
+                ca: "",
+            },
+            default_sni: "test.local",
+        };
+        Target::Proxy(Arc::new(
+            Upstream::from_config(&spec, Path::new(".")).unwrap(),
+        ))
     }
 
     fn site() -> SiteRoutes {
@@ -638,7 +832,7 @@ mod tests {
 
     fn upstream(site: &SiteRoutes, path: &str) -> String {
         match site.resolve(path).target {
-            Target::Proxy(upstream) => upstream.to_string(),
+            Target::Proxy(upstream) => upstream.address.to_string(),
             Target::Static(_) => panic!("expected a proxy target for {path}"),
         }
     }

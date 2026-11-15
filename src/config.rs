@@ -89,6 +89,10 @@ pub struct Config {
     #[serde(default)]
     pub tls: Tls,
 
+    /// Upstream liveness checks.
+    #[serde(default)]
+    pub health: Health,
+
     /// Certificate acquisition and storage (`keys = "auto"`).
     #[serde(default)]
     pub acme: Acme,
@@ -331,6 +335,77 @@ impl Config {
     }
 }
 
+/// Active upstream liveness checks.
+///
+/// A periodic probe (TCP connect, plus a TLS handshake when the upstream speaks
+/// HTTPS) marks a backend down after `failures` consecutive failures. A down
+/// backend is answered with `503` immediately instead of waiting for a connect
+/// timeout. `interval_ms = 0` disables the active probe; the address is still
+/// resolved at startup and on reload.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Health {
+    #[serde(default = "default_health_interval_ms")]
+    pub interval_ms: u64,
+    #[serde(default = "default_health_timeout_ms")]
+    pub timeout_ms: u64,
+    #[serde(default = "default_health_failures")]
+    pub failures: usize,
+}
+
+impl Default for Health {
+    fn default() -> Self {
+        Health {
+            interval_ms: default_health_interval_ms(),
+            timeout_ms: default_health_timeout_ms(),
+            failures: default_health_failures(),
+        }
+    }
+}
+
+fn default_health_interval_ms() -> u64 {
+    5_000
+}
+
+fn default_health_timeout_ms() -> u64 {
+    2_000
+}
+
+fn default_health_failures() -> usize {
+    2
+}
+
+/// The upstream-TLS knobs of one server or route, borrowed for validation.
+#[derive(Debug, Clone, Copy)]
+pub struct UpstreamTls<'a> {
+    pub tls: bool,
+    pub sni: &'a str,
+    pub verify: bool,
+    pub ca: &'a str,
+}
+
+impl Server {
+    pub fn upstream_tls(&self) -> UpstreamTls<'_> {
+        UpstreamTls {
+            tls: self.upstream_tls,
+            sni: &self.upstream_sni,
+            verify: self.upstream_verify,
+            ca: &self.upstream_ca,
+        }
+    }
+}
+
+impl Route {
+    pub fn upstream_tls(&self) -> UpstreamTls<'_> {
+        UpstreamTls {
+            tls: self.upstream_tls,
+            sni: &self.upstream_sni,
+            verify: self.upstream_verify,
+            ca: &self.upstream_ca,
+        }
+    }
+}
+
 /// Abuse protection.
 ///
 /// Every limit counts a fixed one-second window per client IP, and every limit
@@ -540,6 +615,26 @@ pub struct Server {
     #[serde(default)]
     pub upstream: String,
 
+    /// Speak HTTPS to the upstream instead of plain HTTP.
+    #[serde(default)]
+    pub upstream_tls: bool,
+
+    /// SNI (and hostname to verify) for the upstream TLS handshake. Empty means
+    /// the upstream host when it is a DNS name, or this server's `domain` when
+    /// the upstream is an IP literal.
+    #[serde(default)]
+    pub upstream_sni: String,
+
+    /// Verify the upstream certificate. `false` accepts any certificate; pair it
+    /// with a private network, never with the public internet.
+    #[serde(default = "default_true")]
+    pub upstream_verify: bool,
+
+    /// PEM bundle of roots for the upstream certificate. Empty uses the system
+    /// roots. Only meaningful with `upstream_tls`.
+    #[serde(default)]
+    pub upstream_ca: String,
+
     /// Serve static files from this directory when no route matches, instead
     /// of proxying. Relative to the config file. Exactly one of `upstream` and
     /// `root` must be set.
@@ -581,6 +676,16 @@ pub struct Route {
     /// and `root` must be set.
     #[serde(default)]
     pub upstream: String,
+
+    /// Speak HTTPS to this route's upstream. See the server-level fields.
+    #[serde(default)]
+    pub upstream_tls: bool,
+    #[serde(default)]
+    pub upstream_sni: String,
+    #[serde(default = "default_true")]
+    pub upstream_verify: bool,
+    #[serde(default)]
+    pub upstream_ca: String,
 
     /// Serve static files under this directory instead of proxying. Relative
     /// to the config file. Exactly one of `upstream` and `root` must be set.
@@ -736,6 +841,13 @@ impl Config {
             }
         }
         cfg.acme.renew_before_days = cfg.acme.renew_before_days.clamp(1, 89);
+        cfg.health.interval_ms = if cfg.health.interval_ms == 0 {
+            0
+        } else {
+            cfg.health.interval_ms.clamp(100, 3_600_000)
+        };
+        cfg.health.timeout_ms = cfg.health.timeout_ms.clamp(50, 30_000);
+        cfg.health.failures = cfg.health.failures.clamp(1, 100);
         validate_acme(&cfg.acme, &cfg.root_dir)?;
         validate_streams(&mut cfg)?;
         validate_listeners(&cfg)?;
@@ -841,7 +953,13 @@ fn validate_server(s: &Server, root_dir: &Path, https_port: u16) -> Result<()> {
         anyhow::bail!("`{domain}` is not a hostname: no scheme, path, port or wildcard");
     }
 
-    validate_target(&s.upstream, &s.root, root_dir, &format!("`{domain}`"))?;
+    validate_target(
+        &s.upstream,
+        &s.root,
+        root_dir,
+        &format!("`{domain}`"),
+        s.upstream_tls(),
+    )?;
     validate_index(&s.index, &format!("`{domain}`"))?;
     s.binds(https_port)
         .with_context(|| format!("`{domain}` listener override"))?;
@@ -863,7 +981,13 @@ fn validate_server(s: &Server, root_dir: &Path, https_port: u16) -> Result<()> {
 }
 
 /// Exactly one of `upstream` and `root`, and it has to be usable now.
-fn validate_target(upstream: &str, root: &str, root_dir: &Path, owner: &str) -> Result<()> {
+fn validate_target(
+    upstream: &str,
+    root: &str,
+    root_dir: &Path,
+    owner: &str,
+    tls: UpstreamTls<'_>,
+) -> Result<()> {
     let has_upstream = !upstream.trim().is_empty();
     let has_root = !root.trim().is_empty();
 
@@ -874,10 +998,57 @@ fn validate_target(upstream: &str, root: &str, root_dir: &Path, owner: &str) -> 
         }
         (true, false) => {
             validate_upstream(upstream, &format!("{owner} `upstream`"))?;
-            Ok(())
+            validate_upstream_tls(tls, owner, root_dir)
         }
-        (false, true) => validate_static_root(root, root_dir, &format!("{owner} `root`")),
+        (false, true) => {
+            if tls.tls || !tls.sni.trim().is_empty() || !tls.ca.trim().is_empty() || !tls.verify {
+                anyhow::bail!("{owner}: `upstream_tls`/`upstream_sni`/`upstream_ca` need an `upstream`, not a `root`");
+            }
+            validate_static_root(root, root_dir, &format!("{owner} `root`"))
+        }
     }
+}
+
+/// Validate the optional TLS-to-the-backend settings.
+///
+/// The PEM bundle is parsed here, so `uping --check` catches a broken CA before
+/// the first request. The parsed copy used for connections is built later, in
+/// the route table.
+fn validate_upstream_tls(tls: UpstreamTls<'_>, owner: &str, root_dir: &Path) -> Result<()> {
+    let sni = tls.sni.trim();
+    if !sni.is_empty() {
+        if !tls.tls {
+            anyhow::bail!("{owner}: `upstream_sni` only applies with `upstream_tls = true`");
+        }
+        if sni.contains('/') || sni.contains(':') || sni.contains(char::is_whitespace) {
+            anyhow::bail!("{owner}: `upstream_sni = \"{sni}\"` is not a hostname");
+        }
+    }
+    if !tls.tls {
+        if !tls.ca.trim().is_empty() {
+            anyhow::bail!("{owner}: `upstream_ca` only applies with `upstream_tls = true`");
+        }
+        if !tls.verify {
+            anyhow::bail!(
+                "{owner}: `upstream_verify = false` only applies with `upstream_tls = true`"
+            );
+        }
+        return Ok(());
+    }
+    if !tls.ca.trim().is_empty() {
+        let path = resolve_path(root_dir, tls.ca);
+        let pem = std::fs::read(&path)
+            .with_context(|| format!("{owner}: reading `upstream_ca` `{}`", path.display()))?;
+        let certs = openssl::x509::X509::stack_from_pem(&pem)
+            .with_context(|| format!("{owner}: parsing `upstream_ca` `{}`", path.display()))?;
+        if certs.is_empty() {
+            anyhow::bail!(
+                "{owner}: `upstream_ca` `{}` holds no certificate",
+                path.display()
+            );
+        }
+    }
+    Ok(())
 }
 
 fn validate_static_root(raw: &str, root_dir: &Path, what: &str) -> Result<()> {
@@ -933,7 +1104,7 @@ fn validate_routes(routes: &[Route], owner: &str, root_dir: &Path) -> Result<()>
         let path = r.path.trim();
         let where_ = format!("{owner} route `{path}`");
 
-        validate_target(&r.upstream, &r.root, root_dir, &where_)?;
+        validate_target(&r.upstream, &r.root, root_dir, &where_, r.upstream_tls())?;
         validate_index(&r.index, &where_)?;
         if !path.starts_with('/') {
             anyhow::bail!("{where_}: `path` must start with `/`");
@@ -1595,6 +1766,90 @@ listen6 = "2001:db8::1:9443"
         let group = cfg.https_groups().unwrap().remove(0);
         let v6 = group.key.v6.expect("a v6 listener");
         assert_eq!(v6.port(), 443);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn health_defaults_and_is_clamped() {
+        let path = write_temp("health-default.toml", MINIMAL);
+        let cfg = Config::load(&path).unwrap();
+        assert_eq!(cfg.health.interval_ms, 5_000);
+        assert_eq!(cfg.health.timeout_ms, 2_000);
+        assert_eq!(cfg.health.failures, 2);
+        let _ = std::fs::remove_file(path);
+
+        let path = write_temp(
+            "health-clamp.toml",
+            &format!("[health]\ninterval_ms = 10\ntimeout_ms = 999_999\nfailures = 0\n{MINIMAL}"),
+        );
+        let cfg = Config::load(&path).unwrap();
+        assert_eq!(
+            cfg.health.interval_ms, 100,
+            "an interval below 100 ms is raised"
+        );
+        assert_eq!(cfg.health.timeout_ms, 30_000);
+        assert_eq!(cfg.health.failures, 1, "zero failures is raised to one");
+        let _ = std::fs::remove_file(path);
+
+        let path = write_temp(
+            "health-off.toml",
+            &format!("[health]\ninterval_ms = 0\n{MINIMAL}"),
+        );
+        assert_eq!(Config::load(&path).unwrap().health.interval_ms, 0);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn upstream_tls_only_makes_sense_with_an_upstream() {
+        let path = write_temp(
+            "tls-static.toml",
+            "[[server]]\ndomain = \"s.local\"\nroot = \"public\"\nupstream_tls = true\n",
+        );
+        assert!(
+            Config::load(&path).is_err(),
+            "upstream_tls on a static root"
+        );
+        let _ = std::fs::remove_file(path);
+
+        let path = write_temp(
+            "verify-no-tls.toml",
+            "[[server]]\ndomain = \"s.local\"\nupstream = \"127.0.0.1:8080\"\nupstream_verify = false\n",
+        );
+        let err = Config::load(&path).unwrap_err().to_string();
+        assert!(
+            err.contains("only applies with `upstream_tls = true`"),
+            "unexpected error: {err}"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn a_missing_upstream_ca_is_refused() {
+        let path = write_temp(
+            "tls-ca-missing.toml",
+            "[[server]]\ndomain = \"s.local\"\nupstream = \"127.0.0.1:8443\"\n\
+             upstream_tls = true\nupstream_ca = \"does-not-exist.pem\"\n",
+        );
+        let err = Config::load(&path).unwrap_err().to_string();
+        assert!(
+            err.contains("reading `upstream_ca`"),
+            "unexpected error: {err}"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn a_route_inherits_nothing_but_carries_its_own_upstream_tls() {
+        let path = write_temp(
+            "route-tls.toml",
+            "[[server]]\ndomain = \"s.local\"\nupstream = \"127.0.0.1:8080\"\n\
+             [[server.route]]\npath = \"/api\"\nupstream = \"127.0.0.1:8443\"\n\
+             upstream_tls = true\nupstream_sni = \"api.local\"\n",
+        );
+        let cfg = Config::load(&path).unwrap();
+        assert!(!cfg.servers[0].upstream_tls);
+        assert!(cfg.servers[0].routes[0].upstream_tls);
+        assert_eq!(cfg.servers[0].routes[0].upstream_sni, "api.local");
         let _ = std::fs::remove_file(path);
     }
 

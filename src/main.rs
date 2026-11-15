@@ -3,11 +3,13 @@
 //! v0.3 reads a config, obtains or loads one certificate per domain, serves
 //! HTTPS (SNI) on the global and per-domain listeners, redirects plain HTTP to
 //! HTTPS, and keeps a lid on abusive clients. A `[[server]]` or route may also
-//! serve a directory directly (`root`). `[[stream]]` raw TCP forwarding is
-//! experimental.
+//! serve a directory directly (`root`), forward to a TLS backend, and is probed
+//! for liveness so a dead backend is a fast `503`. `[[stream]]` raw TCP
+//! forwarding is experimental.
 
 mod acme;
 mod config;
+mod health;
 mod limits;
 mod proxy;
 mod reload;
@@ -31,6 +33,7 @@ use pingora::services::listening::Service;
 
 use crate::acme::{CertManager, ChallengeStore};
 use crate::config::{Config, GroupKey};
+use crate::health::HealthTracker;
 use crate::limits::{ConnLimiter, RequestLimiter};
 use crate::proxy::{HttpsProxy, RedirectProxy, RouteTable};
 use crate::reload::{Allowed, Reloader};
@@ -158,6 +161,16 @@ fn main() -> Result<()> {
         cfg.servers.len()
     );
 
+    // Resolve and probe every backend before the first request can reach it.
+    let health = HealthTracker::new(&cfg.health);
+    {
+        let table = live_routes
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        health.prime(&table);
+    }
+
     let mut server = Server::new(None).context("creating Pingora server")?;
     server.bootstrap();
 
@@ -218,6 +231,7 @@ fn main() -> Result<()> {
                     request_limiter.clone(),
                     max_body.clone(),
                     allowed.clone(),
+                    health.clone(),
                 ),
             )
             .server_options(server_options.clone())
@@ -257,7 +271,7 @@ fn main() -> Result<()> {
 
     let reloader = Arc::new(Reloader::new(
         std::path::PathBuf::from(&config_path),
-        live_routes,
+        live_routes.clone(),
         resolver,
         certs,
         request_limiter,
@@ -265,9 +279,11 @@ fn main() -> Result<()> {
         max_body,
         allow_lists,
         renewal_servers,
+        health.clone(),
         &cfg,
     )?);
     reloader.spawn().context("starting the reload thread")?;
+    health.clone().spawn(live_routes.clone());
     info!("SIGHUP reloads the config; `systemctl --user reload uping`");
 
     // --- Raw TCP streams (experimental in v0.3) ---
@@ -381,6 +397,10 @@ mod tests {
             pub_key: "certs/test.local.crt".to_string(),
             priv_key: "certs/test.local.key".to_string(),
             upstream: upstream.to_string(),
+            upstream_tls: false,
+            upstream_sni: String::new(),
+            upstream_verify: true,
+            upstream_ca: String::new(),
             root: String::new(),
             index: "index.html".to_string(),
             routes: Vec::new(),
@@ -394,6 +414,7 @@ mod tests {
             listen: Default::default(),
             limits: Default::default(),
             tls: Default::default(),
+            health: Default::default(),
             acme: Default::default(),
             servers,
             streams: Vec::new(),
@@ -402,7 +423,7 @@ mod tests {
 
     fn upstream(routes: &RouteTable, host: &str, path: &str) -> String {
         match routes.get(host).unwrap().resolve(path).target {
-            Target::Proxy(upstream) => upstream.to_string(),
+            Target::Proxy(upstream) => upstream.address.to_string(),
             Target::Static(_) => panic!("expected a proxy target for {host}{path}"),
         }
     }
@@ -459,6 +480,10 @@ mod tests {
         s.routes = vec![crate::config::Route {
             path: "/assets/".to_string(),
             upstream: "127.0.0.1:8085".to_string(),
+            upstream_tls: false,
+            upstream_sni: String::new(),
+            upstream_verify: true,
+            upstream_ca: String::new(),
             root: String::new(),
             index: "index.html".to_string(),
             strip_prefix: true,

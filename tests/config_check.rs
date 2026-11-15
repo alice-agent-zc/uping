@@ -288,6 +288,39 @@ fn a_global_route_is_refused() {
     assert_refused("global-route.toml", &body, "unknown field `route`");
 }
 
+/// An upstream CA is parsed by `--check`, not at the first request.
+#[test]
+fn an_upstream_ca_that_is_not_a_certificate_is_refused() {
+    let (_, key) = cert_pair();
+    let junk = fixtures().join("junk-upstream-ca.pem");
+    std::fs::write(&junk, b"-----BEGIN CERTIFICATE-----\nnot base64\n").unwrap();
+    let body = format!(
+        "\n[[server]]\ndomain = \"secure.local\"\nupstream = \"127.0.0.1:8443\"\n\
+         upstream_tls = true\nupstream_ca = \"{}\"\n",
+        junk.display()
+    );
+    let _ = key;
+    assert_refused("upstream-ca-junk.toml", &body, "parsing `upstream_ca`");
+}
+
+/// Upstream TLS is meaningless without an upstream to speak to.
+#[test]
+fn upstream_tls_with_a_root_is_refused() {
+    let (cert, key) = cert_pair();
+    let root = fixtures().join("static-root");
+    std::fs::create_dir_all(&root).unwrap();
+    let body = format!(
+        "\n[[server]]\ndomain = \"static.local\"\npub_key = \"{cert}\"\npriv_key = \"{key}\"\n\
+         root = \"{}\"\nupstream_tls = true\n",
+        root.display()
+    );
+    assert_refused(
+        "upstream-tls-static.toml",
+        &body,
+        "need an `upstream`, not a `root`",
+    );
+}
+
 /// The failure only the flag can catch: a config that parses but whose
 /// certificate cannot be read. Nothing here touches the network.
 #[test]

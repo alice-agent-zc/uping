@@ -62,6 +62,13 @@ pub fn cert_pair(dir: &Path, domain: &str) -> (PathBuf, PathBuf) {
         .unwrap();
     cert.set_not_after(&Asn1Time::days_from_now(30).unwrap())
         .unwrap();
+    // A SAN, not just the CN: modern hostname verification (including the
+    // upstream-TLS probe) looks at it first.
+    let san = openssl::x509::extension::SubjectAlternativeName::new()
+        .dns(domain)
+        .build(&cert.x509v3_context(None, None))
+        .unwrap();
+    cert.append_extension(san).unwrap();
     cert.sign(&key, MessageDigest::sha256()).unwrap();
     let cert = cert.build();
 

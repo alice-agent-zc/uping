@@ -38,6 +38,14 @@
 # [tls]
 # fallback_cert = true             # serve the first cert when SNI is absent/unknown
 
+# Optional. Upstream liveness. A backend is marked down after `failures`
+# consecutive failed probes and answered with 503 until it returns.
+# interval_ms = 0 disables the active probe (the address is still resolved).
+# [health]
+# interval_ms = 5000
+# timeout_ms  = 2000
+# failures    = 2
+
 [[server]]
 domain   = "www.example.com"
 keys     = "auto"                 # default when no pub_key/priv_key are given
@@ -49,6 +57,12 @@ upstream = "127.0.0.1:8080"       # catch-all: every path without its own route
 # challenge listener.
 # listen  = "203.0.113.10"
 # listen6 = "[2001:db8::10]:8443"
+
+# Optional. Speak HTTPS to the backend instead of plain HTTP.
+# upstream_tls    = true
+# upstream_sni    = "app.internal"       # default: the upstream host, or this domain for an IP
+# upstream_verify = true                 # false accepts any certificate: private nets only
+# upstream_ca     = "certs/internal-ca.pem"   # replaces the system roots
 
 # A static site: no backend, just files. Exactly one of upstream/root.
 #

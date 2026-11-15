@@ -42,6 +42,10 @@ The suite needs no root, no network and no certificate checked into the tree:
 - a route end-to-end test (`tests/route_e2e.rs`): two domains, one route each;
 - a per-server listener test (`tests/listen_e2e.rs`): its own socket answers,
   the global one returns `421`;
+- health checks (`tests/health_e2e.rs`): a backend dies -> `503`, comes back ->
+  `200`, and a TCP-only listener is not a healthy TLS upstream;
+- upstream TLS (`tests/upstream_tls_e2e.rs`): private CA, verify opt-out, and a
+  wrong SNI failing the handshake;
 - a SIGHUP reload test (`tests/reload_e2e.rs`): new root, invalid TOML, listener
   change;
 - end-to-end static serving and raw TCP forwarding.
@@ -80,6 +84,12 @@ max_body_bytes       = 10485760
 [tls]
 fallback_cert = true
 
+# Optional. Upstream liveness. interval_ms = 0 disables the active probe.
+[health]
+interval_ms = 5000
+timeout_ms  = 2000
+failures    = 2
+
 # Array form: the domain is a field.
 [[server]]
 domain   = "www.example.com"
@@ -90,6 +100,13 @@ upstream = "127.0.0.1:8080"
 # The port defaults to `[listen] https`; both families are independent.
 listen  = "203.0.113.10"
 listen6 = "[2001:db8::10]:8443"
+
+# Optional. For an HTTPS backend instead of the plain-HTTP one above:
+# upstream      = "10.0.0.5:8443"
+# upstream_tls  = true
+# upstream_sni  = "app.internal"
+# upstream_ca   = "certs/internal-ca.pem"
+# upstream_verify = false            # accepts any certificate: private nets only
 
 [[server]]
 domain = "static.example.com"
@@ -234,6 +251,56 @@ in the array form (`[[server.route]]`) or under the domain key in the map form
   the query string.
 - `path = "/"` is rejected: use the server's catch-all.
 
+### Upstream TLS
+
+By default uping talks plain HTTP to the backend. Set `upstream_tls = true` to
+speak HTTPS instead:
+
+```toml
+[[server]]
+domain       = "www.example.com"
+upstream     = "10.0.0.5:8443"
+upstream_tls = true
+upstream_sni = "app.internal"          # optional
+upstream_ca  = "certs/internal-ca.pem" # optional, replaces the system roots
+# upstream_verify = false              # accepts any certificate: private nets only
+```
+
+- `upstream_sni` is the SNI sent to the backend and the name verified. When it
+  is empty, a DNS upstream host is used; for an IP literal the server's own
+  `domain` is used (a loopback backend usually serves the public certificate).
+- `upstream_ca` is a PEM bundle of roots; it replaces the system store rather
+  than adding to it, so a private CA cannot be silently bypassed by a public one.
+- `upstream_verify = false` disables both certificate and hostname verification.
+  It is for backends on a trusted network with self-signed certificates; never
+  use it with a backend reached over the public internet.
+- The settings are per server and per `[[server.route]]`: a route can forward to
+  a TLS backend while the catch-all stays plain HTTP.
+
+### Health checks
+
+uping probes every distinct backend: a TCP connect, plus a TLS handshake when
+`upstream_tls` is on. A backend is marked down after `failures` consecutive
+failed probes and up on the first success. A down backend is answered with
+`503 Service Unavailable` immediately, instead of making the client wait for a
+connect timeout.
+
+```toml
+[health]
+interval_ms = 5000   # 0 disables the active probe
+timeout_ms  = 2000
+failures    = 2
+```
+
+- The probe runs in one background thread and follows reloads: adding a domain
+  or changing an upstream is picked up on the next pass, and the reload itself
+  probes the new table before it becomes live.
+- With `interval_ms = 0`, no active probe runs; the address is still resolved at
+  startup and on reload (and refreshed every minute), and an unresolvable
+  upstream is still refused with `503`.
+- Only liveness is checked; there is no per-path HTTP health endpoint and no
+  load balancing. One upstream per server/route, by design.
+
 ### Limits
 
 | Setting | Where | Over budget |
@@ -285,6 +352,7 @@ Applied live:
 - `[tls] fallback_cert`;
 - manual certificates already on disk, and existing `auto` ones;
 - which domains each already-bound HTTPS listener may answer;
+- the health probe follows the new route table automatically;
 - a newly added `auto` domain is requested in the background through the
   running HTTP listener.
 
@@ -374,6 +442,7 @@ src/
   tls.rs           # SNI resolver; renewals replace entries live
   acme.rs          # account, http-01 orders, storage, renewal thread
   static_files.rs  # safe path resolution + streamed files
+  health.rs        # upstream probes, 503 when a backend is down
   limits.rs        # per-IP rate + connection limiters
   proxy.rs         # HTTPS proxy, HTTP redirect + ACME challenge path
   stream.rs        # experimental raw TCP forwarder
@@ -382,6 +451,8 @@ tests/
   acme_e2e.rs      # fake ACME CA over TLS, real first start
   route_e2e.rs     # one route per domain
   listen_e2e.rs    # a per-server listener and its 421 isolation
+  health_e2e.rs    # backend down -> 503, recovered -> 200
+  upstream_tls_e2e.rs  # private CA, verify opt-out, wrong-SNI failure
   reload_e2e.rs    # SIGHUP, bad config, listener warning
   static_e2e.rs    # static serving through the real binary
   stream_e2e.rs    # raw TCP through the real binary

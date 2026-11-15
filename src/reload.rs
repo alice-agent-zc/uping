@@ -30,6 +30,7 @@ use signal_hook::iterator::Signals;
 
 use crate::acme::CertManager;
 use crate::config::{Config, GroupKey, KeyMode};
+use crate::health::HealthTracker;
 use crate::limits::{ConnLimiter, RequestLimiter};
 use crate::proxy::RouteTable;
 use crate::tls::SniResolver;
@@ -74,6 +75,8 @@ pub struct Reloader {
     allow_lists: Vec<(GroupKey, Allowed)>,
     /// Shared with the renewal thread; swapped on every successful reload.
     renewal_servers: Arc<RwLock<Vec<crate::config::Server>>>,
+    /// Probed before the new route table becomes live.
+    health: Arc<HealthTracker>,
     /// One worker issues certificates, so a burst of reloads cannot create a
     /// thread per pending domain. The set de-duplicates domains already queued.
     issue_tx: Mutex<mpsc::Sender<Vec<crate::config::Server>>>,
@@ -96,6 +99,7 @@ impl Reloader {
         max_body: Arc<AtomicUsize>,
         allow_lists: Vec<(GroupKey, Allowed)>,
         renewal_servers: Arc<RwLock<Vec<crate::config::Server>>>,
+        health: Arc<HealthTracker>,
         cfg: &Config,
     ) -> Result<Self> {
         let (issue_tx, issue_rx) = mpsc::channel();
@@ -109,6 +113,7 @@ impl Reloader {
             max_body,
             allow_lists,
             renewal_servers,
+            health,
             issue_tx: Mutex::new(issue_tx),
             issue_rx: Mutex::new(Some(issue_rx)),
             in_flight: Arc::new(Mutex::new(HashSet::new())),
@@ -218,6 +223,8 @@ impl Reloader {
         }
 
         self.resolver.adopt(&candidate);
+        // Resolve/probe the new backends before they can receive a request.
+        self.health.prime(&routes);
         {
             let mut live = self.routes.write().unwrap_or_else(|e| e.into_inner());
             *live = Arc::new(routes);
