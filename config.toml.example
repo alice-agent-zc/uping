@@ -1,5 +1,6 @@
-# uping v0.3 — example configuration
+# uping v0.3.1 — example configuration
 #
+# Copy:   cp config.toml.example config.toml
 # Run:    uping config.toml
 # Check:  uping --check config.toml
 # DNS:    uping --dns-zone config.toml       (hosts records for a VPN resolver)

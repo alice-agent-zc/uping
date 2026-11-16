@@ -8,7 +8,7 @@ also serves a directory without a backend, works over IPv4 and IPv6, and
 reloads its config with `systemctl --user reload` — no restart for a config
 change.
 
-## Status — v0.3.0
+## Status — v0.3.1
 
 - ✅ HTTPS reverse proxy with SNI, one certificate per domain
 - ✅ Let's Encrypt (`keys = "auto"`) and private ACME CAs, including step-ca
@@ -29,6 +29,9 @@ mutual TLS, DNS-01.
 
 ## Quick start
 
+`config.toml` is local and git-ignored; [`config.toml.example`](config.toml.example)
+is the tracked template. Copy it once, then edit the copy:
+
 ```toml
 # config.toml
 [acme]
@@ -40,6 +43,9 @@ upstream = "127.0.0.1:8080"
 ```
 
 ```sh
+cp config.toml.example config.toml
+$EDITOR config.toml
+
 cargo build --release
 sudo setcap 'cap_net_bind_service=+ep' target/release/uping
 ./target/release/uping --check config.toml   # validate, bind nothing

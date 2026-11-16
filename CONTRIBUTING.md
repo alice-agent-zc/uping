@@ -227,8 +227,8 @@ Publishing is tag-driven. A tag names the exact commit that becomes the
 release, so the asset and the crate cannot drift from the source:
 
 ```sh
-git tag v0.3.0
-git push origin v0.3.0
+git tag v0.3.1
+git push origin v0.3.1
 ```
 
 Two workflows run on `v*` tags:
@@ -254,5 +254,7 @@ an existing tag. The tag must match `Cargo.toml`'s version.
 - `cargo fmt --all -- --check`, `cargo clippy --all-targets -- -D warnings` and
   `cargo test` are clean.
 - New behaviour comes with a test; keep the diff scoped.
-- Config changes update the README (defaults and examples) and `config.toml`.
+- Config changes update the README (defaults and examples) and
+  `config.toml.example`. `config.toml` itself is git-ignored: it is the local,
+  machine-specific copy.
 - Anything touching `[[stream]]` keeps it labelled experimental.

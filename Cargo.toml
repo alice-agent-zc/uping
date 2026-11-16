@@ -1,6 +1,6 @@
 [package]
 name = "uping"
-version = "0.3.0"
+version = "0.3.1"
 edition = "2021"
 description = "A tiny TOML-configured reverse proxy with automatic HTTPS (ACME), static files and raw TCP forwarding, built on Cloudflare Pingora."
 license = "Apache-2.0"

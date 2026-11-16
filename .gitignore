@@ -8,3 +8,8 @@ certs/
 
 # Auto-managed certificates and the ACME account (keys = "auto").
 cert/
+
+# Local production config. `config.toml.example` is the tracked template; copy
+# it to `config.toml` and edit the copy. Ignoring the local file keeps a `git
+# pull` from conflicting with the running deployment.
+config.toml
