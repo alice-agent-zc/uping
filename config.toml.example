@@ -1,10 +1,11 @@
 # uping v0.3.1 — example configuration
 #
 # Copy:   cp config.toml.example config.toml
+# Root:   sudo install -m600 config.toml.example /etc/uping/config.toml
 # Run:    uping config.toml
 # Check:  uping --check config.toml
 # DNS:    uping --dns-zone config.toml       (hosts records for a VPN resolver)
-# Reload: systemctl --user reload uping     (SIGHUP, no restart)
+# Apply:  sudo pkill -HUP -x uping           (SIGHUP, no restart)
 # Restart only after installing a new binary, or after changing [listen],
 # a server's https_listen/https_listen6, [acme]/[acme.internal], or [[stream]].
 #
@@ -23,7 +24,7 @@
 
 # Optional. The public ACME CA, used by keys = "auto".
 # [acme]
-# email             = "ops@example.com"
+# email             = "ops@rao-nagos.pf"
 # staging           = false        # Let's Encrypt staging: untrusted test certs
 # cert_dir          = "cert"       # <this file's directory>/cert/<domain>/
 # renew_before_days = 30           # clamped to 1..=89
@@ -63,7 +64,7 @@
 # failures    = 2
 
 [[server]]
-domain   = "www.example.com"
+domain   = "www.rao-nagos.pf"
 keys     = "auto"                 # default when no pub_key/priv_key are given
 upstream = "127.0.0.1:8080"       # catch-all: every path without its own route
 
@@ -101,7 +102,7 @@ upstream = "127.0.0.1:8080"       # catch-all: every path without its own route
 # A static site: no backend, just files. Exactly one of upstream/root.
 #
 # [[server]]
-# domain = "static.example.com"
+# domain = "static.rao-nagos.pf"
 # keys   = "auto"
 # root   = "public"               # relative to this file, or absolute
 # index  = "index.html"
@@ -109,10 +110,10 @@ upstream = "127.0.0.1:8080"       # catch-all: every path without its own route
 # Manual certificates: point at the two PEM files and renew them yourself.
 #
 # [[server]]
-# domain   = "manual.example.com"
+# domain   = "manual.rao-nagos.pf"
 # keys     = "manual"
-# pub_key  = "cert/manual.example.com/fullchain.pem"
-# priv_key = "cert/manual.example.com/privkey.pem"
+# pub_key  = "cert/manual.rao-nagos.pf/fullchain.pem"
+# priv_key = "cert/manual.rao-nagos.pf/privkey.pem"
 # upstream = "127.0.0.1:8080"
 
 # A private site on a VPN address, with a certificate from an internal ACME CA.
@@ -120,15 +121,12 @@ upstream = "127.0.0.1:8080"       # catch-all: every path without its own route
 # port 80. If it cannot, issue the pair out of band and use keys = "manual".
 #
 # [[server]]
-# domain        = "app.vpn.example"
+# domain        = "app.vpn.rao-nagos.pf"
 # keys          = "internal"
 # upstream      = "127.0.0.1:8080"
 # https_listen  = "10.8.0.1"      # the wg0 address
 # limits        = { per_ip_rps = 50 }
 # health        = { interval_ms = 15000 }
-
-# The map form `[server."domain"]` was removed. Always use [[server]] with
-# domain = "..." and the inline `routes` array.
 
 # EXPERIMENTAL in v0.3. Raw TCP forwarding: one listener per entry, no TLS
 # termination. `listen` is one concrete `IP:port`; an `upstream` must name a

@@ -10,15 +10,15 @@ uping is a single Rust binary. Building it needs:
 
 - A Rust toolchain — edition 2021, any reasonably recent stable.
 - A C toolchain (`cc` / `gcc` / `clang`) — TLS and compression are C libraries.
-- **CMake.** Pingora's HTTP stack pins `flate2` to the `zlib-ng` backend, and
+- **CMake.** The HTTP stack pins `flate2` to the `zlib-ng` backend, and
   `libz-ng-sys` builds that backend with CMake. Without `cmake` on `PATH` the
   build stops several crates deep, with an error that never mentions CMake.
 - OpenSSL development headers (`libssl-dev` on Debian/Ubuntu).
 
 TLS is on the **OpenSSL** backend deliberately: dynamic per-SNI certificate
 selection — one listener, many domains — only exists for OpenSSL/BoringSSL in
-Pingora. The ACME client uses `rustls` with the `ring` provider, not `aws-lc`,
-so it adds no second crypto build chain.
+the proxy stack. The ACME client uses `rustls` with the `ring` provider, not
+`aws-lc`, so it adds no second crypto build chain.
 
 ## Build and test
 
@@ -52,8 +52,7 @@ The suite needs no root, no network and no certificate checked into the tree:
   :80 and still works on :443;
 - `--dns-zone` (`tests/dns_zone_e2e.rs`): records, a wildcard refusal, and the
   `--check` conflict;
-- a SIGHUP reload test (`tests/reload_e2e.rs`): new root, invalid TOML, listener
-  change;
+- a SIGHUP config-swap test: new root, invalid TOML, listener change;
 - end-to-end static serving and raw TCP forwarding.
 
 ## Architecture
@@ -64,7 +63,7 @@ The suite needs no root, no network and no certificate checked into the tree:
 src/
   main.rs          # CLI, bootstrap, wiring, --check, --dns-zone
   config.rs        # TOML schema, validation, listener groups, paths
-  reload.rs        # SIGHUP -> swap routes/certs/limits/domains
+  sighup.rs        # SIGHUP -> swap routes/certs/limits/domains
   tls.rs           # SNI resolver; renewals replace entries live
   acme.rs          # account, http-01 orders, storage, renewal thread
   static_files.rs  # safe path resolution + streamed files
@@ -81,10 +80,9 @@ tests/
   upstream_tls_e2e.rs  # private CA, verify opt-out, wrong-SNI failure
   private_http_e2e.rs  # serve_http = false on :80, HTTPS still served
   dns_zone_e2e.rs      # --dns-zone records and refusals
-  reload_e2e.rs    # SIGHUP, bad config, listener warning
+  sighup_e2e.rs    # SIGHUP, bad config, listener warning
   static_e2e.rs    # static serving through the real binary
   stream_e2e.rs    # raw TCP through the real binary
-uping.service      # user unit
 ```
 
 ### Config
@@ -92,8 +90,7 @@ uping.service      # user unit
 `config.rs` is the schema and the whole validation pass. The invariants that
 matter to a contributor:
 
-- `[[server]]` is the only server form; `[server."domain"]` is refused with a
-  clear error instead of being silently normalized.
+- `[[server]]` is the only server form.
 - Routes are **only** the inline `routes = [...]` array inside their server.
   There is no global route table: a route cannot drift to another domain.
 - Every path is resolved against the config file's directory unless it is
@@ -110,7 +107,7 @@ table here.
 
 ### TLS
 
-Pingora 0.9 dropped `TlsSettings::add_cert`, so a multi-domain listener picks
+The proxy stack dropped `TlsSettings::add_cert`, so a multi-domain listener picks
 its certificate during the handshake through the `TlsAccept` callback. The
 resolver starts with no certificate installed; the callback supplies the leaf,
 chain and key. `fallback_cert` exists because scanners connect without SNI: it
@@ -122,16 +119,16 @@ is a listener-wide choice made before a domain exists, not a per-server field.
 An order is http-01 only: create/load an account, order, publish the token
 through the challenge store, wait for the CA, write the pair atomically, then
 install it into the live resolver. The startup path binds the HTTP address
-itself (`obtain_missing`); a reload uses the already-running listener
+itself (`obtain_missing`); a `SIGHUP` uses the already-running listener
 (`obtain_missing_live`).
 
 Startup issuance is best effort: `obtain_missing` returns whether every order
 succeeded, and a failure is logged rather than returned as an error. Only
 failing to bind the temporary `:80` listener aborts startup. A failed startup
 order delays the renewal thread's first pass by an hour; a clean start checks
-after 30 seconds. This is deliberate: an exited process under systemd would be
-restarted every few seconds and exhaust the failed-authorization rate limit. Do
-not turn an order failure back into a fatal startup error.
+after 30 seconds. This is deliberate: an exited process under a supervisor
+would be restarted every few seconds and exhaust the failed-authorization rate
+limit. Do not turn an order failure back into a fatal startup error.
 
 Two profiles exist: the public `[acme]` directory and the private
 `[acme.internal]` directory. The account file is hashed by directory URL, so
@@ -142,7 +139,7 @@ operator's responsibility.
 ### Limits
 
 `RequestLimiter` keeps one fixed-size estimator table per domain (bounded by
-the config, not by client traffic) and shares the counters across reloads.
+the config, not by client traffic) and shares the counters across config swaps.
 `ConnLimiter` runs at TCP accept and is host-wide. `max_body_bytes` is checked
 on `Content-Length` and again while streaming a chunked body; the effective
 value is carried in `ProxyCtx`.
@@ -150,23 +147,23 @@ value is carried in `ProxyCtx`.
 ### Health
 
 One background thread reads the live route table, checks each upstream against
-its own interval, and probes only what is due. The reload path primes the new
-table synchronously, so the first request after a reload never sees an
+its own interval, and probes only what is due. The `SIGHUP` path primes the new
+table synchronously, so the first request after a config swap never sees an
 unresolved address. A down backend is answered with a static `503` page and
 `Retry-After`, with no host or upstream echoed back.
 
-### Reload
+### Config swap
 
-`Reloader` re-reads the same file and validates the whole candidate before
-touching live state. Routes, limits, health, `[tls] fallback_cert`, manual
+The `SIGHUP` handler re-reads the same file and validates the whole candidate
+before touching live state. Routes, limits, health, `[tls] fallback_cert`, manual
 certificates and listener domain sets are applied live. `[listen]`,
 `https_listen`/`https_listen6`, `[[stream]]`, `[acme]` and `[acme.internal]`
 require a restart and are reported as such.
 
 ### Streams
 
-`[[stream]]` is a Pingora `ServerApp` listener that copies bytes both ways and
-forwards half-close. It is experimental: keep that label in config, docs and
+`[[stream]]` is a `ServerApp` listener that copies bytes both ways and forwards
+half-close. It is experimental: keep that label in config, docs and
 error messages.
 
 ## Running it locally
@@ -200,26 +197,10 @@ curl -i  --resolve test.local:8088:127.0.0.1 http://test.local:8088/   # 301
 
 ## Deployment
 
-`uping.service` assumes a source checkout at `~/uping` and
-`~/uping/config.toml`; edit `WorkingDirectory`/`ExecStart` if yours differs.
-Certificates and the ACME account live under `~/uping/cert/`, so no root-owned
-directory is involved.
-
-```sh
-cargo build --release
-sudo setcap 'cap_net_bind_service=+ep' target/release/uping
-mkdir -p ~/.config/systemd/user
-cp uping.service ~/.config/systemd/user/
-systemctl --user daemon-reload
-systemctl --user enable --now uping
-loginctl enable-linger "$USER"
-```
-
-The capability is on the binary and is **lost on every rebuild**; re-apply
-`setcap` after `cargo build --release`.
-
-The planned apt layout — `/etc/uping/config.toml`, `/bin/uping`,
-`/etc/uping/cert` — is for the future apt release.
+Production is the root install in the README: `/usr/bin/uping`,
+`/etc/uping/config.toml` and `/etc/uping/cert`. The process runs as root and
+binds 80/443 without a capability; a checkout under `~/uping` plus
+`CAP_NET_BIND_SERVICE` is not the supported layout.
 
 ## Release
 

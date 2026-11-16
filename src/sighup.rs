@@ -1,8 +1,7 @@
-//! Live configuration reload on `SIGHUP`.
+//! Live configuration swap on `SIGHUP`.
 //!
-//! `systemctl --user reload uping` sends `SIGHUP`; we re-read the same config
-//! file, validate the whole load path, and swap the pieces that can change
-//! without rebinding a socket:
+//! `SIGHUP` asks uping to re-read the same config file, validate the whole
+//! load path, and swap the pieces that can change without rebinding a socket:
 //!
 //! * domains, upstreams, static roots, indexes, `routes = [...]`
 //! * request rate, connection rate and body-size limits (counters are kept)

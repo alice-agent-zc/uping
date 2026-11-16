@@ -1,12 +1,9 @@
 # uping
 
-A tiny, TOML-configured reverse proxy for the 90% of cases where nginx is
-overkill. Built on Cloudflare's [Pingora](https://github.com/cloudflare/pingora).
-
-Point a domain at a local service, let uping obtain the certificate, done. It
-also serves a directory without a backend, works over IPv4 and IPv6, and
-reloads its config with `systemctl --user reload` — no restart for a config
-change.
+A tiny, TOML-configured reverse proxy. Point a domain at a local service, let
+uping obtain the certificate, done. It also serves a directory without a
+backend, works over IPv4 and IPv6, and applies a new config on `SIGHUP` — no
+restart for a config change.
 
 ## Status — v0.3.1
 
@@ -20,52 +17,111 @@ change.
   overridable per domain
 - ✅ Upstream health checks (`503` at once when a backend dies), per-domain
   intervals, and HTTPS to the backend with a private CA, SNI and verify opt-out
-- ✅ Live config reload on `SIGHUP`
+- ✅ Live config swap on `SIGHUP`
 - ⚠️ `[[stream]]` raw TCP forwarding is **experimental** — the mail/database
   relay. `routes` is HTTP path routing, not the mail feature.
 
-Not here: hot-reload of listeners or `[[stream]]`, load balancing, upstream
-mutual TLS, DNS-01.
+Not here: changing listeners or `[[stream]]` without a restart, load balancing,
+upstream mutual TLS, DNS-01.
 
 ## Quick start
 
 `config.toml` is local and git-ignored; [`config.toml.example`](config.toml.example)
-is the tracked template. Copy it once, then edit the copy:
+is the tracked template. The root install below creates
+`/etc/uping/config.toml` from it; edit that file.
 
 ```toml
-# config.toml
+# /etc/uping/config.toml
 [acme]
-email = "ops@example.com"
+email = "ops@rao-nagos.pf"
 
 [[server]]
-domain   = "www.example.com"
+domain   = "www.rao-nagos.pf"
 upstream = "127.0.0.1:8080"
 ```
 
-```sh
-cp config.toml.example config.toml
-$EDITOR config.toml
+The production install below puts the binary in `/usr/bin`, the configuration
+in `/etc/uping/config.toml`, and the certificates in `/etc/uping/cert`. For
+build/test notes, architecture and the release procedure, see
+**[CONTRIBUTING.md](CONTRIBUTING.md)**.
 
+## Install as root
+
+Root is the supported production install. The process binds 80 and 443
+directly, so no `CAP_NET_BIND_SERVICE` and no `setcap` are involved.
+
+| Path | Contents |
+|---|---|
+| `/usr/bin/uping` | the binary |
+| `/etc/uping/config.toml` | the configuration |
+| `/etc/uping/cert/` | certificates, private keys and the ACME account |
+
+Build, install and validate:
+
+```sh
 cargo build --release
-sudo setcap 'cap_net_bind_service=+ep' target/release/uping
-./target/release/uping --check config.toml   # validate, bind nothing
-./target/release/uping config.toml
-./target/release/uping --dns-zone config.toml  # hosts records for a VPN resolver
+sudo install -Dm755 target/release/uping /usr/bin/uping
+sudo install -d -m755 /etc/uping /etc/uping/cert
+sudo install -m600 config.toml.example /etc/uping/config.toml
+sudoedit /etc/uping/config.toml
+sudo /usr/bin/uping --check /etc/uping/config.toml
 ```
 
-For the systemd user unit, build/test notes, architecture and release
-procedure, see **[CONTRIBUTING.md](CONTRIBUTING.md)**.
+Start it in the foreground as root:
+
+```sh
+sudo /usr/bin/uping /etc/uping/config.toml
+```
+
+It logs to stderr and stays in the foreground. Run it from your init system if
+it must start at boot; no capability is needed because the process is root.
+
+Every path in `config.toml` is relative to `/etc/uping` unless it is absolute.
+The default `cert_dir = "cert"` therefore writes:
+
+```text
+/etc/uping/cert/<domain>/fullchain.pem
+/etc/uping/cert/<domain>/privkey.pem
+/etc/uping/cert/acme-account-<hash>.json
+```
+
+The private key and the ACME account are written with mode `0600`; the chain is
+public and is written `0644`. Keep the configuration and the certificate
+directory root-only:
+
+```sh
+sudo chmod 600 /etc/uping/config.toml
+sudo chmod 700 /etc/uping/cert
+```
+
+To apply an edited configuration without dropping connections:
+
+```sh
+sudo pkill -HUP -x uping
+```
+
+The new file is validated first; an invalid file changes nothing. Changes to
+`[listen]`, `https_listen`/`https_listen6`, `[[stream]]`, `[acme]` or
+`[acme.internal]` need a restart instead: stop and start the process the same
+way your init system does.
+
+To upgrade, install the new binary over `/usr/bin/uping` and restart the
+process. The configuration and `/etc/uping/cert` are left in place.
+
+`/usr/bin/uping --dns-zone /etc/uping/config.toml` prints hosts records for a
+VPN resolver.
 
 ## Paths
 
 Every path in the file is resolved from the directory that holds `config.toml`.
-An absolute path is used exactly as written:
+With the root install that directory is `/etc/uping`. An absolute path is used
+exactly as written:
 
 ```toml
-root      = "/srv/www"                 # absolute
-root      = "public"                   # <config dir>/public
-cert_dir  = "/etc/uping/cert"          # absolute
-pub_key   = "cert/app/fullchain.pem"   # <config dir>/cert/app/fullchain.pem
+root      = "/srv/www"                             # absolute
+root      = "public"                               # /etc/uping/public
+cert_dir  = "cert"                                 # /etc/uping/cert
+pub_key   = "cert/www.rao-nagos.pf/fullchain.pem"  # /etc/uping/cert/...
 ```
 
 This applies to `root`, `pub_key`, `priv_key`, `cert_dir`, `upstream_ca` and
@@ -110,7 +166,7 @@ second and fixed. A server can override the per-domain limits:
 
 ```toml
 [[server]]
-domain = "api.example.com"
+domain = "api.rao-nagos.pf"
 upstream = "127.0.0.1:9000"
 limits = { per_ip_rps = 1220, max_body_bytes = 0 }
 ```
@@ -135,12 +191,12 @@ A server can override the table, and a route inherits then overrides it again:
 
 ```toml
 [[server]]
-domain = "slow.example.com"
+domain = "slow.rao-nagos.pf"
 upstream = "127.0.0.1:8080"
 health = { interval_ms = 10000, timeout_ms = 1500, failures = 3 }
 
 [[server]]
-domain = "no-503.example.com"
+domain = "no-503.rao-nagos.pf"
 upstream = "127.0.0.1:8081"
 health = false          # resolve, but never preemptively answer 503
 ```
@@ -215,14 +271,13 @@ certificate is not trusted, no matter what uping does.
 
 ## `[[server]]` — every shape
 
-`[[server]]` is the only server form. The `[server."domain"]` map form was
-removed; it now fails with an error that says to use `[[server]]` + `domain`.
+`[[server]]` is the only server form.
 
 ### 1. Minimal reverse proxy
 
 ```toml
 [[server]]
-domain   = "www.example.com"
+domain   = "www.rao-nagos.pf"
 upstream = "127.0.0.1:8080"
 ```
 
@@ -233,7 +288,7 @@ upstream = "127.0.0.1:8080"
 
 ```toml
 [[server]]
-domain = "static.example.com"
+domain = "static.rao-nagos.pf"
 root   = "public"            # absolute or relative to config.toml
 index  = "index.html"        # default
 ```
@@ -244,7 +299,7 @@ Exactly one of `upstream` and `root` must be set.
 
 ```toml
 [[server]]
-domain   = "www.example.com"
+domain   = "www.rao-nagos.pf"
 upstream = "127.0.0.1:8080"  # catch-all
 routes = [
   { path = "/mcp", upstream = "127.0.0.1:8081" },
@@ -261,14 +316,13 @@ routes = [
 - The query string is kept; `/assets` becomes `/`.
 - `path = "/"` is rejected: use the server's catch-all.
 
-`routes` is the **only** route form: an array of inline tables. The old
-`[[server.route]]` and `[[server."domain".route]]` forms are gone.
+`routes` is the **only** route form: an array of inline tables.
 
 ### 4. Own HTTPS listener
 
 ```toml
 [[server]]
-domain        = "app.example.com"
+domain        = "app.rao-nagos.pf"
 upstream      = "127.0.0.1:8080"
 https_listen  = "203.0.113.10"          # IPv4, default port = [listen] https
 https_listen6 = "[2001:db8::10]:8443"   # IPv6 with an explicit port
@@ -283,10 +337,10 @@ domain is not answered on the other listeners (`421 Misdirected Request`).
 
 ```toml
 [[server]]
-domain     = "private.example.com"
+domain     = "private.rao-nagos.pf"
 keys       = "manual"
-pub_key    = "cert/private.example.com/fullchain.pem"
-priv_key   = "cert/private.example.com/privkey.pem"
+pub_key    = "cert/private.rao-nagos.pf/fullchain.pem"
+priv_key   = "cert/private.rao-nagos.pf/privkey.pem"
 upstream   = "127.0.0.1:8080"
 serve_http = false
 ```
@@ -299,7 +353,7 @@ port 80; use `keys = "manual"` (or a private ACME CA that can reach :80).
 
 ```toml
 [[server]]
-domain          = "www.example.com"
+domain          = "www.rao-nagos.pf"
 upstream        = "10.0.0.5:8443"
 upstream_tls    = true
 upstream_sni    = "app.internal"          # default: upstream host, or the domain for an IP
@@ -314,7 +368,7 @@ upstream_verify = true                    # false accepts any cert: private nets
 
 ```toml
 [[server]]
-domain   = "api.example.com"
+domain   = "api.rao-nagos.pf"
 upstream = "127.0.0.1:9000"
 limits   = { per_ip_rps = 1220, max_body_bytes = 0 }
 health   = { interval_ms = 10000, failures = 3 }
@@ -324,15 +378,15 @@ health   = { interval_ms = 10000, failures = 3 }
 
 ```toml
 [[server]]
-domain   = "manual.example.com"
+domain   = "manual.rao-nagos.pf"
 keys     = "manual"
-pub_key  = "cert/manual.example.com/fullchain.pem"
-priv_key = "cert/manual.example.com/privkey.pem"
+pub_key  = "cert/manual.rao-nagos.pf/fullchain.pem"
+priv_key = "cert/manual.rao-nagos.pf/privkey.pem"
 upstream = "127.0.0.1:8080"
 ```
 
-Both paths are required. uping reads them at startup and on reload; renew them
-yourself (certbot, step-ca, a paid CA, …) and reload.
+Both paths are required. uping reads them at startup and on `SIGHUP`; renew
+them yourself (certbot, step-ca, a paid CA, …) and send `SIGHUP`.
 
 ### 9. Private site with step-ca
 
@@ -360,26 +414,13 @@ DNS](#private-names-wireguard-and-dns).
 
 ```toml
 [[server]]
-domain   = "www.example.com"
+domain   = "www.rao-nagos.pf"
 keys     = "auto"
 upstream = "127.0.0.1:8080"
 ```
 
 `auto` is already the default without key paths. `pub_key` / `priv_key` may
 optionally override where the pair is written.
-
-### The map form was removed
-
-```toml
-# No longer accepted:
-# [server."legacy.example.com"]
-# upstream = "127.0.0.1:8080"
-
-# Write this instead:
-[[server]]
-domain   = "legacy.example.com"
-upstream = "127.0.0.1:8080"
-```
 
 ### Server, route and stream defaults
 
@@ -496,7 +537,7 @@ choice.
 configured domain and family — for dnsmasq, CoreDNS or `/etc/hosts`:
 
 ```sh
-uping --dns-zone config.toml > /etc/dnsmasq.d/uping.hosts
+/usr/bin/uping --dns-zone /etc/uping/config.toml | sudo tee /etc/dnsmasq.d/uping.hosts
 # dnsmasq.conf: addn-hosts=/etc/dnsmasq.d/uping.hosts
 #                interface=wg0
 #                bind-interfaces
@@ -504,46 +545,6 @@ uping --dns-zone config.toml > /etc/dnsmasq.d/uping.hosts
 
 On the client, `DNS = 10.8.0.1` in the WireGuard config. Public names keep
 resolving through the forwarder; your internal names only exist in the tunnel.
-
-## Reload or restart
-
-```sh
-systemctl --user reload uping     # SIGHUP: config changes, no dropped conn
-systemctl --user restart uping    # a new binary, or a listener/[[stream]] change
-```
-
-A reload applies `[[server]]`, `routes`, upstreams, static roots, indexes,
-limits, health settings, `[tls] fallback_cert`, manual certificates and the
-domain sets of already-bound listeners. A bad config changes nothing. Changing
-`[listen]`, `https_listen`/`https_listen6`, `[[stream]]`, `[acme]` or
-`[acme.internal]` requires a restart.
-
-## Running it as a service
-
-uping runs as an ordinary user. The only privileged thing is binding ports
-below 1024 — `CAP_NET_BIND_SERVICE`, not root:
-
-```sh
-cargo build --release
-sudo setcap 'cap_net_bind_service=+ep' target/release/uping
-mkdir -p ~/.config/systemd/user
-cp uping.service ~/.config/systemd/user/
-systemctl --user daemon-reload
-systemctl --user enable --now uping
-loginctl enable-linger "$USER"
-```
-
-The capability is on the binary and is **lost on every rebuild**; re-apply
-`setcap` after `cargo build --release`.
-
-The unit allows five starts in five minutes, then gives up. That turns a fatal
-error (bad config, a port already taken, a missing manual certificate) into a
-clear `failed` state instead of an endless restart loop. Fix the cause, then:
-
-```sh
-systemctl --user reset-failed uping
-systemctl --user start uping
-```
 
 ## License
 

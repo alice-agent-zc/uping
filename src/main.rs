@@ -1,4 +1,4 @@
-//! uping — a tiny TOML-configured reverse proxy on Cloudflare Pingora.
+//! uping — a tiny TOML-configured reverse proxy.
 //!
 //! v0.3 reads a config, obtains or loads one certificate per domain, serves
 //! HTTPS (SNI) on the global and per-domain listeners, redirects plain HTTP to
@@ -12,7 +12,7 @@ mod config;
 mod health;
 mod limits;
 mod proxy;
-mod reload;
+mod sighup;
 mod static_files;
 mod stream;
 mod tls;
@@ -36,7 +36,7 @@ use crate::config::{Config, GroupKey};
 use crate::health::HealthTracker;
 use crate::limits::{ConnLimiter, RequestLimiter};
 use crate::proxy::{HttpsProxy, RedirectProxy, RouteTable};
-use crate::reload::{Allowed, Reloader};
+use crate::sighup::{Allowed, Reloader};
 use crate::stream::StreamForwarder;
 use crate::tls::SniResolver;
 
@@ -370,7 +370,7 @@ fn main() -> Result<()> {
     )?);
     reloader.spawn().context("starting the reload thread")?;
     health.clone().spawn(live_routes.clone());
-    info!("SIGHUP reloads the config; `systemctl --user reload uping`");
+    info!("SIGHUP applies a new config");
 
     // --- Raw TCP streams (experimental in v0.3) ---
     // One listener per [[stream]]. The upstream is whatever holds the port on
