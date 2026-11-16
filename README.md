@@ -175,6 +175,14 @@ happens before any domain exists.
 `keys = "auto"` uses this profile. It uses **http-01**, so the domain must
 resolve publicly and port 80 must be reachable by the CA.
 
+A failed order never stops uping. DNS not ready, port 80 unreachable, or a CA
+rate limit is logged, the other domains are still tried, and the process starts
+with the certificates it already has. Those missing domains fail the TLS
+handshake until a retry succeeds; the HTTP listener stays up to answer the next
+challenge. A failed startup order is retried after one hour (not seconds), so a
+rejection cannot turn into a restart loop that burns the CA's
+failed-authorization budget.
+
 ### `[acme.internal]` — private ACME CA (step-ca)
 
 ```toml
@@ -521,6 +529,15 @@ loginctl enable-linger "$USER"
 
 The capability is on the binary and is **lost on every rebuild**; re-apply
 `setcap` after `cargo build --release`.
+
+The unit allows five starts in five minutes, then gives up. That turns a fatal
+error (bad config, a port already taken, a missing manual certificate) into a
+clear `failed` state instead of an endless restart loop. Fix the cause, then:
+
+```sh
+systemctl --user reset-failed uping
+systemctl --user start uping
+```
 
 ## License
 

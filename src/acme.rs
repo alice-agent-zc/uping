@@ -15,6 +15,11 @@
 //!   A renewed pair is swapped into the live [`SniResolver`] in place; the
 //!   process does not restart and does not drop a connection.
 //!
+//! A failed order is best effort: it is logged, the other domains are still
+//! tried, and the proxy starts with the certificates it has. The process must
+//! stay up even when the CA refuses a domain — otherwise a systemd restart loop
+//! would burn the CA's failed-authorization rate limit in minutes.
+//!
 //! The account key lives beside the certificates, named after a hash of the
 //! ACME directory URL so production and staging cannot collide. It is written
 //! `0600`, like every private key here.
@@ -127,9 +132,17 @@ impl CertManager {
     /// Request every pending certificate at startup. The HTTP challenge
     /// listener is bound only if there is something to request, and is released
     /// before the caller starts pingora.
-    pub fn obtain_missing(&self, pending: &[Server], http_addrs: &[String]) -> Result<()> {
+    ///
+    /// A failed order is **not** a startup error: it is logged, the remaining
+    /// domains are still tried, and the process starts with the pairs it has.
+    /// The renewal thread retries later. Only a setup failure that also makes
+    /// the run impossible — the temporary `:80` listener cannot bind — is
+    /// returned as `Err`.
+    ///
+    /// Returns `true` when every pending certificate was obtained.
+    pub fn obtain_missing(&self, pending: &[Server], http_addrs: &[String]) -> Result<bool> {
         if pending.is_empty() {
-            return Ok(());
+            return Ok(true);
         }
 
         let runtime = tokio::runtime::Builder::new_current_thread()
@@ -139,13 +152,14 @@ impl CertManager {
 
         runtime.block_on(async {
             let listener = ChallengeServer::bind(http_addrs, self.challenges.clone()).await?;
-            let mut first_error: Option<anyhow::Error> = None;
+            let mut all_obtained = true;
 
             for s in pending {
                 let profile = match self.acme.profile(s.key_mode()) {
                     Ok(profile) => profile,
                     Err(e) => {
                         error!("acme: {}: {e:#}", s.domain);
+                        all_obtained = false;
                         continue;
                     }
                 };
@@ -155,17 +169,12 @@ impl CertManager {
                 );
                 if let Err(e) = self.issue(s).await {
                     error!("acme: {} failed: {e:#}", s.domain);
-                    if first_error.is_none() {
-                        first_error = Some(e);
-                    }
+                    all_obtained = false;
                 }
             }
 
             listener.shutdown().await;
-            match first_error {
-                Some(e) => Err(e),
-                None => Ok(()),
-            }
+            Ok(all_obtained)
         })
     }
 
@@ -211,9 +220,15 @@ impl CertManager {
     /// Start the renewal thread. It checks once an hour; a certificate is only
     /// reissued when it is inside the `renew_before_days` window, so the hourly
     /// wake-up is just a local file read.
+    ///
+    /// `first_check` delays the first pass. It is short after a clean start
+    /// (let pingora bind `:80` before a due certificate is renewed through it)
+    /// and one hour after a failed startup order, so a rejecting or
+    /// rate-limited CA is not hit again immediately.
     pub fn spawn_renewal(
         self: Arc<Self>,
         servers: Arc<std::sync::RwLock<Vec<Server>>>,
+        first_check: Duration,
     ) -> Result<()> {
         std::thread::Builder::new()
             .name("uping-acme".into())
@@ -229,10 +244,10 @@ impl CertManager {
                     }
                 };
 
-                // Let pingora finish binding the HTTP listener before a due
-                // certificate is renewed through it; the first check is not
-                // urgent by a few seconds.
-                std::thread::sleep(Duration::from_secs(30));
+                // A clean start only needs enough time for pingora to bind
+                // `:80`; after a failed startup the CA may be rate-limited, so
+                // wait out the window before trying again.
+                std::thread::sleep(first_check);
 
                 loop {
                     // The reload thread swaps this list in place; snapshot it so

@@ -125,6 +125,14 @@ install it into the live resolver. The startup path binds the HTTP address
 itself (`obtain_missing`); a reload uses the already-running listener
 (`obtain_missing_live`).
 
+Startup issuance is best effort: `obtain_missing` returns whether every order
+succeeded, and a failure is logged rather than returned as an error. Only
+failing to bind the temporary `:80` listener aborts startup. A failed startup
+order delays the renewal thread's first pass by an hour; a clean start checks
+after 30 seconds. This is deliberate: an exited process under systemd would be
+restarted every few seconds and exhaust the failed-authorization rate limit. Do
+not turn an order failure back into a fatal startup error.
+
 Two profiles exist: the public `[acme]` directory and the private
 `[acme.internal]` directory. The account file is hashed by directory URL, so
 public and private CAs never share one. `ca_bundle` is the trust anchor for

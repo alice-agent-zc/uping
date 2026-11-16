@@ -264,9 +264,15 @@ fn main() -> Result<()> {
         .iter()
         .map(|addr| addr.to_string())
         .collect();
-    certs
+    let acme_complete = certs
         .obtain_missing(&pending, &http_addrs)
         .context("preparing TLS certificates")?;
+    if !acme_complete {
+        warn!(
+            "acme: some certificates are still missing; starting without them and \
+             retrying in one hour (those domains fail the TLS handshake until then)"
+        );
+    }
 
     // Shared between the :80 and :443 listeners, so one client cannot use two
     // ports to get two connection budgets.
@@ -335,9 +341,17 @@ fn main() -> Result<()> {
         server.add_service(http_service);
     }
 
+    // A clean start renews a due pair 30s after pingora owns `:80`; a failed
+    // startup order waits an hour, both to let the CA's window pass and to
+    // avoid turning a rejection into a retry storm.
+    let first_renewal_check = if acme_complete {
+        Duration::from_secs(30)
+    } else {
+        Duration::from_secs(60 * 60)
+    };
     certs
         .clone()
-        .spawn_renewal(renewal_servers.clone())
+        .spawn_renewal(renewal_servers.clone(), first_renewal_check)
         .context("starting certificate renewal")?;
 
     let reloader = Arc::new(Reloader::new(
