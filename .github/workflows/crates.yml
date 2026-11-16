@@ -1,6 +1,6 @@
 name: crates
 
-# Publishing is tag-driven, like the publish workflow: a tag names the exact
+# Publishing is tag-driven, like the release workflow: a tag names the exact
 # commit that becomes the crate, so the version on crates.io and the source on
 # GitHub can never drift apart.
 #

@@ -225,7 +225,7 @@ git push origin v0.3.0
 
 Two workflows run on `v*` tags:
 
-- `.github/workflows/publish.yml` — builds the Linux binary, runs the tests,
+- `.github/workflows/release.yml` — builds the Linux binary, runs the tests,
   packages `uping-<target>.tar.gz` + `.sha256`, and creates/updates the GitHub
   release. It uses the built-in `GITHUB_TOKEN`; `permissions: contents: write`
   is already set, so there is no secret to add.
