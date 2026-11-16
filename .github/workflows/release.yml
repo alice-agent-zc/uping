@@ -19,7 +19,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Existing tag to publish (e.g. v0.3.0)"
+        description: "Existing tag to publish (e.g. v0.3.1)"
         required: true
 
 permissions:
@@ -76,7 +76,7 @@ jobs:
           mkdir -p dist
           cp target/"$TARGET"/release/uping dist/uping
           strip dist/uping
-          cp config.toml dist/config.toml.example
+          cp config.toml.example dist/config.toml.example
           cp uping.service dist/uping.service
           # tar -C dist writes the archive beside the workflow's cwd, so the
           # checksum is taken there too.

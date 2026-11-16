@@ -125,6 +125,14 @@ install it into the live resolver. The startup path binds the HTTP address
 itself (`obtain_missing`); a reload uses the already-running listener
 (`obtain_missing_live`).
 
+Startup issuance is best effort: `obtain_missing` returns whether every order
+succeeded, and a failure is logged rather than returned as an error. Only
+failing to bind the temporary `:80` listener aborts startup. A failed startup
+order delays the renewal thread's first pass by an hour; a clean start checks
+after 30 seconds. This is deliberate: an exited process under systemd would be
+restarted every few seconds and exhaust the failed-authorization rate limit. Do
+not turn an order failure back into a fatal startup error.
+
 Two profiles exist: the public `[acme]` directory and the private
 `[acme.internal]` directory. The account file is hashed by directory URL, so
 public and private CAs never share one. `ca_bundle` is the trust anchor for
@@ -219,8 +227,8 @@ Publishing is tag-driven. A tag names the exact commit that becomes the
 release, so the asset and the crate cannot drift from the source:
 
 ```sh
-git tag v0.3.0
-git push origin v0.3.0
+git tag v0.3.1
+git push origin v0.3.1
 ```
 
 Two workflows run on `v*` tags:
@@ -246,5 +254,7 @@ an existing tag. The tag must match `Cargo.toml`'s version.
 - `cargo fmt --all -- --check`, `cargo clippy --all-targets -- -D warnings` and
   `cargo test` are clean.
 - New behaviour comes with a test; keep the diff scoped.
-- Config changes update the README (defaults and examples) and `config.toml`.
+- Config changes update the README (defaults and examples) and
+  `config.toml.example`. `config.toml` itself is git-ignored: it is the local,
+  machine-specific copy.
 - Anything touching `[[stream]]` keeps it labelled experimental.

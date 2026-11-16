@@ -149,6 +149,8 @@ struct State {
     http: SocketAddr,
     verified: bool,
     finalized: bool,
+    /// Refuse `POST /order` with an ACME rate-limit problem.
+    refuse_order: bool,
     key_authorization: Option<String>,
     cert: String,
 }
@@ -162,6 +164,21 @@ struct FakeCa {
 
 impl FakeCa {
     fn start(http: SocketAddr, acceptor: Arc<SslAcceptor>, cert: String) -> Self {
+        Self::start_with(http, acceptor, cert, false)
+    }
+
+    /// A CA that accepts the account but rejects every order, as a
+    /// rate-limited Let's Encrypt would after repeated authorization failures.
+    fn refusing_orders(http: SocketAddr, acceptor: Arc<SslAcceptor>, cert: String) -> Self {
+        Self::start_with(http, acceptor, cert, true)
+    }
+
+    fn start_with(
+        http: SocketAddr,
+        acceptor: Arc<SslAcceptor>,
+        cert: String,
+        refuse_order: bool,
+    ) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
         let addr = listener.local_addr().unwrap();
@@ -169,6 +186,7 @@ impl FakeCa {
             http,
             verified: false,
             finalized: false,
+            refuse_order,
             key_authorization: None,
             cert,
         }));
@@ -235,12 +253,23 @@ fn handle<S: Read + Write>(mut stream: S, addr: &SocketAddr, state: &Arc<Mutex<S
             r#"{"status":"valid"}"#.to_string(),
             Some(format!("{base}/account/1")),
         ),
-        ("POST", "/order") => (
-            201,
-            "application/json",
-            order_json(&base),
-            Some(format!("{base}/order/1")),
-        ),
+        ("POST", "/order") => {
+            if state.lock().unwrap().refuse_order {
+                (
+                    429,
+                    "application/problem+json",
+                    r#"{"type":"urn:ietf:params:acme:error:rateLimited","detail":"too many failed authorizations (5) for \"acme.local\" in the last 1h0m0s","status":429}"#.to_string(),
+                    None,
+                )
+            } else {
+                (
+                    201,
+                    "application/json",
+                    order_json(&base),
+                    Some(format!("{base}/order/1")),
+                )
+            }
+        }
         ("POST", "/authz/1") => {
             let verified = state.lock().unwrap().verified;
             (200, "application/json", authz_json(&base, verified), None)
@@ -401,6 +430,103 @@ fn read_request<S: Read>(stream: &mut S) -> Option<(String, String)> {
 
 fn find_headers_end(buf: &[u8]) -> Option<usize> {
     buf.windows(4).position(|window| window == b"\r\n\r\n")
+}
+
+#[test]
+fn a_rejected_order_does_not_stop_the_process() {
+    let http = free_port();
+    let https = free_port();
+    let http_addr: SocketAddr = format!("127.0.0.1:{http}").parse().unwrap();
+
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("target")
+        .join(format!("acme-fail-e2e-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let (ca_path, chain, key) = tls_material(&dir);
+    let ca = FakeCa::refusing_orders(http_addr, acceptor(&chain, &key), cert_pem());
+
+    let cfg = dir.join("config.toml");
+    std::fs::write(
+        &cfg,
+        format!(
+            "[listen]\nipv4 = \"127.0.0.1\"\nhttp = {http}\nhttps = {https}\n\
+             [acme]\ndirectory = \"https://localhost:{}/directory\"\n\
+             ca_bundle = \"{}\"\nemail = \"ops@acme.local\"\n\
+             [[server]]\ndomain = \"acme.local\"\nupstream = \"127.0.0.1:9\"\n",
+            ca.addr.port(),
+            ca_path.display()
+        ),
+    )
+    .unwrap();
+
+    let log = dir.join("acme.log");
+    let out = std::fs::File::create(&log).unwrap();
+    let err = out.try_clone().unwrap();
+    let child = Command::new(env!("CARGO_BIN_EXE_uping"))
+        .arg(&cfg)
+        .env("RUST_LOG", "info")
+        .stdout(Stdio::from(out))
+        .stderr(Stdio::from(err))
+        .spawn()
+        .expect("spawning the uping binary");
+    let mut server = Server(child);
+
+    // The process must log the failure, then keep running instead of exiting
+    // for systemd to restart. A restart loop is what burns the CA's
+    // failed-authorization budget.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut text = String::new();
+    while Instant::now() < deadline {
+        text = std::fs::read_to_string(&log).unwrap_or_default();
+        if text.contains("some certificates are still missing") {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    assert!(
+        text.contains("some certificates are still missing"),
+        "the rejected order was not reported; log:\n{text}"
+    );
+    assert!(
+        server.0.try_wait().unwrap().is_none(),
+        "uping exited after a rejected order; log:\n{text}"
+    );
+
+    // The HTTP listener is what answers the next http-01 attempt, so it must be
+    // up even though the domain has no certificate yet.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if TcpStream::connect(("127.0.0.1", http)).is_ok() {
+            break;
+        }
+        assert!(
+            server.0.try_wait().unwrap().is_none(),
+            "uping exited before binding :{http}; log:\n{text}"
+        );
+        assert!(
+            Instant::now() < deadline,
+            "HTTP listener never came up; log:\n{text}"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
+
+    let mut stream = TcpStream::connect(("127.0.0.1", http)).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    write!(
+        stream,
+        "GET / HTTP/1.1\r\nHost: acme.local\r\nConnection: close\r\n\r\n"
+    )
+    .unwrap();
+    let mut response = [0u8; 512];
+    let n = stream.read(&mut response).unwrap();
+    let response = String::from_utf8_lossy(&response[..n]);
+    assert!(response.starts_with("HTTP/1.1 301"), "{response}");
+
+    drop(server);
+    let _ = std::fs::remove_dir_all(dir);
 }
 
 #[test]
