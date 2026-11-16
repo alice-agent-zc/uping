@@ -4,7 +4,7 @@ name: crates
 # commit that becomes the crate, so the version on crates.io and the source on
 # GitHub can never drift apart.
 #
-# The `publish` environment (or the repository) must hold a
+# The `crates.io` environment (or the repository) must hold a
 # `CARGO_REGISTRY_TOKEN` secret: a crates.io API token scoped to `uping`.
 # `cargo publish` packages the tracked tree and compiles it once in a scratch
 # directory, so a broken tag fails here instead of publishing something that
@@ -25,7 +25,7 @@ jobs:
   publish:
     runs-on: ubuntu-24.04
     environment:
-      name: publish
+      name: crates.io
       url: https://crates.io/crates/uping
     steps:
       - uses: actions/checkout@v4

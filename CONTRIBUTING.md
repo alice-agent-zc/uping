@@ -231,12 +231,12 @@ Two workflows run on `v*` tags:
   is already set, so there is no secret to add.
 - `.github/workflows/crates.yml` — publishes the crate to crates.io. It needs
   **`CARGO_REGISTRY_TOKEN`**, holding a crates.io API token scoped to `uping`.
-  Put it in the GitHub Environment named **`publish`** (Settings →
-  Environments → publish → Environment secrets), or as a repository secret;
-  both jobs run in that environment, so you can add required reviewers there
-  before anything is published. `cargo publish` compiles the tagged tree in a
-  scratch directory, so a broken tag fails there instead of publishing
-  something that does not build.
+  Put it in the GitHub Environment named **`crates.io`** (Settings →
+  Environments → crates.io → Environment secrets), or as a repository secret.
+  The release workflow does not use that environment; it only needs the
+  built-in token. `cargo publish` compiles the tagged tree in a scratch
+  directory, so a broken tag fails there instead of publishing something that
+  does not build.
 
 Both workflows also expose a `workflow_dispatch` input named `tag` to rebuild
 an existing tag. The tag must match `Cargo.toml`'s version.
