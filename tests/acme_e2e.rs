@@ -421,7 +421,7 @@ fn a_first_start_requests_and_stores_a_certificate() {
     std::fs::write(
         &cfg,
         format!(
-            "[listen]\nhttp = \"127.0.0.1:{http}\"\nhttps = \"127.0.0.1:{https}\"\n\
+            "[listen]\nipv4 = \"127.0.0.1\"\nhttp = {http}\nhttps = {https}\n\
              [acme]\ndirectory = \"https://localhost:{}/directory\"\n\
              ca_bundle = \"{}\"\nemail = \"ops@acme.local\"\n\
              [[server]]\ndomain = \"acme.local\"\nupstream = \"127.0.0.1:9\"\n",

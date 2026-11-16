@@ -1,11 +1,14 @@
 [package]
 name = "uping"
-version = "0.2.1"
+version = "0.3.0"
 edition = "2021"
 description = "A tiny TOML-configured reverse proxy with automatic HTTPS (ACME), static files and raw TCP forwarding, built on Cloudflare Pingora."
 license = "Apache-2.0"
 authors = ["tetuaoro <65575727+tetuaoro@users.noreply.github.com>"]
 repository = "https://github.com/raonagos/uping"
+readme = "README.md"
+keywords = ["reverse-proxy", "tls", "acme", "pingora", "http"]
+categories = ["web-programming::http-server", "network-programming"]
 
 [dependencies]
 pingora = { version = "0.9", features = ["proxy", "openssl", "connection_filter"] }
@@ -19,7 +22,7 @@ http = "1"
 log = "0.4"
 env_logger = "0.11"
 # Already in the tree through pingora; named here for the [[stream]] forwarder.
-tokio = { version = "1", features = ["io-util", "net", "time", "rt", "macros", "fs"] }
+tokio = { version = "1", features = ["io-util", "net", "time", "rt", "macros", "fs", "sync"] }
 # ACME (Let's Encrypt) client for `keys = "auto"`. `ring` keeps the build free
 # of the aws-lc/cmake toolchain that the default feature would pull in.
 instant-acme = { version = "0.8", default-features = false, features = ["ring", "hyper-rustls", "rcgen"] }
@@ -30,3 +33,5 @@ mime_guess = "2"
 # Certificate parsing, key writing and renewal dates. Pingora already links
 # OpenSSL, so this adds no new native dependency.
 openssl = "0.10"
+# SIGHUP -> live config reload (systemctl --user reload).
+signal-hook = "0.3"

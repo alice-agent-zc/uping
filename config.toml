@@ -1,28 +1,45 @@
-# uping v0.2 — example configuration
+# uping v0.3 — example configuration
 #
-# Run:  uping config.toml
-# Check: uping --check config.toml
+# Run:    uping config.toml
+# Check:  uping --check config.toml
+# DNS:    uping --dns-zone config.toml       (hosts records for a VPN resolver)
+# Reload: systemctl --user reload uping     (SIGHUP, no restart)
+# Restart only after installing a new binary, or after changing [listen],
+# a server's https_listen/https_listen6, [acme]/[acme.internal], or [[stream]].
 #
-# Every relative path (certificates, static roots, cert_dir) is resolved from
-# the directory that holds this file.
+# Every path (certificates, static roots, cert_dir, CA bundles) is resolved
+# from the directory that holds this file. An absolute path is used as written,
+# so /srv/www and /etc/uping/cert work exactly as expected.
 
-# Optional. Defaults to 0.0.0.0:80 and 0.0.0.0:443.
-# `*:port` is accepted as shorthand for `0.0.0.0:port`.
-# An IPv6 literal works directly; `ipv6 = true` turns the wildcard into the
-# dual-stack `[::]:port` (and adds [::1]:port beside a 127.0.0.1 listener).
+# Optional. Host-wide listeners. One address per family, one port per protocol.
+# There is no wildcard and no list: a domain that needs another address or port
+# overrides it with `https_listen` / `https_listen6` below.
 # [listen]
-# http  = "*:80"
-# https = "*:443"
-# ipv6  = false
+# ipv4  = "0.0.0.0"                # default
+# ipv6  = "2607:f1c0:f031:4500::1" # omit for no IPv6
+# http  = 80                       # default
+# https = 443                      # default
 
-# Optional. Let's Encrypt, used by keys = "auto".
+# Optional. The public ACME CA, used by keys = "auto".
 # [acme]
 # email             = "ops@example.com"
-# staging           = false
-# cert_dir          = "cert"        # <this file's directory>/cert/<domain>/
-# renew_before_days = 30            # clamped to 1..=89
-# directory         = ""            # another ACME directory URL
-# ca_bundle         = ""            # PEM root for a private ACME CA
+# staging           = false        # Let's Encrypt staging: untrusted test certs
+# cert_dir          = "cert"       # <this file's directory>/cert/<domain>/
+# renew_before_days = 30           # clamped to 1..=89
+# directory         = ""           # another public ACME directory URL
+# ca_bundle         = ""           # PEM root for the ACME server; empty = system roots
+
+# Optional. A private ACME CA, selected by keys = "internal" (alias "step-ca").
+# step-ca speaks ACME, so its provisioner directory is all uping needs. The
+# certificate is for the domain, not the IP: the A record may point to 10.8.0.1.
+# The client must trust the step-ca ROOT (installed once per client); uping
+# cannot push it. `ca_bundle` below only lets uping trust the ACME API itself.
+# [acme.internal]
+# directory = "https://step-ca.internal/acme/acme/directory"
+# ca_bundle = "certs/step-ca-root.pem"
+#
+# keys = "internal" still uses http-01: step-ca must resolve the name (internal
+# DNS) and reach the host on port 80. If it cannot, use keys = "manual".
 
 # Optional. Abuse protection, counted per client IP over a 1-second window.
 # Set any of them to 0 to switch that limit off.
@@ -31,14 +48,54 @@
 # per_ip_conns_per_sec = 100       # new TCP connections/sec per IP, then dropped
 # max_body_bytes      = 10485760   # 10 MiB, then 413
 
-# Optional. TLS behaviour.
+# Optional. TLS behaviour. `fallback_cert` is listener-wide: it answers a
+# missing/unknown SNI before a domain exists, so it cannot be set per server.
 # [tls]
 # fallback_cert = true             # serve the first cert when SNI is absent/unknown
+
+# Optional. Upstream liveness. A backend is marked down after `failures`
+# consecutive failed probes and answered with 503 until it returns.
+# interval_ms = 0 disables the active probe (the address is still resolved).
+# [health]
+# interval_ms = 5000
+# timeout_ms  = 2000
+# failures    = 2
 
 [[server]]
 domain   = "www.example.com"
 keys     = "auto"                 # default when no pub_key/priv_key are given
 upstream = "127.0.0.1:8080"       # catch-all: every path without its own route
+
+# Optional. Per-domain overrides of [limits] and [health]. Every omitted field
+# keeps the global value. `per_ip_conns_per_sec` is host-wide and cannot be set
+# here: it runs at TCP accept, before the Host header is known.
+# limits = { per_ip_rps = 1220, max_body_bytes = 0 }
+# health = { interval_ms = 10000, failures = 3 }
+# health = false                  # keep resolving, but never 503 this backend
+
+# Optional. Give this domain its own HTTPS listener instead of the global one.
+# `https_listen` is IPv4, `https_listen6` is IPv6; each may carry a port, which
+# defaults to `[listen] https`. HTTP stays host-wide: it is the redirect and the
+# ACME challenge listener, unless `serve_http = false` removes this domain from
+# port 80.
+# https_listen  = "203.0.113.10"
+# https_listen6 = "[2001:db8::10]:8443"
+# serve_http    = false           # no :80 vhost (private/VPN site; needs manual keys)
+
+# Optional. Speak HTTPS to the backend instead of plain HTTP.
+# upstream_tls    = true
+# upstream_sni    = "app.internal"       # default: the upstream host, or this domain for an IP
+# upstream_verify = true                 # false accepts any certificate: private nets only
+# upstream_ca     = "certs/internal-ca.pem"   # replaces the system roots
+
+# Optional. One target per path prefix. The longest prefix wins, and a prefix
+# only matches whole segments: /mcp covers /mcp and /mcp/sse, not /mcpx.
+# `routes` is the ONLY route form: an array of inline tables inside the server.
+# strip_prefix: /assets/app.css -> public/assets/app.css.
+# routes = [
+#   { path = "/mcp", upstream = "127.0.0.1:8081" },
+#   { path = "/assets", root = "public/assets", strip_prefix = true },
+# ]
 
 # A static site: no backend, just files. Exactly one of upstream/root.
 #
@@ -57,32 +114,27 @@ upstream = "127.0.0.1:8080"       # catch-all: every path without its own route
 # priv_key = "cert/manual.example.com/privkey.pem"
 # upstream = "127.0.0.1:8080"
 
-# Optional. One target per path prefix. The longest prefix wins, and a prefix
-# only matches whole segments: /mcp covers /mcp and /mcp/sse, not /mcpx.
+# A private site on a VPN address, with a certificate from an internal ACME CA.
+# keys = "internal" still uses http-01, so the CA must reach this domain on
+# port 80. If it cannot, issue the pair out of band and use keys = "manual".
 #
-# [[server.route]]
-# path     = "/mcp"
-# upstream = "127.0.0.1:8081"
-#
-# [[server.route]]
-# path         = "/assets"
-# root         = "public/assets"
-# strip_prefix = true            # /assets/app.css -> public/assets/app.css
+# [[server]]
+# domain        = "app.vpn.example"
+# keys          = "internal"
+# upstream      = "127.0.0.1:8080"
+# https_listen  = "10.8.0.1"      # the wg0 address
+# limits        = { per_ip_rps = 50 }
+# health        = { interval_ms = 15000 }
 
-# Optional. One route for several domains at once. `hosts` empty (or ["*"])
-# means every [[server]]; a named list must match configured domains.
-# On an identical path the domain's own [[server.route]] wins.
-#
-# [[route]]
-# path     = "/mcp"
-# upstream = "127.0.0.1:8081"
-# hosts    = ["www.example.com", "api.example.com"]   # optional
+# The map form `[server."domain"]` was removed. Always use [[server]] with
+# domain = "..." and the inline `routes` array.
 
-# EXPERIMENTAL in v0.2. Raw TCP forwarding: one listener per entry, no TLS
-# termination. `listen` accepts `*:port`; an `upstream` must name a real peer.
+# EXPERIMENTAL in v0.3. Raw TCP forwarding: one listener per entry, no TLS
+# termination. `listen` is one concrete `IP:port`; an `upstream` must name a
+# real peer.
 #
 # [[stream]]
 # name     = "smtp"
-# listen   = "*:25"
+# listen   = "0.0.0.0:25"
 # upstream = "127.0.0.1:10025"
 # connect_timeout_ms = 5000      # optional, default 5000, clamped 100..30000

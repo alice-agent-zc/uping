@@ -216,10 +216,10 @@ fn a_dead_upstream_releases_the_client_with_one_log_line() {
     let _ = std::fs::remove_file(&log);
 }
 
-/// `listen = "*:port"` must bind every interface, and the log must name the
+/// `listen = "0.0.0.0:port"` binds every interface, and the log names the
 /// address that was actually bound — the two come from the same string.
 #[test]
-fn a_wildcard_listen_binds_every_interface() {
+fn an_explicit_0000_listen_binds_every_interface() {
     let echo = TcpListener::bind("127.0.0.1:0").unwrap();
     let echo_addr = echo.local_addr().unwrap();
     let upstream = echo_with_drain(echo);
@@ -228,16 +228,16 @@ fn a_wildcard_listen_binds_every_interface() {
     let front_port = front.local_addr().unwrap().port();
     drop(front);
 
-    let cfg_path = temp_path("wildcard.toml");
+    let cfg_path = temp_path("all-interfaces.toml");
     std::fs::write(
         &cfg_path,
         format!(
-            "[[stream]]\nname = \"star\"\nlisten = \"*:{front_port}\"\nupstream = \"{echo_addr}\"\n\
+            "[[stream]]\nname = \"all\"\nlisten = \"0.0.0.0:{front_port}\"\nupstream = \"{echo_addr}\"\n\
              connect_timeout_ms = 2000\n"
         ),
     )
     .unwrap();
-    let log = temp_path("wildcard.log");
+    let log = temp_path("all-interfaces.log");
 
     let _server = start(&cfg_path, &log);
 
@@ -245,14 +245,14 @@ fn a_wildcard_listen_binds_every_interface() {
     let expected = format!("listening on 0.0.0.0:{front_port}");
     assert!(
         text.contains(&expected),
-        "the wildcard must be logged as the address bound (`{expected}`):\n{text}"
+        "the bound address must be logged (`{expected}`):\n{text}"
     );
 
     let mut c = client(SocketAddr::from(([127, 0, 0, 1], front_port)));
-    c.write_all(b"wildcard").unwrap();
-    let mut back = [0u8; 8];
+    c.write_all(b"all-interfaces").unwrap();
+    let mut back = [0u8; 14];
     c.read_exact(&mut back).unwrap();
-    assert_eq!(&back, b"wildcard");
+    assert_eq!(&back, b"all-interfaces");
 
     // Close the client first: the echo thread only returns on EOF.
     drop(c);

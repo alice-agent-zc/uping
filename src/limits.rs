@@ -20,7 +20,10 @@
 //! trade-off Pingora's own rate-limiting example makes, and it is fine for
 //! stopping a flood.
 
+use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::RwLock;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -32,55 +35,95 @@ use pingora_limits::rate::Rate;
 const WINDOW: Duration = Duration::from_secs(1);
 
 /// Per-IP HTTP request limiter. A budget of `0` disables it.
+///
+/// One counter table per domain: a busy high-limit domain must not spend a
+/// quiet low-limit domain's budget. The map is keyed by the domains in the
+/// config, so its size is bounded by the config, not by client traffic.
 pub struct RequestLimiter {
-    rate: Rate,
-    max_per_window: usize,
+    rates: RwLock<HashMap<String, Rate>>,
+    max_per_window: AtomicUsize,
 }
 
 impl RequestLimiter {
     pub fn new(max_per_window: usize) -> Self {
         Self {
-            rate: Rate::new(WINDOW),
-            max_per_window,
+            rates: RwLock::new(HashMap::new()),
+            max_per_window: AtomicUsize::new(max_per_window),
         }
     }
 
-    /// Count this request and report whether it is within budget.
+    /// Count this request against the configured budget. Test-only: the proxy
+    /// always uses `check_with` so a domain can carry its own ceiling.
+    #[cfg(test)]
     pub fn check(&self, ip: &IpAddr) -> bool {
-        if self.max_per_window == 0 {
+        self.check_with("", ip, self.budget())
+    }
+
+    /// Count this request against one domain's budget. An empty `domain` is the
+    /// shared bucket for unknown Host headers.
+    pub fn check_with(&self, domain: &str, ip: &IpAddr, budget: usize) -> bool {
+        if budget == 0 {
             return true;
         }
-        let seen = self.rate.observe(ip, 1);
-        seen <= self.max_per_window as isize
+        if let Some(rate) = self
+            .rates
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(domain)
+        {
+            return rate.observe(ip, 1) <= budget as isize;
+        }
+        let mut rates = self.rates.write().unwrap_or_else(|e| e.into_inner());
+        let rate = rates
+            .entry(domain.to_string())
+            .or_insert_with(|| Rate::new(WINDOW));
+        rate.observe(ip, 1) <= budget as isize
     }
 
     /// The configured budget, for logging.
     pub fn budget(&self) -> usize {
-        self.max_per_window
+        self.max_per_window.load(Ordering::Relaxed)
+    }
+
+    /// Apply a new budget after a config reload. The counters are kept: a reload
+    /// must not hand a flooding client a fresh window.
+    pub fn set_budget(&self, max_per_window: usize) {
+        self.max_per_window.store(max_per_window, Ordering::Relaxed);
     }
 }
 
 /// Per-IP TCP connection limiter, applied before the TLS handshake.
 pub struct ConnLimiter {
     rate: Rate,
-    max_per_window: usize,
+    max_per_window: AtomicUsize,
 }
 
 impl ConnLimiter {
     pub fn new(max_per_window: usize) -> Self {
         Self {
             rate: Rate::new(WINDOW),
-            max_per_window,
+            max_per_window: AtomicUsize::new(max_per_window),
         }
     }
 
     /// Count this connection and report whether it is within budget.
     fn allow(&self, ip: &IpAddr) -> bool {
-        if self.max_per_window == 0 {
+        let budget = self.max_per_window.load(Ordering::Relaxed);
+        if budget == 0 {
             return true;
         }
         let seen = self.rate.observe(ip, 1);
-        seen <= self.max_per_window as isize
+        seen <= budget as isize
+    }
+
+    /// The current budget, for logging.
+    pub fn budget(&self) -> usize {
+        self.max_per_window.load(Ordering::Relaxed)
+    }
+
+    /// Apply a new budget after a config reload.
+    pub fn set_budget(&self, max_per_window: usize) {
+        self.max_per_window.store(max_per_window, Ordering::Relaxed);
     }
 }
 
@@ -88,7 +131,7 @@ impl ConnLimiter {
 impl std::fmt::Debug for ConnLimiter {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ConnLimiter")
-            .field("max_per_window", &self.max_per_window)
+            .field("max_per_window", &self.budget())
             .finish()
     }
 }
@@ -106,7 +149,7 @@ impl ConnectionFilter for ConnLimiter {
             debug!(
                 "dropping connection from {} (over {} conn/s)",
                 addr.ip(),
-                self.max_per_window
+                self.budget()
             );
         }
         allowed

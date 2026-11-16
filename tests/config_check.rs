@@ -10,11 +10,9 @@
 //! policy blocks it) and never `/dev/null`. `target/` is disposable; every run
 //! rewrites its own fixtures.
 //!
-//! One case is deliberately absent because today's behaviour is a design
-//! decision rather than a bug: two `[[server]]` with the same `domain` ("last
-//! wins", asserted by `later_entries_win_on_duplicate_domains` in `src/main.rs`).
-//! Unknown fields are now refused by `deny_unknown_fields`, so a typo cannot
-//! silently become a default.
+//! Unknown fields are refused by `deny_unknown_fields`, so a typo cannot
+//! silently become a default, and two `[[server]]` entries may not share a
+//! domain: the config loader refuses the duplicate instead of picking one.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -156,6 +154,10 @@ fn server(domain: &str, upstream: &str) -> String {
     )
 }
 
+fn server_with_routes(domain: &str, upstream: &str, routes: &str) -> String {
+    format!("{}routes = [{routes}]\n", server(domain, upstream))
+}
+
 // ---------------------------------------------------------------------------
 // The upstream must name one dialable peer.
 // ---------------------------------------------------------------------------
@@ -246,7 +248,7 @@ fn two_streams_on_one_port_are_refused() {
     assert_refused(
         "stream-duplicate-listen.toml",
         "[[stream]]\nname = \"a\"\nlisten = \"0.0.0.0:2525\"\nupstream = \"127.0.0.1:10025\"\n\
-         \n[[stream]]\nname = \"b\"\nlisten = \"*:2525\"\nupstream = \"127.0.0.1:10026\"\n",
+         \n[[stream]]\nname = \"b\"\nlisten = \"0.0.0.0:2525\"\nupstream = \"127.0.0.1:10026\"\n",
         "clashes with [[stream]]",
     );
 }
@@ -279,15 +281,48 @@ fn an_empty_file_is_refused() {
 }
 
 #[test]
-fn two_global_routes_that_overlap_in_hosts_are_refused() {
+fn a_global_route_is_refused() {
+    // `[[route]]` with a `hosts` list was ambiguous: nothing tied the route to
+    // the server it belonged to. Routes now live only under a server.
     let (cert, key) = cert_pair();
     let body = format!(
         "\n[[server]]\ndomain = \"a.example\"\npub_key = \"{cert}\"\npriv_key = \"{key}\"\nupstream = \"127.0.0.1:8080\"\n\
-         \n[[server]]\ndomain = \"b.example\"\npub_key = \"{cert}\"\npriv_key = \"{key}\"\nupstream = \"127.0.0.1:8090\"\n\
-         \n[[route]]\npath = \"/api\"\nupstream = \"127.0.0.1:9001\"\nhosts = [\"a.example\"]\n\
-         \n[[route]]\npath = \"/api\"\nupstream = \"127.0.0.1:9002\"\n",
+         \n[[route]]\npath = \"/api\"\nupstream = \"127.0.0.1:9001\"\nhosts = [\"a.example\"]\n",
     );
-    assert_refused("global-overlap.toml", &body, "overlap");
+    assert_refused("global-route.toml", &body, "unknown field `route`");
+}
+
+/// An upstream CA is parsed by `--check`, not at the first request.
+#[test]
+fn an_upstream_ca_that_is_not_a_certificate_is_refused() {
+    let (_, key) = cert_pair();
+    let junk = fixtures().join("junk-upstream-ca.pem");
+    std::fs::write(&junk, b"-----BEGIN CERTIFICATE-----\nnot base64\n").unwrap();
+    let body = format!(
+        "\n[[server]]\ndomain = \"secure.local\"\nupstream = \"127.0.0.1:8443\"\n\
+         upstream_tls = true\nupstream_ca = \"{}\"\n",
+        junk.display()
+    );
+    let _ = key;
+    assert_refused("upstream-ca-junk.toml", &body, "parsing `upstream_ca`");
+}
+
+/// Upstream TLS is meaningless without an upstream to speak to.
+#[test]
+fn upstream_tls_with_a_root_is_refused() {
+    let (cert, key) = cert_pair();
+    let root = fixtures().join("static-root");
+    std::fs::create_dir_all(&root).unwrap();
+    let body = format!(
+        "\n[[server]]\ndomain = \"static.local\"\npub_key = \"{cert}\"\npriv_key = \"{key}\"\n\
+         root = \"{}\"\nupstream_tls = true\n",
+        root.display()
+    );
+    assert_refused(
+        "upstream-tls-static.toml",
+        &body,
+        "need an `upstream`, not a `root`",
+    );
 }
 
 /// The failure only the flag can catch: a config that parses but whose
@@ -334,16 +369,15 @@ fn an_auto_server_without_a_certificate_is_accepted_by_check() {
     );
 }
 
-/// The exact shape that died on 2026-10-25: `[[stream]] listen = "*:443"`.
+/// A stream is an ordinary concrete socket, with no `[listen]` involved.
 ///
-/// No `[[server]]` here, so nothing terminates TLS and the shorthand is the only
-/// thing under test. `--check` binds nothing, so the privileged port is not a
-/// failure — only the serving path warns about `CAP_NET_BIND_SERVICE`.
+/// `--check` binds nothing, so the privileged port is not a failure — only the
+/// serving path warns about `CAP_NET_BIND_SERVICE`.
 #[test]
-fn a_wildcard_stream_listen_is_accepted() {
+fn an_explicit_stream_listen_is_accepted() {
     let ok = assert_accepted(
-        "good-wildcard-stream.toml",
-        "[[stream]]\nname = \"https-pipe\"\nlisten = \"*:443\"\nupstream = \"127.0.0.1:10443\"\n",
+        "good-stream.toml",
+        "[[stream]]\nname = \"https-pipe\"\nlisten = \"0.0.0.0:443\"\nupstream = \"127.0.0.1:10443\"\n",
     );
     assert!(
         ok.starts_with("ok: 0 [[server]], 1 [[stream]], 0 route(s)"),
@@ -351,16 +385,51 @@ fn a_wildcard_stream_listen_is_accepted() {
     );
 }
 
+/// The wildcard was removed on purpose; the error must say what to write.
+#[test]
+fn a_wildcard_stream_listen_is_refused() {
+    assert_refused(
+        "stream-wildcard.toml",
+        "[[stream]]\nlisten = \"*:443\"\nupstream = \"127.0.0.1:10443\"\n",
+        "wildcard was removed",
+    );
+}
+
+/// The map server form was removed; the error must say what to write.
+#[test]
+fn the_map_server_form_is_refused() {
+    let body = "[server.\"map.local\"]\nupstream = \"127.0.0.1:8080\"\n";
+    let path = write("map-form.toml", body);
+    let out = check(&path);
+
+    assert_ne!(out.status.code(), Some(0), "stdout: {}", stdout(&out));
+    assert!(
+        stderr(&out).contains("map form was removed"),
+        "stderr: {}",
+        stderr(&out)
+    );
+}
+
 /// A config a real operator would write, path first and `--check` last.
 #[test]
 fn a_realistic_three_server_config_is_accepted() {
+    // Each route is nested under the server it belongs to; there is no shared
+    // route table where a route could apply to the wrong domain.
     let body = format!(
-        "[listen]\nhttp  = \"*:80\"\nhttps = \"*:443\"\n{}{}{}\
-         \n[[server.route]]\npath = \"/mcp\"\nupstream = \"127.0.0.1:8081\"\n\
-         \n[[route]]\npath = \"/api\"\nupstream = \"127.0.0.1:9001\"\nhosts = [\"b.example\"]\n\
+        "[listen]\nipv4 = \"0.0.0.0\"\nhttp = 80\nhttps = 443\n{}\
+         {}\
+         {}\
          \n[[stream]]\nname = \"smtp\"\nlisten = \"0.0.0.0:2525\"\nupstream = \"127.0.0.1:10025\"\n",
-        server("a.example", "127.0.0.1:8080"),
-        server("b.example", "127.0.0.1:8090"),
+        server_with_routes(
+            "a.example",
+            "127.0.0.1:8080",
+            r#"{ path = "/mcp", upstream = "127.0.0.1:8081" }"#,
+        ),
+        server_with_routes(
+            "b.example",
+            "127.0.0.1:8090",
+            r#"{ path = "/api", upstream = "127.0.0.1:9001" }"#,
+        ),
         server("c.example", "127.0.0.1:8095"),
     );
     let path = write("good-three-servers.toml", &body);

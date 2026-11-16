@@ -1,0 +1,59 @@
+name: crates
+
+# Publishing is tag-driven, like the release workflow: a tag names the exact
+# commit that becomes the crate, so the version on crates.io and the source on
+# GitHub can never drift apart.
+#
+# The `crates.io` environment (or the repository) must hold a
+# `CARGO_REGISTRY_TOKEN` secret: a crates.io API token scoped to `uping`.
+# `cargo publish` packages the tracked tree and compiles it once in a scratch
+# directory, so a broken tag fails here instead of publishing something that
+# does not build.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to publish (e.g. v0.3.0)"
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-24.04
+    environment:
+      name: crates.io
+      url: https://crates.io/crates/uping
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+          fetch-depth: 0
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      # pingora builds zlib-ng through cmake and links OpenSSL.
+      - name: build deps
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends \
+            cmake pkg-config libssl-dev
+
+      - name: the tag matches Cargo.toml
+        run: |
+          version="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')"
+          if [ "v$version" != "${GITHUB_REF_NAME}" ]; then
+            echo "tag ${GITHUB_REF_NAME} does not match Cargo.toml version v$version" >&2
+            exit 1
+          fi
+
+      - name: tests
+        run: cargo test --locked
+
+      - name: publish
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: cargo publish --locked

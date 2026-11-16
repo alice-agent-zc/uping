@@ -1,19 +1,31 @@
 //! The two `ProxyHttp` implementations that make up uping.
 
-use std::collections::HashMap;
-use std::sync::Arc;
+use std::collections::{HashMap, HashSet};
+use std::net::IpAddr;
+use std::path::Path;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, RwLock};
+use std::time::Duration;
 
+use anyhow::Context;
 use async_trait::async_trait;
 use bytes::Bytes;
 use log::{debug, error, warn};
 use pingora::http::{RequestHeader, ResponseHeader};
+use pingora::protocols::tls::CaType;
 use pingora::proxy::{ProxyHttp, Session};
 use pingora::upstreams::peer::HttpPeer;
 use pingora::{Error, ErrorType, Result};
 
 use crate::acme::{ChallengeStore, CHALLENGE_PREFIX};
+use crate::config::{EffectiveHealth, Limits, UpstreamTls};
+use crate::health::HealthTracker;
 use crate::limits::RequestLimiter;
 use crate::static_files::{self, StaticSite};
+
+/// How long an idle HTTP/1.1 connection is kept for the next request.
+/// Pingora has no global default for this; 75 s matches nginx's default.
+const KEEPALIVE_TIMEOUT_SECS: u64 = 75;
 
 /// Lowercase a `host[:port]` value, dropping any port suffix.
 ///
@@ -26,7 +38,9 @@ fn normalize_host(raw: &str) -> String {
     } else {
         raw.split(':').next().unwrap_or(raw)
     };
-    host.to_ascii_lowercase()
+    // `example.com.` is the same name as `example.com`; a trailing dot in a
+    // Host header must not turn into a 404 (or a route mismatch).
+    host.trim_end_matches('.').to_ascii_lowercase()
 }
 
 /// Pick the effective hostname: the `Host` header wins, the request URI
@@ -106,24 +120,175 @@ fn rewrite_path_and_query(path: &str, query: Option<&str>, prefix: &str) -> Stri
     }
 }
 
+/// One HTTP backend. Shared behind an `Arc`, so a request clone is an atomic
+/// increment rather than a string copy.
+pub struct Upstream {
+    /// The configured `host:port`, as written.
+    pub address: Arc<str>,
+    /// Speak HTTPS to the backend.
+    pub tls: bool,
+    /// SNI sent in the upstream handshake (also the name verified).
+    pub sni: Arc<str>,
+    /// Verify the backend certificate.
+    pub verify: bool,
+    /// Roots for that verification; `None` uses the system store.
+    pub ca: Option<Arc<CaType>>,
+    /// Probe the backend and answer `503` when it is down. `false` makes the
+    /// registry resolve the address but never reject the request.
+    pub health: bool,
+    /// Run the active TCP/TLS probe. `false` keeps only the resolver refresh.
+    pub active_probe: bool,
+    /// How often this backend is probed (or its DNS refreshed).
+    pub health_interval: Duration,
+    pub health_timeout: Duration,
+    pub health_failures: usize,
+    /// Pre-built OpenSSL connector for the health probe. `None` means plain TCP.
+    pub probe: Option<Arc<openssl::ssl::SslConnector>>,
+    /// Identity used by the health registry (address + TLS settings).
+    key: Arc<str>,
+}
+
+impl std::fmt::Debug for Upstream {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Upstream")
+            .field("address", &self.address)
+            .field("tls", &self.tls)
+            .field("sni", &self.sni)
+            .field("verify", &self.verify)
+            .finish()
+    }
+}
+
+impl Upstream {
+    pub fn key(&self) -> &Arc<str> {
+        &self.key
+    }
+}
+
+/// The parts of a server/route that describe its backend.
+pub struct UpstreamSpec<'a> {
+    pub address: &'a str,
+    pub tls: UpstreamTls<'a>,
+    /// Used as the SNI when the backend is an IP literal and no `upstream_sni`
+    /// is written: a loopback backend usually serves the public certificate.
+    pub default_sni: &'a str,
+    /// The effective `[health]` settings for this backend.
+    pub health: EffectiveHealth,
+}
+
+impl Upstream {
+    fn from_config(spec: &UpstreamSpec<'_>, root_dir: &Path) -> anyhow::Result<Self> {
+        let address = spec.address.trim();
+        let tls = spec.tls;
+        let health = spec.health;
+        let host = host_of(address);
+        let sni = if !tls.sni.trim().is_empty() {
+            tls.sni.trim().to_string()
+        } else if host.parse::<IpAddr>().is_ok() {
+            spec.default_sni.trim().to_string()
+        } else {
+            host.to_string()
+        };
+
+        let path = if tls.ca.trim().is_empty() {
+            None
+        } else if Path::new(tls.ca.trim()).is_absolute() {
+            Some(std::path::PathBuf::from(tls.ca.trim()))
+        } else {
+            Some(root_dir.join(tls.ca.trim()))
+        };
+
+        let ca = match &path {
+            None => None,
+            Some(path) => {
+                let pem = std::fs::read(path)
+                    .with_context(|| format!("reading `upstream_ca` `{}`", path.display()))?;
+                let certs = openssl::x509::X509::stack_from_pem(&pem)
+                    .with_context(|| format!("parsing `upstream_ca` `{}`", path.display()))?;
+                if certs.is_empty() {
+                    anyhow::bail!("`upstream_ca` `{}` holds no certificate", path.display());
+                }
+                Some(std::sync::Arc::new(certs.into_boxed_slice()))
+            }
+        };
+
+        let probe = if tls.tls {
+            let mut builder = openssl::ssl::SslConnector::builder(openssl::ssl::SslMethod::tls())
+                .context("building the upstream TLS probe")?;
+            if !tls.verify {
+                builder.set_verify(openssl::ssl::SslVerifyMode::NONE);
+            } else if let Some(path) = &path {
+                builder
+                    .set_ca_file(path)
+                    .with_context(|| format!("loading `upstream_ca` `{}`", path.display()))?;
+            }
+            Some(std::sync::Arc::new(builder.build()))
+        } else {
+            None
+        };
+
+        let active_probe = health.gate && health.interval_ms != 0;
+        let key = format!(
+            "{address}|tls={}|sni={sni}|verify={}|gate={}|interval={}|timeout={}|failures={}",
+            tls.tls,
+            tls.verify,
+            health.gate,
+            health.interval_ms,
+            health.timeout_ms,
+            health.failures
+        );
+        let refresh_ms = if active_probe {
+            health.interval_ms
+        } else {
+            60_000
+        };
+        Ok(Self {
+            address: std::sync::Arc::from(address),
+            tls: tls.tls,
+            sni: std::sync::Arc::from(sni.as_str()),
+            verify: tls.verify,
+            ca,
+            probe,
+            health: health.gate,
+            active_probe,
+            health_interval: Duration::from_millis(refresh_ms),
+            health_timeout: Duration::from_millis(health.timeout_ms),
+            health_failures: health.failures,
+            key: std::sync::Arc::from(key.as_str()),
+        })
+    }
+}
+
+/// The host part of a `host:port` or `[v6]:port` string.
+fn host_of(address: &str) -> &str {
+    if let Some(rest) = address.strip_prefix('[') {
+        return rest.split(']').next().unwrap_or(rest);
+    }
+    address
+        .rsplit_once(':')
+        .map(|(host, _)| host)
+        .unwrap_or(address)
+}
+
 /// Where one request goes.
 #[derive(Debug, Clone)]
 pub enum Target {
-    /// Forward it to a `host:port` upstream.
-    Proxy(String),
+    /// Forward it to an HTTP(S) backend.
+    Proxy(std::sync::Arc<Upstream>),
     /// Serve it from a directory on this host.
     Static(StaticSite),
 }
 
 impl Target {
     pub fn from_config(
-        upstream: &str,
+        spec: &UpstreamSpec<'_>,
         root: &str,
         index: &str,
         root_dir: &std::path::Path,
     ) -> anyhow::Result<Self> {
-        if !upstream.trim().is_empty() {
-            return Ok(Target::Proxy(upstream.trim().to_string()));
+        if !spec.address.trim().is_empty() {
+            return Upstream::from_config(spec, root_dir)
+                .map(|u| Target::Proxy(std::sync::Arc::new(u)));
         }
         let path = if std::path::Path::new(root.trim()).is_absolute() {
             std::path::PathBuf::from(root.trim())
@@ -146,11 +311,19 @@ pub struct PathRoute {
 impl PathRoute {
     pub fn from_config(
         route: &crate::config::Route,
+        domain: &str,
         root_dir: &std::path::Path,
+        inherited: EffectiveHealth,
     ) -> anyhow::Result<Self> {
+        let spec = UpstreamSpec {
+            address: &route.upstream,
+            tls: route.upstream_tls(),
+            default_sni: domain,
+            health: route.health.resolve(inherited),
+        };
         Ok(Self {
             prefix: route.prefix().to_string(),
-            target: Target::from_config(&route.upstream, &route.root, &route.index, root_dir)?,
+            target: Target::from_config(&spec, &route.root, &route.index, root_dir)?,
             strip_prefix: route.strip_prefix,
         })
     }
@@ -165,19 +338,38 @@ pub struct Resolved<'a> {
 }
 
 /// The routes of one domain: a catch-all target plus optional path routes,
-/// longest prefix first.
+/// longest prefix first, and the limits that apply to this domain.
 #[derive(Debug)]
 pub struct SiteRoutes {
     catch_all: Target,
     routes: Vec<PathRoute>,
+    pub limits: Limits,
 }
 
 impl SiteRoutes {
+    #[cfg(test)]
     pub fn new(catch_all: Target, routes: impl IntoIterator<Item = PathRoute>) -> Self {
+        Self::with_limits(catch_all, routes, Limits::default())
+    }
+
+    pub fn with_limits(
+        catch_all: Target,
+        routes: impl IntoIterator<Item = PathRoute>,
+        limits: Limits,
+    ) -> Self {
         let mut routes: Vec<PathRoute> = routes.into_iter().collect();
         // Longest first: `/assets/` is looked at before `/`.
         routes.sort_by_key(|r| std::cmp::Reverse(r.prefix.len()));
-        Self { catch_all, routes }
+        Self {
+            catch_all,
+            routes,
+            limits,
+        }
+    }
+
+    /// Every target this domain can reach, catch-all included.
+    pub fn targets(&self) -> impl Iterator<Item = &Target> {
+        std::iter::once(&self.catch_all).chain(self.routes.iter().map(|r| &r.target))
     }
 
     /// Pick the route for `path`. Always succeeds: the catch-all is the floor.
@@ -208,6 +400,38 @@ impl RouteTable {
         Self { sites }
     }
 
+    /// Build the table from a validated config. The config loader has already
+    /// checked every target; this second pass canonicalises static roots and is
+    /// the only place a reload can fail after `Config::load`.
+    pub fn from_config(cfg: &crate::config::Config) -> anyhow::Result<Self> {
+        let mut sites = HashMap::new();
+        for s in &cfg.servers {
+            let health = cfg.health_for(s);
+            let spec = UpstreamSpec {
+                address: &s.upstream,
+                tls: s.upstream_tls(),
+                default_sni: &s.domain,
+                health,
+            };
+            let catch_all = Target::from_config(&spec, &s.root, &s.index, &cfg.root_dir)
+                .with_context(|| format!("building the catch-all for `{}`", s.domain))?;
+            let mut routes = Vec::new();
+            for r in &s.routes {
+                routes.push(
+                    PathRoute::from_config(r, &s.domain, &cfg.root_dir, health).with_context(
+                        || format!("building route `{}` for `{}`", r.path, s.domain),
+                    )?,
+                );
+            }
+            let limits = cfg.limits_for(s);
+            sites.insert(
+                s.domain.to_ascii_lowercase(),
+                SiteRoutes::with_limits(catch_all, routes, limits),
+            );
+        }
+        Ok(Self::new(sites))
+    }
+
     pub fn get(&self, host: &str) -> Option<&SiteRoutes> {
         self.sites.get(host)
     }
@@ -216,34 +440,130 @@ impl RouteTable {
     pub fn route_count(&self) -> usize {
         self.sites.values().map(|s| s.routes.len()).sum()
     }
+
+    /// Every distinct proxy backend in the table, for health checks.
+    pub fn upstreams(&self) -> Vec<Arc<Upstream>> {
+        let mut seen = HashSet::new();
+        let mut out = Vec::new();
+        for site in self.sites.values() {
+            for target in site.targets() {
+                if let Target::Proxy(upstream) = target {
+                    if seen.insert(upstream.key().clone()) {
+                        out.push(upstream.clone());
+                    }
+                }
+            }
+        }
+        out
+    }
 }
 
 /// Per-request state carried between the `ProxyHttp` phases.
 #[derive(Default)]
 pub struct ProxyCtx {
     /// Upstream chosen for this request in `request_filter`.
-    upstream: Option<String>,
+    upstream: Option<Arc<Upstream>>,
+    /// Normalized host, so `upstream_peer` does not parse the header again.
+    host: Option<String>,
     /// Prefix the matched route wants removed before forwarding.
     strip_prefix: Option<String>,
+    /// Effective `max_body_bytes` for this domain; `None` means "not resolved
+    /// yet", not "unlimited".
+    max_body: Option<usize>,
     /// Bytes of request body seen so far, for chunked uploads.
     body_bytes: u64,
 }
 
+/// The page a healthy-looking request gets when its backend is down.
+///
+/// Static on purpose: no host, no upstream address, nothing a client could
+/// reflect back. It is served with `503` and `Retry-After`, and the probe keeps
+/// running, so the next request after recovery is proxied normally.
+const UNAVAILABLE_PAGE: &str = r#"<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Service temporarily unavailable</title>
+  <style>
+    :root { color-scheme: light dark; }
+    body {
+      margin: 0; min-height: 100vh; display: grid; place-items: center;
+      background: #0f1115; color: #e8eaf0;
+      font: 16px/1.6 system-ui, -apple-system, "Segoe UI", sans-serif;
+    }
+    main { max-width: 34rem; padding: 2.5rem 1.5rem; text-align: center; }
+    .badge {
+      display: inline-block; margin-bottom: 1.25rem; padding: .25rem .75rem;
+      border: 1px solid #3a4150; border-radius: 999px;
+      color: #9aa4b8; font-size: .8rem; letter-spacing: .08em;
+      text-transform: uppercase;
+    }
+    h1 { margin: 0 0 .75rem; font-size: 1.6rem; font-weight: 600; }
+    p { margin: .5rem 0; color: #b6bdcc; }
+    .hint { margin-top: 1.75rem; color: #7b8497; font-size: .9rem; }
+  </style>
+</head>
+<body>
+  <main>
+    <span class="badge">503 &middot; temporarily unavailable</span>
+    <h1>The service behind this domain is taking a break.</h1>
+    <p>uping cannot reach the application right now. It keeps checking in the
+       background and will route traffic again the moment the service answers.</p>
+    <p class="hint">Nothing to fix on your side &mdash; try again in a few seconds.</p>
+  </main>
+</body>
+</html>
+"#;
+
+/// Write the 503 page, honouring `HEAD` like the rest of the proxy.
+async fn respond_unavailable(session: &mut Session) -> Result<()> {
+    let head = session.req_header().method == http::Method::HEAD;
+    let mut resp = ResponseHeader::build(503, Some(4))?;
+    resp.insert_header("Content-Type", "text/html; charset=utf-8")?;
+    resp.insert_header("Content-Length", UNAVAILABLE_PAGE.len().to_string())?;
+    resp.insert_header("Cache-Control", "no-store")?;
+    resp.insert_header("Retry-After", "5")?;
+    session.write_response_header(Box::new(resp), head).await?;
+    if !head {
+        session
+            .write_response_body(Some(Bytes::from_static(UNAVAILABLE_PAGE.as_bytes())), true)
+            .await?;
+    }
+    Ok(())
+}
+
 /// Terminates TLS and forwards to the upstream of the matching domain and path.
 pub struct HttpsProxy {
-    routes: Arc<RouteTable>,
-    /// Per-IP request budget.
-    limiter: RequestLimiter,
+    /// Swapped whole on a reload; readers clone the current `Arc`.
+    routes: Arc<RwLock<Arc<RouteTable>>>,
+    /// Per-IP request budget; its counters survive a reload.
+    limiter: Arc<RequestLimiter>,
     /// Largest request body we accept; `0` disables the check.
-    max_body_bytes: usize,
+    max_body_bytes: Arc<AtomicUsize>,
+    /// Domains this listener is allowed to answer. A server with its own
+    /// `listen`/`listen6` lives in its own group; a request for a domain from
+    /// another group is misdirected, even though routes and certificates are
+    /// shared. Swapped on reload with the rest of the config.
+    allowed: Arc<RwLock<Arc<HashSet<String>>>>,
+    /// Upstream liveness, shared by every listener and the probe thread.
+    health: Arc<HealthTracker>,
 }
 
 impl HttpsProxy {
-    pub fn new(routes: Arc<RouteTable>, limiter: RequestLimiter, max_body_bytes: usize) -> Self {
+    pub fn new(
+        routes: Arc<RwLock<Arc<RouteTable>>>,
+        limiter: Arc<RequestLimiter>,
+        max_body_bytes: Arc<AtomicUsize>,
+        allowed: Arc<RwLock<Arc<HashSet<String>>>>,
+        health: Arc<HealthTracker>,
+    ) -> Self {
         Self {
             routes,
             limiter,
             max_body_bytes,
+            allowed,
+            health,
         }
     }
 }
@@ -256,56 +576,90 @@ impl ProxyHttp for HttpsProxy {
         ProxyCtx::default()
     }
 
-    /// Runs before the request is forwarded: rate limit, route, size check.
+    /// Runs before the request is forwarded: route, rate limit, size check.
     async fn request_filter(&self, session: &mut Session, ctx: &mut Self::CTX) -> Result<bool> {
-        // 1. Per-IP request budget. Counted for every request, including the
-        //    ones we are about to reject, so a flood never gets a free pass.
+        session.set_keepalive(Some(KEEPALIVE_TIMEOUT_SECS));
+
+        // 1. Resolve the domain first: its own `limits` may differ from the
+        //    global budget. An unknown host still gets the global budget, so a
+        //    flood of bogus Host headers is not free.
+        let host = request_host(session).unwrap_or_default();
+        let routes = {
+            let live = self.routes.read().unwrap_or_else(|e| e.into_inner());
+            live.clone()
+        };
+        let site = routes.get(&host);
         if let Some(addr) = session.client_addr().and_then(|a| a.as_inet()) {
-            if !self.limiter.check(&addr.ip()) {
+            let budget = site.map_or_else(|| self.limiter.budget(), |s| s.limits.per_ip_rps);
+            let domain = if site.is_some() { host.as_str() } else { "" };
+            if !self.limiter.check_with(domain, &addr.ip(), budget) {
                 warn!(
-                    "rate limit: {} exceeded {} req/s, answering 429",
-                    addr.ip(),
-                    self.limiter.budget()
+                    "rate limit: {} exceeded {budget} req/s, answering 429",
+                    addr.ip()
                 );
                 session.respond_error(429).await?;
                 return Ok(true);
             }
         }
-
-        // 2. Resolve the upstream now so an unrouted host gets a clean 404
-        //    instead of a 500 from `upstream_peer`. An unknown *path* is not an
-        //    error: it falls through to the server's catch-all upstream.
-        let host = request_host(session).unwrap_or_default();
-        let Some(site) = self.routes.get(&host) else {
+        let Some(site) = site else {
             debug!("no [[server]] entry for host `{host}`, answering 404");
             session.respond_error(404).await?;
             return Ok(true);
         };
 
-        let path = session.req_header().uri.path().to_string();
-        let query = session.req_header().uri.query().map(str::to_string);
-        let resolved = site.resolve(&path);
-
-        // A static target answers right here and never reaches `upstream_peer`.
-        if let Target::Static(site) = resolved.target {
-            static_files::serve(session, site, &path, query.as_deref(), resolved.strip).await?;
+        // A known domain can still be misdirected: it exists, but its own
+        // `listen`/`listen6` is a different socket.
+        let permitted = {
+            let allowed = self.allowed.read().unwrap_or_else(|e| e.into_inner());
+            allowed.contains(&host)
+        };
+        if !permitted {
+            debug!("host `{host}` is not served by this listener, answering 421");
+            session.respond_error(421).await?;
             return Ok(true);
         }
 
-        let Target::Proxy(upstream) = resolved.target else {
-            unreachable!("a static target returned above")
-        };
-        ctx.upstream = Some(upstream.clone());
-        ctx.strip_prefix = resolved.strip.map(str::to_string);
+        // The body cap is per domain too. Remember it for the chunked-body
+        // filter, where there is no `Content-Length` to check upfront.
+        let max_body = site.limits.max_body_bytes;
+        ctx.max_body = Some(max_body);
 
-        // 3. Reject obviously oversized bodies before reading anything.
-        if self.max_body_bytes > 0 {
-            if let Some(len) = declared_content_length(session) {
-                if len > self.max_body_bytes as u64 {
+        // `Resolved` borrows only the route table, so the request path can stay
+        // borrowed from the session until the static branch clones it.
+        let resolved = site.resolve(session.req_header().uri.path());
+
+        match resolved.target {
+            // A static target answers right here and never reaches
+            // `upstream_peer`.
+            Target::Static(target) => {
+                let uri = &session.req_header().uri;
+                let path = uri.path().to_string();
+                let query = uri.query().map(str::to_string);
+                static_files::serve(session, target, &path, query.as_deref(), resolved.strip)
+                    .await?;
+                return Ok(true);
+            }
+            Target::Proxy(upstream) => {
+                if self.health.down(upstream) {
                     warn!(
-                        "rejecting {len}-byte body from host `{host}` (limit {})",
-                        self.max_body_bytes
+                        "upstream {} is down; answering 503 for {}",
+                        upstream.address, host
                     );
+                    respond_unavailable(session).await?;
+                    return Ok(true);
+                }
+                ctx.upstream = Some(upstream.clone());
+                ctx.host = Some(host);
+                ctx.strip_prefix = resolved.strip.map(str::to_string);
+            }
+        }
+
+        // 2. Reject obviously oversized bodies before reading anything.
+        if max_body > 0 {
+            if let Some(len) = declared_content_length(session) {
+                if len > max_body as u64 {
+                    let host = ctx.host.as_deref().unwrap_or_default();
+                    warn!("rejecting {len}-byte body from host `{host}` (limit {max_body})");
                     session.respond_error(413).await?;
                     return Ok(true);
                 }
@@ -317,19 +671,34 @@ impl ProxyHttp for HttpsProxy {
 
     async fn upstream_peer(
         &self,
-        session: &mut Session,
+        _session: &mut Session,
         ctx: &mut Self::CTX,
     ) -> Result<Box<HttpPeer>> {
         // `request_filter` always fills this in; if it is missing the request
-        // was answered early and never reaches here.
-        let upstream = ctx.upstream.clone().ok_or_else(|| {
+        // was answered early and never reaches here. `take` avoids a clone on
+        // every request: the context is not used again for this field.
+        let upstream = ctx.upstream.take().ok_or_else(|| {
             Error::new_str("internal error: no upstream resolved for this request")
         })?;
+        let host = ctx.host.take().unwrap_or_default();
+        let addr = self.health.addr(&upstream).ok_or_else(|| {
+            Error::new_str("internal error: the upstream has no resolved address")
+        })?;
 
-        let host = request_host(session).unwrap_or_default();
-        debug!("proxying {host} -> {upstream}");
-        // `tls = false`: we forward to a plain-HTTP upstream.
-        Ok(Box::new(HttpPeer::new(upstream.as_str(), false, host)))
+        debug!(
+            "proxying {host} -> {}{}",
+            upstream.address,
+            if upstream.tls { " over TLS" } else { "" }
+        );
+        let mut peer = HttpPeer::new(addr, upstream.tls, upstream.sni.to_string());
+        if upstream.tls {
+            peer.options.verify_cert = upstream.verify;
+            peer.options.verify_hostname = upstream.verify;
+            if let Some(ca) = &upstream.ca {
+                peer.options.ca = Some(ca.clone());
+            }
+        }
+        Ok(Box::new(peer))
     }
 
     /// Tell the backend where the request really came from.
@@ -400,12 +769,15 @@ impl ProxyHttp for HttpsProxy {
         _end_of_stream: bool,
         ctx: &mut Self::CTX,
     ) -> Result<()> {
-        if self.max_body_bytes == 0 {
+        let max_body = ctx
+            .max_body
+            .unwrap_or_else(|| self.max_body_bytes.load(Ordering::Relaxed));
+        if max_body == 0 {
             return Ok(());
         }
         if let Some(chunk) = body {
             ctx.body_bytes += chunk.len() as u64;
-            if ctx.body_bytes > self.max_body_bytes as u64 {
+            if ctx.body_bytes > max_body as u64 {
                 // Surfacing this as an HTTPStatus error makes Pingora's
                 // `fail_to_proxy` answer the client with a real 413.
                 return Err(Error::new(ErrorType::HTTPStatus(413)));
@@ -419,11 +791,17 @@ impl ProxyHttp for HttpsProxy {
 /// the ACME http-01 path, which must be served in the clear.
 pub struct RedirectProxy {
     challenges: ChallengeStore,
+    /// Domains configured with `serve_http = false`: they exist only behind HTTPS, so
+    /// a request for one on port 80 is a plain `404`, not a redirect.
+    disabled: Arc<RwLock<Arc<HashSet<String>>>>,
 }
 
 impl RedirectProxy {
-    pub fn new(challenges: ChallengeStore) -> Self {
-        Self { challenges }
+    pub fn new(challenges: ChallengeStore, disabled: Arc<RwLock<Arc<HashSet<String>>>>) -> Self {
+        Self {
+            challenges,
+            disabled,
+        }
     }
 }
 
@@ -445,6 +823,18 @@ impl ProxyHttp for RedirectProxy {
     }
 
     async fn request_filter(&self, session: &mut Session, _ctx: &mut Self::CTX) -> Result<bool> {
+        session.set_keepalive(Some(KEEPALIVE_TIMEOUT_SECS));
+        let host = request_host(session).unwrap_or_default();
+        let disabled = {
+            let set = self.disabled.read().unwrap_or_else(|e| e.into_inner());
+            set.contains(&host)
+        };
+        if disabled {
+            debug!("no HTTP vhost for `{host}` (`serve_http = false`), answering 404");
+            session.respond_error(404).await?;
+            return Ok(true);
+        }
+
         let path = session.req_header().uri.path().to_string();
 
         if let Some(token) = path.strip_prefix(CHALLENGE_PREFIX) {
@@ -470,7 +860,6 @@ impl ProxyHttp for RedirectProxy {
             return Ok(true);
         }
 
-        let host = request_host(session).unwrap_or_default();
         let path = session
             .req_header()
             .uri
@@ -509,6 +898,12 @@ mod tests {
     }
 
     #[test]
+    fn normalize_host_drops_a_trailing_root_dot() {
+        assert_eq!(normalize_host("Example.COM."), "example.com");
+        assert_eq!(normalize_host("example.com.:443"), "example.com");
+    }
+
+    #[test]
     fn select_host_prefers_the_host_header() {
         assert_eq!(
             select_host(Some("WWW.Example.com:80"), Some("ignored.example")),
@@ -536,7 +931,20 @@ mod tests {
     }
 
     fn proxy(upstream: &str) -> Target {
-        Target::Proxy(upstream.to_string())
+        let spec = UpstreamSpec {
+            address: upstream,
+            tls: UpstreamTls {
+                tls: false,
+                sni: "",
+                verify: true,
+                ca: "",
+            },
+            default_sni: "test.local",
+            health: EffectiveHealth::default(),
+        };
+        Target::Proxy(Arc::new(
+            Upstream::from_config(&spec, Path::new(".")).unwrap(),
+        ))
     }
 
     fn site() -> SiteRoutes {
@@ -559,7 +967,7 @@ mod tests {
 
     fn upstream(site: &SiteRoutes, path: &str) -> String {
         match site.resolve(path).target {
-            Target::Proxy(upstream) => upstream.clone(),
+            Target::Proxy(upstream) => upstream.address.to_string(),
             Target::Static(_) => panic!("expected a proxy target for {path}"),
         }
     }

@@ -2,8 +2,8 @@
 //!
 //! Pingora 0.9 dropped `TlsSettings::add_cert`, so a multi-domain listener
 //! picks its certificate during the handshake via the [`TlsAccept`] callback.
-//! We pre-load every configured cert/key pair once at startup and look it up
-//! by the requested SNI hostname.
+//! The map is loaded at startup and replaced atomically on a config reload or
+//! an ACME renewal; the callback looks the requested SNI hostname up in it.
 //!
 //! The listener starts with **no** certificate installed at all: whatever the
 //! callback leaves behind is the only cert OpenSSL can use. If we install
@@ -18,6 +18,7 @@
 
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 
 use async_trait::async_trait;
@@ -26,8 +27,7 @@ use pingora::listeners::TlsAccept;
 use pingora::protocols::tls::TlsRef;
 use pingora::tls::{ext, pkey, ssl, x509};
 
-#[cfg(test)]
-use crate::config::Server;
+use crate::config::{Config, KeyMode, Server};
 
 /// A parsed leaf + its intermediate chain + private key, ready for OpenSSL.
 struct CertKey {
@@ -47,9 +47,9 @@ pub struct SniResolver {
     /// Lowercased domain -> (cert, key).
     certs: Arc<RwLock<HashMap<String, Arc<CertKey>>>>,
     /// Certificate used when SNI matches nothing (first configured domain).
-    default_domain: String,
+    default_domain: Arc<RwLock<String>>,
     /// Serve `default_domain` when SNI is absent or unknown.
-    fallback: bool,
+    fallback: Arc<AtomicBool>,
 }
 
 impl SniResolver {
@@ -58,9 +58,43 @@ impl SniResolver {
     pub fn empty(default_domain: impl Into<String>, fallback: bool) -> Self {
         Self {
             certs: Arc::new(RwLock::new(HashMap::new())),
-            default_domain: default_domain.into().to_ascii_lowercase(),
-            fallback,
+            default_domain: Arc::new(RwLock::new(default_domain.into().to_ascii_lowercase())),
+            fallback: Arc::new(AtomicBool::new(fallback)),
         }
+    }
+
+    /// Build a resolver for a whole config, and return the `auto` servers whose
+    /// pair does not exist yet. A missing `manual` pair is an error: the
+    /// operator promised two files and uping cannot conjure them.
+    ///
+    /// This never touches the network and writes nothing, so it is also what
+    /// `--check` and a reload candidate use.
+    pub fn from_config(cfg: &Config) -> anyhow::Result<(Self, Vec<Server>)> {
+        let default_domain = cfg
+            .servers
+            .first()
+            .map(|s| s.domain.to_ascii_lowercase())
+            .unwrap_or_default();
+        let resolver = SniResolver::empty(default_domain, cfg.tls.fallback_cert);
+        let mut pending = Vec::new();
+
+        for s in &cfg.servers {
+            let (cert, key) = cfg.key_paths(s);
+            if cert.is_file() && key.is_file() {
+                resolver.load_files(&s.domain, &cert, &key)?;
+            } else {
+                match s.key_mode() {
+                    KeyMode::Manual => anyhow::bail!(
+                        "`{}` is manual and its certificate is missing: `{}` / `{}`",
+                        s.domain,
+                        cert.display(),
+                        key.display()
+                    ),
+                    KeyMode::Auto | KeyMode::Internal => pending.push(s.clone()),
+                }
+            }
+        }
+        Ok((resolver, pending))
     }
 
     /// Load every cert/key pair from the explicit `pub_key`/`priv_key` fields.
@@ -76,6 +110,28 @@ impl SniResolver {
             resolver.load_files(&s.domain, Path::new(&s.pub_key), Path::new(&s.priv_key))?;
         }
         Ok(resolver)
+    }
+
+    /// Replace this resolver's live state with `other`'s. Used after a reload
+    /// has built and validated a complete candidate.
+    pub fn adopt(&self, other: &Self) {
+        let certs = {
+            let source = other.certs.read().unwrap_or_else(|e| e.into_inner());
+            source.clone()
+        };
+        *self.certs.write().unwrap_or_else(|e| e.into_inner()) = certs;
+
+        let default = other
+            .default_domain
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        *self
+            .default_domain
+            .write()
+            .unwrap_or_else(|e| e.into_inner()) = default;
+        self.fallback
+            .store(other.fallback.load(Ordering::Relaxed), Ordering::Relaxed);
     }
 
     /// Read and parse one pair from disk, replacing any current entry.
@@ -140,15 +196,22 @@ impl SniResolver {
     /// * otherwise -> `None`, i.e. no certificate is installed and the
     ///   handshake is expected to fail
     fn resolve_key(&self, sni: &str) -> Option<String> {
-        let sni = sni.to_ascii_lowercase();
+        let sni = sni.trim_end_matches('.').to_ascii_lowercase();
         let certs = self.certs.read().unwrap_or_else(|e| e.into_inner());
 
         if certs.contains_key(&sni) {
             return Some(sni);
         }
-        if self.fallback && certs.contains_key(&self.default_domain) {
-            debug!("no certificate configured for SNI `{sni}`, using default");
-            return Some(self.default_domain.clone());
+        if self.fallback.load(Ordering::Relaxed) {
+            let default = self
+                .default_domain
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone();
+            if certs.contains_key(&default) {
+                debug!("no certificate configured for SNI `{sni}`, using default");
+                return Some(default);
+            }
         }
         None
     }
@@ -243,10 +306,19 @@ mod tests {
         let (cert, key) = pair();
         Server {
             domain: domain.to_string(),
+            https_listen: String::new(),
+            https_listen6: String::new(),
+            serve_http: true,
+            health: Default::default(),
+            limits: None,
             keys: None,
             pub_key: cert.clone(),
             priv_key: key.clone(),
             upstream: "127.0.0.1:8080".to_string(),
+            upstream_tls: false,
+            upstream_sni: String::new(),
+            upstream_verify: true,
+            upstream_ca: String::new(),
             root: String::new(),
             index: "index.html".to_string(),
             routes: Vec::new(),
@@ -308,7 +380,7 @@ mod tests {
     fn domain_keys_are_lowercased() {
         let resolver = SniResolver::from_servers(&[test_server("TEST.Local")], true).unwrap();
         assert!(resolver.has("test.local"));
-        assert_eq!(resolver.default_domain, "test.local");
+        assert_eq!(*resolver.default_domain.read().unwrap(), "test.local");
     }
 
     #[test]
