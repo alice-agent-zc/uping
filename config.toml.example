@@ -1,17 +1,16 @@
 # uping v0.3.2 — example configuration
 #
 # Copy:   cp config.toml.example config.toml
-# Root:   sudo install -m600 config.toml.example /etc/uping/config.toml
-# Run:    uping config.toml
-# Check:  uping --check config.toml
-# DNS:    uping --dns-zone config.toml       (hosts records for a VPN resolver)
-# Apply:  sudo pkill -HUP -x uping           (SIGHUP, no restart)
+# Run:    ./target/release/uping config.toml
+# Check:  ./target/release/uping --check config.toml
+# DNS:    ./target/release/uping --dns-zone config.toml   (hosts records)
+# Apply:  pkill -HUP -x uping               (SIGHUP, no restart)
 # Restart only after installing a new binary, or after changing [listen],
 # a server's https_listen/https_listen6, [acme]/[acme.internal], or [[stream]].
 #
 # Every path (certificates, static roots, cert_dir, CA bundles) is resolved
 # from the directory that holds this file. An absolute path is used as written,
-# so /srv/www and /etc/uping/cert work exactly as expected.
+# so /srv/www and ~/uping/cert work exactly as expected.
 
 # Optional. Host-wide listeners. One address per family, one port per protocol.
 # There is no wildcard and no list: a domain that needs another address or port

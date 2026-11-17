@@ -83,7 +83,7 @@ tests/
   sighup_e2e.rs    # SIGHUP, bad config, listener warning
   static_e2e.rs    # static serving through the real binary
   stream_e2e.rs    # raw TCP through the real binary
-uping.service      # root system unit, ordered after rupa.service
+uping.service      # user unit for a ~/uping checkout
 ```
 
 ### Config
@@ -206,12 +206,10 @@ curl -i  --resolve test.local:8088:127.0.0.1 http://test.local:8088/   # 301
 
 ## Deployment
 
-Production is the root install in the README: `/usr/bin/uping`,
-`/etc/uping/config.toml` and `/etc/uping/cert`. The process runs as root and
-binds 80/443 without a capability; a checkout under `~/uping` plus
-`CAP_NET_BIND_SERVICE` is not the supported layout. `uping.service` is the root
-unit: it runs that binary and config, and starts after `rupa.service` so a VPN
-listen address exists before the bind.
+Production is the `~/uping` checkout: `target/release/uping` with `config.toml`
+and `cert/` beside it. The binary carries `CAP_NET_BIND_SERVICE` via `setcap`,
+so the process stays an ordinary user. `uping.service` is the user unit; it can
+order itself after `rupa.service` when both run in the same user manager.
 
 ## Release
 

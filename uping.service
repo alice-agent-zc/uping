@@ -1,36 +1,39 @@
-# uping — systemd unit for the root install.
+# uping — user systemd unit (setcap, no root daemon).
 #
 # Install:
-#   sudo install -m644 uping.service /etc/systemd/system/uping.service
-#   sudo systemctl daemon-reload
-#   sudo systemctl enable --now uping
+#   sudo setcap 'cap_net_bind_service=+ep' %h/uping/target/release/uping
+#   mkdir -p ~/.config/systemd/user
+#   cp uping.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now uping
+#   loginctl enable-linger "$USER"      # start at boot, not only at login
 #
-# The process runs as root and binds 80/443 directly: no CAP_NET_BIND_SERVICE,
-# no setcap. It is ordered after rupa.service so a VPN address such as
-# 10.8.0.1 exists before uping binds it.
+# Ordering: rupa.service must already be running. When rupa is a user unit, the
+# After= below orders the start; a user manager cannot order after a system
+# service, so start the system rupa.service before uping in that case.
 #
 # Apply an edited config without dropping connections:
-#   sudo systemctl reload uping
+#   systemctl --user reload uping
 # A new binary, or a change to [listen], https_listen/https_listen6,
 # [acme]/[acme.internal] or [[stream]], needs a restart:
-#   sudo systemctl restart uping
+#   systemctl --user restart uping
+#
+# The capability lives on the binary and is lost on every rebuild; re-apply it.
 
 [Unit]
-Description=uping reverse proxy
-Documentation=https://github.com/raonagos/uping
-After=network-online.target rupa.service
-Wants=network-online.target rupa.service
+Description=uping reverse proxy (user mode)
+After=rupa.service
 StartLimitIntervalSec=300
 StartLimitBurst=5
 
 [Service]
 Type=simple
-WorkingDirectory=/etc/uping
-ExecStart=/usr/bin/uping /etc/uping/config.toml
+WorkingDirectory=%h/uping
+ExecStart=%h/uping/target/release/uping %h/uping/config.toml
 ExecReload=/bin/kill -HUP $MAINPID
 Restart=on-failure
 RestartSec=10
 Environment=RUST_LOG=info
 
 [Install]
-WantedBy=multi-user.target
+WantedBy=default.target

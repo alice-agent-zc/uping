@@ -28,11 +28,10 @@ upstream mutual TLS, DNS-01.
 ## Quick start
 
 `config.toml` is local and git-ignored; [`config.toml.example`](config.toml.example)
-is the tracked template. The root install below creates
-`/etc/uping/config.toml` from it; edit that file.
+is the tracked template. Copy it once, then edit the copy:
 
 ```toml
-# /etc/uping/config.toml
+# config.toml
 [acme]
 email = "ops@rao-nagos.pf"
 
@@ -41,91 +40,78 @@ domain   = "www.rao-nagos.pf"
 upstream = "127.0.0.1:8080"
 ```
 
-The production install below puts the binary in `/usr/bin`, the configuration
-in `/etc/uping/config.toml`, and the certificates in `/etc/uping/cert`. For
-build/test notes, architecture and the release procedure, see
-**[CONTRIBUTING.md](CONTRIBUTING.md)**.
+```sh
+cp config.toml.example config.toml
+$EDITOR config.toml
+```
 
-## Install as root
+The examples assume a checkout at `~/uping`, with `config.toml` at its root.
+Certificates and the ACME account live under `~/uping/cert`.
 
-Root is the supported production install. The process binds 80 and 443
-directly, so no `CAP_NET_BIND_SERVICE` and no `setcap` are involved.
+## Build and run with setcap
 
-| Path | Contents |
-|---|---|
-| `/usr/bin/uping` | the binary |
-| `/etc/uping/config.toml` | the configuration |
-| `/etc/uping/cert/` | certificates, private keys and the ACME account |
-
-Build, install and validate:
+uping runs as an ordinary user. The only privileged operation is binding ports
+below 1024; a capability on the binary grants it:
 
 ```sh
 cargo build --release
-sudo install -Dm755 target/release/uping /usr/bin/uping
-sudo install -d -m755 /etc/uping /etc/uping/cert
-sudo install -m600 config.toml.example /etc/uping/config.toml
-sudoedit /etc/uping/config.toml
-sudo /usr/bin/uping --check /etc/uping/config.toml
+sudo setcap 'cap_net_bind_service=+ep' target/release/uping
+./target/release/uping --check config.toml
+./target/release/uping config.toml
 ```
 
-Start it in the foreground as root:
+The capability lives on the binary and is lost on every rebuild; re-apply
+`setcap` after `cargo build --release`. The repository ships
+[`uping.service`](uping.service), a user unit for this `~/uping` checkout; it
+can order itself after `rupa.service` when both run in the same user manager.
+For build/test notes, architecture and the release procedure, see
+**[CONTRIBUTING.md](CONTRIBUTING.md)**.
 
-```sh
-sudo /usr/bin/uping /etc/uping/config.toml
-```
-
-It logs to stderr and stays in the foreground. The release also ships
-[`uping.service`](uping.service), a root unit that runs this exact command and
-orders itself after `rupa.service`, so a VPN address such as `10.8.0.1` exists
-before uping binds it. Install it with your init system if it must start at
-boot; no capability is needed because the process is root.
-
-Every path in `config.toml` is relative to `/etc/uping` unless it is absolute.
-The default `cert_dir = "cert"` therefore writes:
+Every path in `config.toml` is relative to the directory that holds it, here
+`~/uping`. The default `cert_dir = "cert"` therefore writes:
 
 ```text
-/etc/uping/cert/<domain>/fullchain.pem
-/etc/uping/cert/<domain>/privkey.pem
-/etc/uping/cert/acme-account-<hash>.json
+~/uping/cert/<domain>/fullchain.pem
+~/uping/cert/<domain>/privkey.pem
+~/uping/cert/acme-account-<hash>.json
 ```
 
-The private key and the ACME account are written with mode `0600`; the chain is
-public and is written `0644`. Keep the configuration and the certificate
-directory root-only:
+The private key and ACME account are written `0600`; the chain is public and
+written `0644`. Keep the config and certificate directory private:
 
 ```sh
-sudo chmod 600 /etc/uping/config.toml
-sudo chmod 700 /etc/uping/cert
+chmod 600 config.toml
+mkdir -p cert && chmod 700 cert
 ```
 
 To apply an edited configuration without dropping connections:
 
 ```sh
-sudo pkill -HUP -x uping
+pkill -HUP -x uping
 ```
 
 The new file is validated first; an invalid file changes nothing. Changes to
 `[listen]`, `https_listen`/`https_listen6`, `[[stream]]`, `[acme]` or
-`[acme.internal]` need a restart instead: stop and start the process the same
-way your init system does.
+`[acme.internal]` need a restart instead: restart it through your user service
+manager.
 
-To upgrade, install the new binary over `/usr/bin/uping` and restart the
-process. The configuration and `/etc/uping/cert` are left in place.
+To upgrade, rebuild and re-apply `setcap`; the configuration and `cert/` stay
+in place.
 
-`/usr/bin/uping --dns-zone /etc/uping/config.toml` prints hosts records for a
-VPN resolver.
+`./target/release/uping --dns-zone config.toml` prints hosts records for a VPN
+resolver.
 
 ## Paths
 
 Every path in the file is resolved from the directory that holds `config.toml`.
-With the root install that directory is `/etc/uping`. An absolute path is used
+With the checkout layout that directory is `~/uping`. An absolute path is used
 exactly as written:
 
 ```toml
 root      = "/srv/www"                             # absolute
-root      = "public"                               # /etc/uping/public
-cert_dir  = "cert"                                 # /etc/uping/cert
-pub_key   = "cert/www.rao-nagos.pf/fullchain.pem"  # /etc/uping/cert/...
+root      = "public"                               # ~/uping/public
+cert_dir  = "cert"                                 # ~/uping/cert
+pub_key   = "cert/www.rao-nagos.pf/fullchain.pem"  # ~/uping/cert/...
 ```
 
 This applies to `root`, `pub_key`, `priv_key`, `cert_dir`, `upstream_ca` and
@@ -307,7 +293,7 @@ server's TLS certificate.
    private key — somewhere uping can read:
 
    ```sh
-   sudo install -m644 "$(sudo step path)/certs/root_ca.crt" /etc/uping/cert/step-ca-root.pem
+   sudo install -m644 "$(sudo step path)/certs/root_ca.crt" "$HOME/uping/cert/step-ca-root.pem"
    ```
 
    `sudo step ca init` writes under `/root/.step`, so use `sudo step path` here,
@@ -324,7 +310,7 @@ server's TLS certificate.
    ```toml
    [acme.internal]                    # [acme.step-ca] is an accepted alias
    directory = "https://step-ca.internal/acme/acme/directory"
-   ca_bundle = "/etc/uping/cert/step-ca-root.pem"
+   ca_bundle = "cert/step-ca-root.pem"
    ```
 
    `ca_bundle` is the trust anchor for uping → ACME server. It is **not** a
@@ -346,9 +332,9 @@ server's TLS certificate.
    uping creates the ACME account and the leaf certificate automatically:
 
    ```text
-   /etc/uping/cert/acme-account-<hash>.json
-   /etc/uping/cert/site1.internal.rao-nagos.pf/fullchain.pem
-   /etc/uping/cert/site1.internal.rao-nagos.pf/privkey.pem
+   ~/uping/cert/acme-account-<hash>.json
+   ~/uping/cert/site1.internal.rao-nagos.pf/fullchain.pem
+   ~/uping/cert/site1.internal.rao-nagos.pf/privkey.pem
    ```
 
 **Important:** `ca_bundle` is only the trust anchor for uping → ACME server. It
@@ -482,7 +468,7 @@ them yourself (certbot, step-ca, a paid CA, …) and send `SIGHUP`.
 ```toml
 [acme.internal]
 directory = "https://step-ca.internal/acme/acme/directory"
-ca_bundle = "/etc/uping/cert/step-ca-root.pem"
+ca_bundle = "cert/step-ca-root.pem"
 
 [[server]]
 domain       = "site1.internal.rao-nagos.pf"
@@ -627,7 +613,7 @@ choice.
 configured domain and family — for dnsmasq, CoreDNS or `/etc/hosts`:
 
 ```sh
-/usr/bin/uping --dns-zone /etc/uping/config.toml | sudo tee /etc/dnsmasq.d/uping.hosts
+./target/release/uping --dns-zone config.toml | sudo tee /etc/dnsmasq.d/uping.hosts
 # dnsmasq.conf: addn-hosts=/etc/dnsmasq.d/uping.hosts
 #                interface=<rupa-interface>
 #                bind-interfaces
