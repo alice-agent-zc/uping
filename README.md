@@ -313,8 +313,11 @@ server's TLS certificate.
    `sudo step ca init` writes under `/root/.step`, so use `sudo step path` here,
    not the unprivileged user's path. If step-ca runs as a dedicated user,
    initialize as that user (or pass `--root`/`--key`) so it can read the keys.
-   If the ACME endpoint serves only the leaf and not its intermediate, append
-   `intermediate_ca.crt` to the bundle as well.
+
+   Do **not** copy `intermediate_ca.crt` alone in place of the root: it is a
+   chain certificate, not the long-lived trust anchor. step-ca normally sends
+   its intermediate during the TLS handshake; if it does not, concatenate
+   `root_ca.crt` and `intermediate_ca.crt` into the bundle.
 
 4. Point uping at the directory and that root:
 
