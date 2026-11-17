@@ -110,8 +110,8 @@ fn run_check(path: &str) -> ! {
 ///
 /// The format is `hosts(5)` — `IP name`, one line per family — because that is
 /// what dnsmasq (`addn-hosts=`), CoreDNS (`hosts`) and `/etc/hosts` all read.
-/// uping does not serve DNS: the WireGuard-side resolver owns that, and this
-/// command keeps the names in sync with the proxy config.
+/// uping does not serve DNS: the rupa-side resolver owns that, and this command
+/// keeps the names in sync with the proxy config.
 fn run_dns_zone(path: &str) -> ! {
     match dns_zone(path) {
         Ok(text) => {
@@ -258,9 +258,8 @@ fn main() -> Result<()> {
     )));
 
     let http_addrs: Vec<String> = cfg
-        .listen
         .http_addrs()
-        .context("reading `[listen]`")?
+        .context("reading the HTTP listeners")?
         .iter()
         .map(|addr| addr.to_string())
         .collect();
@@ -441,7 +440,6 @@ fn main() -> Result<()> {
 
     let privileged_http = !cfg.servers.is_empty()
         && cfg
-            .listen
             .http_addrs()
             .unwrap_or_default()
             .into_iter()
@@ -455,8 +453,8 @@ fn main() -> Result<()> {
         .any(|addr| is_privileged(&addr));
     if privileged_http || privileged_stream {
         warn!(
-            "a port below 1024 needs CAP_NET_BIND_SERVICE, not root: \
-             `sudo setcap 'cap_net_bind_service=+ep' $(command -v uping)`"
+            "a port below 1024 needs root or CAP_NET_BIND_SERVICE; the root install \
+             runs as root, a non-root process needs `setcap 'cap_net_bind_service=+ep'`"
         );
     }
 

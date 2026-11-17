@@ -46,7 +46,7 @@ struct Pinned {
 impl Pinned {
     fn of(cfg: &Config) -> Result<Self> {
         Ok(Self {
-            http: cfg.listen.http_addrs()?,
+            http: cfg.http_addrs()?,
             groups: cfg.https_groups()?.into_iter().map(|g| g.key).collect(),
             streams: cfg
                 .streams

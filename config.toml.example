@@ -1,4 +1,4 @@
-# uping v0.3.1 — example configuration
+# uping v0.3.2 — example configuration
 #
 # Copy:   cp config.toml.example config.toml
 # Root:   sudo install -m600 config.toml.example /etc/uping/config.toml
@@ -15,7 +15,9 @@
 
 # Optional. Host-wide listeners. One address per family, one port per protocol.
 # There is no wildcard and no list: a domain that needs another address or port
-# overrides it with `https_listen` / `https_listen6` below.
+# overrides it with `https_listen` / `https_listen6` below. For an ACME server,
+# that same IP is also bound on `http`: a private site on 10.8.0.1:443 gets
+# 10.8.0.1:80 automatically for http-01.
 # [listen]
 # ipv4  = "0.0.0.0"                # default
 # ipv6  = "2607:f1c0:f031:4500::1" # omit for no IPv6
@@ -32,13 +34,14 @@
 # ca_bundle         = ""           # PEM root for the ACME server; empty = system roots
 
 # Optional. A private ACME CA, selected by keys = "internal" (alias "step-ca").
-# step-ca speaks ACME, so its provisioner directory is all uping needs. The
-# certificate is for the domain, not the IP: the A record may point to 10.8.0.1.
-# The client must trust the step-ca ROOT (installed once per client); uping
-# cannot push it. `ca_bundle` below only lets uping trust the ACME API itself.
+# uping does NOT create the step-ca root or a client certificate. Run `step ca
+# init` once, copy its root certificate (root_ca.crt, public part only) where
+# uping can read it, and point `ca_bundle` at that file. `ca_bundle` only lets
+# uping trust the ACME API's TLS certificate; it is not pushed to clients.
+# The leaf for the domain is requested and renewed by uping automatically.
 # [acme.internal]
 # directory = "https://step-ca.internal/acme/acme/directory"
-# ca_bundle = "certs/step-ca-root.pem"
+# ca_bundle = "cert/step-ca-root.pem"
 #
 # keys = "internal" still uses http-01: step-ca must resolve the name (internal
 # DNS) and reach the host on port 80. If it cannot, use keys = "manual".
@@ -78,8 +81,9 @@ upstream = "127.0.0.1:8080"       # catch-all: every path without its own route
 # Optional. Give this domain its own HTTPS listener instead of the global one.
 # `https_listen` is IPv4, `https_listen6` is IPv6; each may carry a port, which
 # defaults to `[listen] https`. HTTP stays host-wide: it is the redirect and the
-# ACME challenge listener, unless `serve_http = false` removes this domain from
-# port 80.
+# ACME challenge listener. For an ACME server, this same IP is also bound on
+# `[listen] http` so http-01 can follow the domain onto this address, unless
+# `serve_http = false` removes this domain from port 80.
 # https_listen  = "203.0.113.10"
 # https_listen6 = "[2001:db8::10]:8443"
 # serve_http    = false           # no :80 vhost (private/VPN site; needs manual keys)
@@ -124,7 +128,7 @@ upstream = "127.0.0.1:8080"       # catch-all: every path without its own route
 # domain        = "app.vpn.rao-nagos.pf"
 # keys          = "internal"
 # upstream      = "127.0.0.1:8080"
-# https_listen  = "10.8.0.1"      # the wg0 address
+# https_listen  = "10.8.0.1"      # the rupa VPN address
 # limits        = { per_ip_rps = 50 }
 # health        = { interval_ms = 15000 }
 

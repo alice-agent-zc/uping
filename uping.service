@@ -1,46 +1,36 @@
-# uping — user systemd unit (no root daemon).
+# uping — systemd unit for the root install.
 #
 # Install:
-#   sudo setcap 'cap_net_bind_service=+ep' %h/uping/target/release/uping
-#   mkdir -p ~/.config/systemd/user
-#   cp uping.service ~/.config/systemd/user/
-#   systemctl --user daemon-reload
-#   systemctl --user enable --now uping
-#   loginctl enable-linger "$USER"      # start at boot, not only at login
+#   sudo install -m644 uping.service /etc/systemd/system/uping.service
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now uping
 #
-# After editing config.toml:
-#   systemctl --user reload uping       # SIGHUP, no restart, no dropped conn
-# Restart after installing a new binary, or after changing [listen], a server's
-# listen/listen6, or [[stream]] (sockets cannot be rebound under a live process):
-#   systemctl --user restart uping
+# The process runs as root and binds 80/443 directly: no CAP_NET_BIND_SERVICE,
+# no setcap. It is ordered after rupa.service so a VPN address such as
+# 10.8.0.1 exists before uping binds it.
 #
-# The capability lives on the binary and is lost on every rebuild; re-apply it.
-# `AmbientCapabilities` is deliberately not used: systemd should not grant the
-# service a capability the binary can hold by itself, and it does not work in a
-# user manager without extra setup.
-#
-# Paths assume a source checkout at ~/uping. Adjust WorkingDirectory/ExecStart
-# if yours differs; certificates live under <config dir>/cert/.
+# Apply an edited config without dropping connections:
+#   sudo systemctl reload uping
+# A new binary, or a change to [listen], https_listen/https_listen6,
+# [acme]/[acme.internal] or [[stream]], needs a restart:
+#   sudo systemctl restart uping
 
 [Unit]
-Description=uping reverse proxy (user mode)
-After=network.target
-# Stop a crash loop instead of restarting forever: five starts in five minutes.
-# Without this, a fatal config/TLS error (or an ACME CA rejection) is retried
-# every RestartSec and can hammer a CA's rate limit.
+Description=uping reverse proxy
+Documentation=https://github.com/raonagos/uping
+After=network-online.target rupa.service
+Wants=network-online.target rupa.service
 StartLimitIntervalSec=300
 StartLimitBurst=5
 
 [Service]
 Type=simple
-WorkingDirectory=%h/uping
-ExecStart=%h/uping/target/release/uping %h/uping/config.toml
+WorkingDirectory=/etc/uping
+ExecStart=/usr/bin/uping /etc/uping/config.toml
 ExecReload=/bin/kill -HUP $MAINPID
-# AmbientCapabilities denied, use `sudo setcap 'cap_net_bind_service=+ep' path/to/binary` instead
-#AmbientCapabilities=CAP_NET_BIND_SERVICE
 Restart=on-failure
 RestartSec=10
 Environment=RUST_LOG=info
 
 [Install]
-WantedBy=default.target
+WantedBy=multi-user.target

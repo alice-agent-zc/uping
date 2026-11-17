@@ -5,7 +5,7 @@ uping obtain the certificate, done. It also serves a directory without a
 backend, works over IPv4 and IPv6, and applies a new config on `SIGHUP` — no
 restart for a config change.
 
-## Status — v0.3.1
+## Status — v0.3.2
 
 - ✅ HTTPS reverse proxy with SNI, one certificate per domain
 - ✅ Let's Encrypt (`keys = "auto"`) and private ACME CAs, including step-ca
@@ -13,6 +13,7 @@ restart for a config change.
 - ✅ Static files (`root`) and path routing (`routes = [...]`)
 - ✅ One `[listen]` for the host, plus per-domain `https_listen` / `https_listen6`
 - ✅ Private sites on a VPN address, `serve_http = false`, and `uping --dns-zone`
+- ✅ ACME http-01 follows an explicit `https_listen` onto the same IP at `:80`
 - ✅ HTTP → HTTPS redirect, per-IP connection limits, request/body caps
   overridable per domain
 - ✅ Upstream health checks (`503` at once when a backend dies), per-domain
@@ -73,8 +74,11 @@ Start it in the foreground as root:
 sudo /usr/bin/uping /etc/uping/config.toml
 ```
 
-It logs to stderr and stays in the foreground. Run it from your init system if
-it must start at boot; no capability is needed because the process is root.
+It logs to stderr and stays in the foreground. The release also ships
+[`uping.service`](uping.service), a root unit that runs this exact command and
+orders itself after `rupa.service`, so a VPN address such as `10.8.0.1` exists
+before uping binds it. Install it with your init system if it must start at
+boot; no capability is needed because the process is root.
 
 Every path in `config.toml` is relative to `/etc/uping` unless it is absolute.
 The default `cert_dir = "cert"` therefore writes:
@@ -152,6 +156,11 @@ https = 443
 to disable IPv6. A server can override its HTTPS socket with `https_listen` /
 `https_listen6`; HTTP stays host-wide because it is where ACME http-01 answers
 and where the redirect lives.
+
+For an ACME server with an explicit `https_listen` / `https_listen6`, uping
+also binds the same IP on `[listen] http`. A private site on `10.8.0.1:443`
+therefore gets `10.8.0.1:80` automatically for http-01. A derived socket already
+covered by a wildcard or the same address is not added twice.
 
 ### `[limits]` — abuse protection
 
@@ -247,27 +256,98 @@ failed-authorization budget.
 
 ### `[acme.internal]` — private ACME CA (step-ca)
 
-```toml
-[acme.internal]                    # [acme.step-ca] is an accepted alias
-directory = "https://step-ca.internal/acme/acme/directory"
-ca_bundle = "/etc/uping/cert/step-ca-root.pem"
-```
+`keys = "internal"` (alias `"step-ca"`) selects this profile. It still uses
+**http-01**: the private CA must resolve the domain and reach the host on port
+80, and `serve_http = true` is required. `staging` does not apply to this
+profile. Accounts are stored per directory URL, so public and private CAs never
+share one.
 
 | Field | Default | Meaning |
 |---|---|---|
 | `directory` | required | The provisioner's ACME directory URL |
 | `ca_bundle` | inherits `[acme] ca_bundle` | PEM root that signs the ACME server |
 
-`keys = "internal"` (alias `"step-ca"`) selects this profile. It still uses
-**http-01**: the private CA must reach the domain on port 80, and
-`serve_http = true` is required. `staging` does not apply to this profile.
-Accounts are stored per directory URL, so public and private CAs never share
-one.
+uping does **not** initialize step-ca, create its root CA, or generate a client
+certificate. You install step-ca once, then give uping two things: the
+provisioner's ACME directory URL and the root certificate that signs the ACME
+server's TLS certificate.
 
-**Important:** `ca_bundle` is the trust anchor for uping → ACME server. It is
-**not** pushed to clients. Clients must trust the private CA root themselves
-(install the same root once in the OS/browser/MDM). Without that, the issued
-certificate is not trusted, no matter what uping does.
+#### Set up step-ca once
+
+1. Initialize the CA on the step-ca host:
+
+   ```sh
+   step ca init
+   ```
+
+   This creates the root and intermediate CA — often
+   `~/.step/certs/root_ca.crt` and `~/.step/certs/intermediate_ca.crt` — and
+   the CA configuration.
+
+2. Check that an ACME provisioner exists:
+
+   ```sh
+   step ca provisioner list
+   ```
+
+   If it is missing:
+
+   ```sh
+   step ca provisioner add acme --type ACME
+   ```
+
+   The directory URL for a provisioner named `acme` is
+   `https://<ca-host>/acme/acme/directory`; adjust the path for another
+   provisioner name.
+
+3. Copy the **root** certificate — the public certificate only, never the root
+   private key — somewhere uping can read:
+
+   ```sh
+   sudo install -m644 "$(step path)/certs/root_ca.crt" /etc/uping/cert/step-ca-root.pem
+   ```
+
+   If the ACME endpoint serves only the leaf and not its intermediate, append
+   `intermediate_ca.crt` to the bundle as well.
+
+4. Point uping at the directory and that root:
+
+   ```toml
+   [acme.internal]                    # [acme.step-ca] is an accepted alias
+   directory = "https://step-ca.internal/acme/acme/directory"
+   ca_bundle = "/etc/uping/cert/step-ca-root.pem"
+   ```
+
+   `ca_bundle` is the trust anchor for uping → ACME server. It is **not** a
+   client certificate and **not** the leaf certificate for your domain. If the
+   ACME endpoint has a publicly trusted certificate, `ca_bundle` may be empty;
+   with step-ca's own certificate, point it at the root.
+
+5. Use the private profile on the server:
+
+   ```toml
+   [[server]]
+   domain       = "site1.internal.rao-nagos.pf"
+   keys         = "internal"
+   upstream     = "127.0.0.1:8080"
+   https_listen = "10.8.0.1"      # the rupa VPN address
+   # serve_http = true (default): http-01 answers on 10.8.0.1:80
+   ```
+
+   uping creates the ACME account and the leaf certificate automatically:
+
+   ```text
+   /etc/uping/cert/acme-account-<hash>.json
+   /etc/uping/cert/site1.internal.rao-nagos.pf/fullchain.pem
+   /etc/uping/cert/site1.internal.rao-nagos.pf/privkey.pem
+   ```
+
+**Important:** `ca_bundle` is only the trust anchor for uping → ACME server. It
+is **not** pushed to clients. Clients must trust the step-ca **root** themselves
+(install `root_ca.crt` once in the OS/browser/MDM). Without that, the issued
+certificate is not trusted, no matter what uping does. Do not put the root
+private key or a manually generated leaf certificate in uping's `cert_dir`:
+uping writes the leaf itself.
 
 ## `[[server]]` — every shape
 
@@ -399,7 +479,7 @@ ca_bundle = "/etc/uping/cert/step-ca-root.pem"
 domain       = "site1.internal.rao-nagos.pf"
 keys         = "internal"
 upstream     = "127.0.0.1:8080"
-https_listen = "10.8.0.1"       # wg0
+https_listen = "10.8.0.1"       # the rupa VPN address
 # serve_http = true (default): step-ca validates via http-01
 ```
 
@@ -407,8 +487,8 @@ This is automatic leaf issuance and renewal, but the **client** must trust the
 step-ca root. You install that root once per client; you do not install each
 leaf. The private CA can validate a name that only exists in your internal DNS:
 no public zone change is required, provided step-ca can resolve the name and
-reach the host on port 80. See [Private names, WireGuard and
-DNS](#private-names-wireguard-and-dns).
+reach the host on port 80. See [Private names, rupa and
+DNS](#private-names-rupa-and-dns).
 
 ### 10. Explicit `keys = "auto"`
 
@@ -473,11 +553,11 @@ One listener per entry; duplicate sockets are a config error. Half-close is
 forwarded. There is no idle timeout and no TLS termination — terminate it in
 the upstream.
 
-## Private names, WireGuard and DNS
+## Private names, rupa and DNS
 
-A VPS that also runs WireGuard can host services that exist only inside the
-tunnel. uping does **not** serve DNS; the WireGuard-side resolver owns that. It
-renders the records its config already knows:
+A VPS that also runs rupa can host services that exist only inside the tunnel.
+uping does **not** serve DNS; the rupa-side resolver owns that. It renders the
+records its config already knows:
 
 ```sh
 uping --dns-zone config.toml
@@ -488,12 +568,12 @@ uping --dns-zone config.toml
 - The address comes from the site's `https_listen` / `https_listen6`, or from
   `[listen] ipv4` / `ipv6` when there is no override.
 - A wildcard (`0.0.0.0`, `::`) is refused: a DNS record must name a real
-  address. Set a concrete `https_listen` (the `wg0` address).
+  address. Set a concrete `https_listen` (the rupa VPN address).
 - Load it with dnsmasq `addn-hosts=`, CoreDNS `hosts`, or `/etc/hosts`.
   Do **not** use `local=/rao-nagos.pf/` for a subdomain of a public zone; that
   would capture the whole public zone. `addn-hosts=` alone is enough, or
   `local=/internal.rao-nagos.pf/` if you are authoritative for that subdomain.
-- Clients set their DNS to the WireGuard resolver.
+- Clients set their DNS to the rupa resolver.
 
 ### Trust model for private names
 
@@ -514,7 +594,8 @@ installation.
 
 For step-ca:
 
-1. Run step-ca on (or reachable from) the WireGuard network, with a root CA.
+1. Run step-ca on (or reachable from) the rupa network, with a root CA; see
+   [Set up step-ca once](#set-up-step-ca-once).
 2. Configure its ACME provisioner and its DNS so it resolves the private names
    (the internal resolver, or `/etc/hosts`).
 3. Keep `serve_http = true` so http-01 can answer on port 80.
@@ -539,12 +620,12 @@ configured domain and family — for dnsmasq, CoreDNS or `/etc/hosts`:
 ```sh
 /usr/bin/uping --dns-zone /etc/uping/config.toml | sudo tee /etc/dnsmasq.d/uping.hosts
 # dnsmasq.conf: addn-hosts=/etc/dnsmasq.d/uping.hosts
-#                interface=wg0
+#                interface=<rupa-interface>
 #                bind-interfaces
 ```
 
-On the client, `DNS = 10.8.0.1` in the WireGuard config. Public names keep
-resolving through the forwarder; your internal names only exist in the tunnel.
+On the client, `DNS = 10.8.0.1` in the rupa config. Public names keep resolving
+through the forwarder; your internal names only exist in the tunnel.
 
 ## License
 

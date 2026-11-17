@@ -83,6 +83,7 @@ tests/
   sighup_e2e.rs    # SIGHUP, bad config, listener warning
   static_e2e.rs    # static serving through the real binary
   stream_e2e.rs    # raw TCP through the real binary
+uping.service      # root system unit, ordered after rupa.service
 ```
 
 ### Config
@@ -95,6 +96,9 @@ matter to a contributor:
   There is no global route table: a route cannot drift to another domain.
 - Every path is resolved against the config file's directory unless it is
   absolute. `index` is a bare file name, not a path.
+- The HTTP sockets are `[listen] ipv4`/`ipv6` plus, for each ACME server with
+  an explicit `https_listen`/`https_listen6`, the same IP on `[listen] http`.
+  `Config::http_addrs` owns that derivation; http-01 always uses the HTTP port.
 - A server and a route need exactly one of `upstream` / `root`.
 - `keys` is inferred when omitted: no key paths → `auto`; both → `manual`.
   `auto` and `internal` are the only ACME modes and require `serve_http = true`.
@@ -121,6 +125,11 @@ through the challenge store, wait for the CA, write the pair atomically, then
 install it into the live resolver. The startup path binds the HTTP address
 itself (`obtain_missing`); a `SIGHUP` uses the already-running listener
 (`obtain_missing_live`).
+
+The HTTP challenge listener follows an ACME server's explicit
+`https_listen`/`https_listen6` onto the same IP at `[listen] http`; see
+`Config::http_addrs`. That is what lets a private site on the rupa VPN answer
+http-01 on `10.8.0.1:80` without a second address setting.
 
 Startup issuance is best effort: `obtain_missing` returns whether every order
 succeeded, and a failure is logged rather than returned as an error. Only
@@ -200,7 +209,9 @@ curl -i  --resolve test.local:8088:127.0.0.1 http://test.local:8088/   # 301
 Production is the root install in the README: `/usr/bin/uping`,
 `/etc/uping/config.toml` and `/etc/uping/cert`. The process runs as root and
 binds 80/443 without a capability; a checkout under `~/uping` plus
-`CAP_NET_BIND_SERVICE` is not the supported layout.
+`CAP_NET_BIND_SERVICE` is not the supported layout. `uping.service` is the root
+unit: it runs that binary and config, and starts after `rupa.service` so a VPN
+listen address exists before the bind.
 
 ## Release
 
@@ -208,8 +219,8 @@ Publishing is tag-driven. A tag names the exact commit that becomes the
 release, so the asset and the crate cannot drift from the source:
 
 ```sh
-git tag v0.3.1
-git push origin v0.3.1
+git tag v0.3.2
+git push origin v0.3.2
 ```
 
 Two workflows run on `v*` tags:

@@ -113,9 +113,10 @@ pub struct Config {
 /// written bare (`"2001:db8::1"`, no brackets and no port); empty means "do not
 /// listen on IPv6". `http` and `https` are single ports, default 80 and 443.
 ///
-/// There is deliberately no wildcard syntax and no address list: a listener is
-/// one concrete address. A host that owns several addresses lists them on the
-/// `[[server]]` entries that need them with `https_listen` / `https_listen6`.
+/// There is deliberately no address list: a listener is one concrete address.
+/// A host that owns several addresses lists them on the `[[server]]` entries
+/// that need them with `https_listen` / `https_listen6`. The HTTP listener
+/// also follows an ACME server onto that address; see [`Config::http_addrs`].
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Listen {
@@ -344,6 +345,31 @@ impl Config {
         }
         groups.sort_by(|a, b| a.key.cmp(&b.key));
         Ok(groups)
+    }
+
+    /// The sockets of the host-wide HTTP listener.
+    ///
+    /// It starts with `[listen] ipv4` / `ipv6` and adds, for every ACME server
+    /// with an explicit HTTPS address, the same IP on `[listen] http`. http-01
+    /// always uses the HTTP port, even when the domain's TLS listener is on a
+    /// different address or port: a private proof on `10.8.0.1:443` needs
+    /// `10.8.0.1:80`, not another setting. A derived socket already covered by
+    /// the global listener (same address, or a wildcard) is not added twice.
+    pub fn http_addrs(&self) -> Result<Vec<SocketAddr>> {
+        let mut out = self.listen.http_addrs()?;
+        for s in &self.servers {
+            if !s.serve_http || !s.key_mode().is_acme() {
+                continue;
+            }
+            let (v4, v6) = s.binds(self.listen.https)?;
+            for addr in [v4, v6].into_iter().flatten() {
+                let http = SocketAddr::new(addr.ip(), self.listen.http);
+                if !out.iter().any(|existing| addrs_conflict(existing, &http)) {
+                    out.push(http);
+                }
+            }
+        }
+        Ok(out)
     }
 }
 
@@ -1396,7 +1422,7 @@ fn validate_routes(
 /// refusal at startup: one of the two ports would keep working and the operator
 /// would have no way to know which.
 fn validate_streams(cfg: &mut Config) -> Result<()> {
-    let http = cfg.listen.http_addrs()?;
+    let http = cfg.http_addrs()?;
     let https = cfg.listen.https_addrs()?;
     let bound = !cfg.servers.is_empty();
 
@@ -1452,7 +1478,7 @@ fn validate_streams(cfg: &mut Config) -> Result<()> {
 /// twice would fail at startup with a bare `EADDRINUSE`, so the config loader
 /// rejects the overlap first and names both sides.
 fn validate_listeners(cfg: &Config) -> Result<()> {
-    let http = cfg.listen.http_addrs()?;
+    let http = cfg.http_addrs()?;
     let groups = cfg.https_groups()?;
 
     for (i, g) in groups.iter().enumerate() {
@@ -2671,6 +2697,50 @@ upstream = "127.0.0.1:8080"
             &format!("[listen]\nipv4 = \"127.0.0.1\"\n{MINIMAL}"),
         );
         assert!(Config::load(&path).unwrap().listen.ipv6.is_none());
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn an_acme_https_listen_also_binds_http_on_the_same_ip() {
+        let path = write_temp(
+            "http-follows-acme.toml",
+            "[listen]\nipv4 = \"203.0.113.10\"\nhttp = 80\nhttps = 443\n\
+             [acme.internal]\ndirectory = \"https://step-ca.internal/acme/acme/directory\"\n\
+             [[server]]\ndomain = \"site1.internal.rao-nagos.pf\"\nkeys = \"internal\"\n\
+             https_listen = \"10.8.0.1\"\nhttps_listen6 = \"2001:db8::10\"\n\
+             upstream = \"127.0.0.1:8080\"\n",
+        );
+        let cfg = Config::load(&path).unwrap();
+        let http: Vec<String> = cfg
+            .http_addrs()
+            .unwrap()
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        assert_eq!(
+            http,
+            vec!["203.0.113.10:80", "10.8.0.1:80", "[2001:db8::10]:80"]
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn a_manual_https_listen_does_not_add_http() {
+        let path = write_temp(
+            "http-follows-manual.toml",
+            "[listen]\nipv4 = \"127.0.0.1\"\nhttp = 8080\nhttps = 8443\n\
+             [[server]]\ndomain = \"manual.local\"\nkeys = \"manual\"\n\
+             pub_key = \"certs/manual.local.crt\"\npriv_key = \"certs/manual.local.key\"\n\
+             https_listen = \"127.0.0.2\"\nupstream = \"127.0.0.1:8080\"\n",
+        );
+        let cfg = Config::load(&path).unwrap();
+        let http: Vec<String> = cfg
+            .http_addrs()
+            .unwrap()
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        assert_eq!(http, vec!["127.0.0.1:8080"]);
         let _ = std::fs::remove_file(path);
     }
 
