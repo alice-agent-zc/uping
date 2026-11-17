@@ -34,10 +34,11 @@
 # ca_bundle         = ""           # PEM root for the ACME server; empty = system roots
 
 # Optional. A private ACME CA, selected by keys = "internal" (alias "step-ca").
-# uping does NOT create the step-ca root or a client certificate. Run `step ca
-# init` once, copy its root certificate (root_ca.crt, public part only) where
-# uping can read it, and point `ca_bundle` at that file. `ca_bundle` only lets
-# uping trust the ACME API's TLS certificate; it is not pushed to clients.
+# uping does NOT create the step-ca root or a client certificate. Run
+# `sudo step ca init --deployment-type standalone --acme` once, copy its root
+# certificate (root_ca.crt, public part only) where uping can read it, and
+# point `ca_bundle` at that file. `ca_bundle` only lets uping trust the ACME
+# API's TLS certificate; it is not pushed to clients.
 # The leaf for the domain is requested and renewed by uping automatically.
 # [acme.internal]
 # directory = "https://step-ca.internal/acme/acme/directory"

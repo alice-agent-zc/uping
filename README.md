@@ -274,39 +274,45 @@ server's TLS certificate.
 
 #### Set up step-ca once
 
-1. Initialize the CA on the step-ca host:
+1. Initialize the CA on the step-ca host. At the deployment-type prompt choose
+   **Standalone**: `Linked` adds Smallstep cloud configuration/reporting and
+   `Hosted` is Smallstep's managed CA. For a CA you run yourself on rupa,
+   Standalone is the right choice. `--acme` creates the ACME provisioner:
 
    ```sh
-   step ca init
+   sudo step ca init --deployment-type standalone --acme
    ```
 
-   This creates the root and intermediate CA — often
-   `~/.step/certs/root_ca.crt` and `~/.step/certs/intermediate_ca.crt` — and
-   the CA configuration.
-
-2. Check that an ACME provisioner exists:
+   Without `--acme`, add the provisioner after step-ca is running:
 
    ```sh
-   step ca provisioner list
-   ```
-
-   If it is missing:
-
-   ```sh
-   step ca provisioner add acme --type ACME
+   sudo step ca provisioner add acme --type ACME
    ```
 
    The directory URL for a provisioner named `acme` is
    `https://<ca-host>/acme/acme/directory`; adjust the path for another
    provisioner name.
 
+   This creates the root and intermediate CA — often
+   `/root/.step/certs/root_ca.crt` and `intermediate_ca.crt` when run with
+   `sudo` — plus the CA configuration.
+
+2. Start step-ca and check the provisioner once it is reachable:
+
+   ```sh
+   sudo step ca provisioner list
+   ```
+
 3. Copy the **root** certificate — the public certificate only, never the root
    private key — somewhere uping can read:
 
    ```sh
-   sudo install -m644 "$(step path)/certs/root_ca.crt" /etc/uping/cert/step-ca-root.pem
+   sudo install -m644 "$(sudo step path)/certs/root_ca.crt" /etc/uping/cert/step-ca-root.pem
    ```
 
+   `sudo step ca init` writes under `/root/.step`, so use `sudo step path` here,
+   not the unprivileged user's path. If step-ca runs as a dedicated user,
+   initialize as that user (or pass `--root`/`--key`) so it can read the keys.
    If the ACME endpoint serves only the leaf and not its intermediate, append
    `intermediate_ca.crt` to the bundle as well.
 
