@@ -741,17 +741,46 @@ pub struct Internal {
     #[serde(default = "default_internal_cert_dir")]
     pub cert_dir: String,
 
-    /// Subject CN of the root certificate. Informational; it is not a hostname.
-    #[serde(default = "default_internal_common_name")]
+    /// Subject CN of the root certificate. Empty derives
+    /// `uping <zone> Root CA`; the intermediate and the leaves always use
+    /// derived names (`... Intermediate CA`, the hostname).
+    #[serde(default)]
     pub common_name: String,
 
-    /// Subject O of the root certificate.
-    #[serde(default = "default_internal_organization")]
+    /// Subject O, shown by clients next to the name. Empty omits the field.
+    #[serde(default)]
     pub organization: String,
+
+    /// Subject OU. Empty omits the field.
+    #[serde(default)]
+    pub organizational_unit: String,
+
+    /// Subject C, exactly two letters (e.g. `PF`). Empty omits the field.
+    #[serde(default)]
+    pub country: String,
+
+    /// Subject ST (state or province). Empty omits the field.
+    #[serde(default)]
+    pub state: String,
+
+    /// Subject L (locality). Empty omits the field.
+    #[serde(default)]
+    pub locality: String,
+
+    /// Subject `emailAddress`. Informational: TLS clients do not verify it.
+    /// Empty omits the field.
+    #[serde(default)]
+    pub email: String,
 
     /// Root lifetime in days.
     #[serde(default = "default_internal_ca_days")]
     pub ca_days: u64,
+
+    /// Intermediate lifetime in days. It signs the leaves, so it should be
+    /// shorter than the root and long enough not to rotate often; clamped to
+    /// `1..=ca_days`.
+    #[serde(default = "default_internal_intermediate_days")]
+    pub intermediate_days: u64,
 
     /// Leaf lifetime in days. 397 is the Apple/Safari ceiling.
     #[serde(default = "default_internal_leaf_days")]
@@ -781,9 +810,15 @@ impl Default for Internal {
             domain: String::new(),
             ca_dir: default_internal_ca_dir(),
             cert_dir: default_internal_cert_dir(),
-            common_name: default_internal_common_name(),
-            organization: default_internal_organization(),
+            common_name: String::new(),
+            organization: String::new(),
+            organizational_unit: String::new(),
+            country: String::new(),
+            state: String::new(),
+            locality: String::new(),
+            email: String::new(),
             ca_days: default_internal_ca_days(),
+            intermediate_days: default_internal_intermediate_days(),
             leaf_days: default_internal_leaf_days(),
             renew_before_days: default_internal_renew_before_days(),
             key_type: KeyKind::default(),
@@ -800,16 +835,12 @@ fn default_internal_cert_dir() -> String {
     "cert/internal".to_string()
 }
 
-fn default_internal_common_name() -> String {
-    "uping local CA".to_string()
-}
-
-fn default_internal_organization() -> String {
-    "uping".to_string()
-}
-
 fn default_internal_ca_days() -> u64 {
     3650
+}
+
+fn default_internal_intermediate_days() -> u64 {
+    1825
 }
 
 fn default_internal_leaf_days() -> u64 {
@@ -1467,8 +1498,21 @@ fn validate_internal(internal: &mut Internal, root_dir: &Path) -> Result<()> {
     if internal.cert_dir.trim().is_empty() {
         anyhow::bail!("`[internal] cert_dir` is empty; give a directory or omit the field");
     }
-    if internal.common_name.trim().is_empty() {
-        anyhow::bail!("`[internal] common_name` is empty; give a name or omit the field");
+    if !internal.country.trim().is_empty()
+        && (internal.country.trim().len() != 2
+            || !internal
+                .country
+                .trim()
+                .chars()
+                .all(|c| c.is_ascii_alphabetic()))
+    {
+        anyhow::bail!(
+            "`[internal] country` `{}` must be exactly two letters (e.g. `PF`)",
+            internal.country
+        );
+    }
+    if !internal.email.trim().is_empty() && !internal.email.contains('@') {
+        anyhow::bail!("`[internal] email` `{}` is not an address", internal.email);
     }
     internal.domain = internal
         .domain
@@ -1492,6 +1536,7 @@ fn validate_internal(internal: &mut Internal, root_dir: &Path) -> Result<()> {
 
     internal.leaf_days = internal.leaf_days.clamp(1, 825);
     internal.ca_days = internal.ca_days.clamp(internal.leaf_days, 7300);
+    internal.intermediate_days = internal.intermediate_days.clamp(1, internal.ca_days);
     internal.renew_before_days = internal
         .renew_before_days
         .clamp(1, internal.leaf_days.saturating_sub(1).max(1));
@@ -3452,6 +3497,46 @@ upstream = "127.0.0.1:8080"
         assert_eq!(cfg.internal.leaf_days, 825);
         assert_eq!(cfg.internal.ca_days, 825);
         assert_eq!(cfg.internal.renew_before_days, 824);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn internal_identity_fields_are_optional_but_validated_when_set() {
+        let base = "[internal]\ndomain = \"a.local\"\n{}\n\
+                    [[server]]\ndomain = \"a.local\"\nkeys = \"internal\"\n\
+                    upstream = \"127.0.0.1:8080\"\n";
+        for (name, extra, needle) in [
+            ("country.toml", "country = \"France\"", "two letters"),
+            ("email.toml", "email = \"not-an-address\"", "not an address"),
+        ] {
+            let path = write_temp(name, &base.replace("{}", extra));
+            let err = Config::load(&path).unwrap_err().to_string();
+            assert!(err.contains(needle), "{name}: {err}");
+            let _ = std::fs::remove_file(path);
+        }
+
+        let path = write_temp(
+            "identity-ok.toml",
+            &base.replace(
+                "{}",
+                "organization = \"rao-nagos\"\norganizational_unit = \"Infrastructure\"\n\
+                 country = \"PF\"\nstate = \"Windward Islands\"\nlocality = \"Papeete\"\n\
+                 email = \"ops@rao-nagos.pf\"",
+            ),
+        );
+        let cfg = Config::load(&path).unwrap();
+        assert_eq!(cfg.internal.country, "PF");
+        assert_eq!(cfg.internal.email, "ops@rao-nagos.pf");
+        let _ = std::fs::remove_file(path);
+
+        // An intermediate can never outlive the root it chains to.
+        let path = write_temp(
+            "intermediate-days.toml",
+            "[internal]\ndomain = \"a.local\"\nca_days = 400\nintermediate_days = 900\n\
+             [[server]]\ndomain = \"a.local\"\nkeys = \"internal\"\n\
+             upstream = \"127.0.0.1:8080\"\n",
+        );
+        assert_eq!(Config::load(&path).unwrap().internal.intermediate_days, 400);
         let _ = std::fs::remove_file(path);
     }
 

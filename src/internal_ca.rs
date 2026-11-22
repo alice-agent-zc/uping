@@ -50,13 +50,21 @@ use openssl::pkey::{PKey, Private};
 use openssl::rsa::Rsa;
 use openssl::ssl::{SslAcceptor, SslMethod};
 use openssl::x509::extension::{
-    BasicConstraints, ExtendedKeyUsage, KeyUsage, SubjectAlternativeName,
+    AuthorityKeyIdentifier, BasicConstraints, ExtendedKeyUsage, KeyUsage, SubjectAlternativeName,
+    SubjectKeyIdentifier,
 };
 use openssl::x509::{X509NameBuilder, X509};
 
 use crate::acme::cert_is_due;
 use crate::config::{in_zone, parse_serve_root, Config, Internal, KeyKind, ServeRoot, Server};
 use crate::tls::SniResolver;
+
+/// The signing material a leaf needs: the intermediate and its key. The root
+/// is only used to create or rotate that intermediate.
+struct Ca {
+    intermediate: X509,
+    intermediate_key: PKey<Private>,
+}
 
 /// The local CA: its settings, its two paths, and the live resolver it feeds.
 #[derive(Clone)]
@@ -145,13 +153,13 @@ impl LocalCa {
         }
 
         let _guard = self.lock.lock().unwrap_or_else(|e| e.into_inner());
-        let (root, root_key) = self.ensure_root()?;
+        let ca = self.ensure_ca()?;
         let (cert_path, key_path) = self.leaf_paths_for(&domain);
 
         if cert_path.is_file() && key_path.is_file() {
             let pem = fs::read(&cert_path)
                 .with_context(|| format!("reading `{}`", cert_path.display()))?;
-            match self.pair_is_current(&pem, &root, &domain, alt_names) {
+            match self.pair_is_current(&pem, &ca, &domain, alt_names) {
                 Ok(true) => {
                     self.resolver.load_files(&domain, &cert_path, &key_path)?;
                     return Ok(());
@@ -166,9 +174,15 @@ impl LocalCa {
             }
         }
 
-        let (leaf, key) = new_leaf(&self.cfg, &root, &root_key, &domain, alt_names)?;
+        let (leaf, key) = new_leaf(&self.cfg, &ca, &domain, alt_names)?;
+        // Standard server chain: the leaf, then the intermediate. The root is
+        // in the client's trust store and never sent.
         let mut fullchain = leaf.to_pem().context("encoding the leaf")?;
-        fullchain.extend_from_slice(&root.to_pem().context("encoding the root")?);
+        fullchain.extend_from_slice(
+            &ca.intermediate
+                .to_pem()
+                .context("encoding the intermediate")?,
+        );
 
         write_atomic(&cert_path, &fullchain, 0o644)?;
         write_atomic(
@@ -201,18 +215,30 @@ impl LocalCa {
         all_ok
     }
 
-    /// Create the root on first use, then reuse it forever.
-    fn ensure_root(&self) -> Result<(X509, PKey<Private>)> {
+    /// Load or create the root and the intermediate that signs the leaves.
+    ///
+    /// The root is created once and never regenerated. The intermediate is
+    /// created under it on first use (or when an early v0.4 root is upgraded),
+    /// which is why a client that installed the root never has to reinstall it
+    /// when leaves move to a chain. `root.key` is only needed to create or
+    /// rotate the intermediate: once it exists, that key can be kept offline.
+    fn ensure_ca(&self) -> Result<Ca> {
+        let (root, root_key) = self.ensure_root()?;
+        let (intermediate, intermediate_key) = self.ensure_intermediate(&root, root_key)?;
+        Ok(Ca {
+            intermediate,
+            intermediate_key,
+        })
+    }
+
+    /// The root pair, or the root alone when its key has been moved offline.
+    fn ensure_root(&self) -> Result<(X509, Option<PKey<Private>>)> {
         let cert_exists = self.ca_cert.is_file();
         let key_exists = self.ca_key.is_file();
 
         match (cert_exists, key_exists) {
             (true, true) => {
-                let pem = fs::read(&self.ca_cert)
-                    .with_context(|| format!("reading `{}`", self.ca_cert.display()))?;
-                let root = X509::from_pem(&pem).with_context(|| {
-                    format!("parsing the local CA root `{}`", self.ca_cert.display())
-                })?;
+                let root = self.read_cert(&self.ca_cert)?;
                 let key_pem = fs::read(&self.ca_key)
                     .with_context(|| format!("reading `{}`", self.ca_key.display()))?;
                 let key = PKey::private_key_from_pem(&key_pem).with_context(|| {
@@ -230,14 +256,11 @@ impl LocalCa {
                         self.ca_key.display()
                     );
                 }
-                Ok((root, key))
+                Ok((root, Some(key)))
             }
-            (true, false) => anyhow::bail!(
-                "`{}` exists but `{}` does not: restore the key, or remove the root as \
-                 well if you intend to create a new CA",
-                self.ca_cert.display(),
-                self.ca_key.display()
-            ),
+            // The root key may live offline; the intermediate key is enough to
+            // keep issuing leaves.
+            (true, false) => Ok((self.read_cert(&self.ca_cert)?, None)),
             (false, true) => anyhow::bail!(
                 "`{}` exists but `{}` does not: restore the root, or remove the key as \
                  well if you intend to create a new CA",
@@ -245,7 +268,7 @@ impl LocalCa {
                 self.ca_cert.display()
             ),
             (false, false) => {
-                let (root, key) = new_root(&self.cfg)?;
+                let (root, key) = new_root(&self.cfg, &self.zone)?;
                 write_atomic(
                     &self.ca_cert,
                     &root.to_pem().context("encoding the root")?,
@@ -265,24 +288,172 @@ impl LocalCa {
                     self.cfg.ca_days,
                     self.zone
                 );
-                Ok((root, key))
+                Ok((root, Some(key)))
             }
         }
+    }
+
+    /// The intermediate that signs the leaves. Created under an existing root
+    /// when missing, so a first run upgrades without touching client trust.
+    fn ensure_intermediate(
+        &self,
+        root: &X509,
+        root_key: Option<PKey<Private>>,
+    ) -> Result<(X509, PKey<Private>)> {
+        let cert_path = self.ca_dir().join("intermediate.crt");
+        let key_path = self.ca_dir().join("intermediate.key");
+        match (cert_path.is_file(), key_path.is_file()) {
+            (true, true) => {
+                let cert = self.read_cert(&cert_path)?;
+                let key_pem = fs::read(&key_path)
+                    .with_context(|| format!("reading `{}`", key_path.display()))?;
+                let key = PKey::private_key_from_pem(&key_pem)
+                    .with_context(|| format!("parsing `{}`", key_path.display()))?;
+                let public = cert.public_key().context("reading the intermediate key")?;
+                if !public.public_eq(&key) {
+                    anyhow::bail!(
+                        "`{}` and `{}` do not match",
+                        cert_path.display(),
+                        key_path.display()
+                    );
+                }
+                let root_public = root.public_key().context("reading the root public key")?;
+                if !cert
+                    .verify(&root_public)
+                    .context("verifying the intermediate signature")?
+                {
+                    // A new root was created over an older intermediate (a test
+                    // reset, or a deliberate root replacement). Re-sign the
+                    // intermediate when the root key is there; otherwise say so.
+                    let Some(root_key) = root_key.as_ref() else {
+                        anyhow::bail!(
+                            "`{}` is not signed by `{}` and there is no root key to \
+                             reissue it",
+                            cert_path.display(),
+                            self.ca_cert.display()
+                        );
+                    };
+                    info!(
+                        "internal CA: `{}` is not signed by the current root; reissuing",
+                        cert_path.display()
+                    );
+                    let (cert, key) = new_intermediate(&self.cfg, root, root_key, &self.zone)?;
+                    self.write_intermediate(&cert, &key, &cert_path, &key_path)?;
+                    return Ok((cert, key));
+                }
+                if cert_is_due(
+                    &cert.to_pem().context("encoding the intermediate")?,
+                    self.cfg.renew_before_days,
+                )? {
+                    let Some(root_key) = root_key.as_ref() else {
+                        warn!(
+                            "internal CA: `{}` expires within {} days and `{}` is \
+                             offline; restore it once to rotate the intermediate \
+                             (clients keep trusting the root)",
+                            cert_path.display(),
+                            self.cfg.renew_before_days,
+                            self.ca_key.display()
+                        );
+                        return Ok((cert, key));
+                    };
+                    info!(
+                        "internal CA: intermediate expires within {} days; rotating",
+                        self.cfg.renew_before_days
+                    );
+                    let (cert, key) = new_intermediate(&self.cfg, root, root_key, &self.zone)?;
+                    self.write_intermediate(&cert, &key, &cert_path, &key_path)?;
+                    Ok((cert, key))
+                } else {
+                    Ok((cert, key))
+                }
+            }
+            (false, false) => {
+                let Some(root_key) = root_key.as_ref() else {
+                    anyhow::bail!(
+                        "the intermediate is missing and `{}` is not there to create it; \
+                         restore the root key once",
+                        self.ca_key.display()
+                    );
+                };
+                let (cert, key) = new_intermediate(&self.cfg, root, root_key, &self.zone)?;
+                self.write_intermediate(&cert, &key, &cert_path, &key_path)?;
+                info!(
+                    "internal CA: created `{}` under `{}`; leaves now chain to it and \
+                     clients keep trusting the root",
+                    cert_path.display(),
+                    self.ca_cert.display()
+                );
+                Ok((cert, key))
+            }
+            (true, false) => anyhow::bail!(
+                "`{}` exists but `{}` does not: restore the pair",
+                cert_path.display(),
+                key_path.display()
+            ),
+            (false, true) => anyhow::bail!(
+                "`{}` exists but `{}` does not: restore the pair",
+                key_path.display(),
+                cert_path.display()
+            ),
+        }
+    }
+
+    fn write_intermediate(
+        &self,
+        cert: &X509,
+        key: &PKey<Private>,
+        cert_path: &Path,
+        key_path: &Path,
+    ) -> Result<()> {
+        write_atomic(
+            cert_path,
+            &cert.to_pem().context("encoding the intermediate")?,
+            0o644,
+        )?;
+        write_atomic(
+            key_path,
+            &key.private_key_to_pem_pkcs8()
+                .context("encoding the intermediate key")?,
+            0o600,
+        )
+    }
+
+    fn ca_dir(&self) -> PathBuf {
+        self.ca_cert
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| PathBuf::from("."))
+    }
+
+    fn read_cert(&self, path: &Path) -> Result<X509> {
+        let pem = fs::read(path).with_context(|| format!("reading `{}`", path.display()))?;
+        X509::from_pem(&pem).with_context(|| format!("parsing `{}`", path.display()))
     }
 
     /// Is the pair on disk still exactly what this name needs?
     fn pair_is_current(
         &self,
         pem: &[u8],
-        root: &X509,
+        ca: &Ca,
         domain: &str,
         alt_names: &[String],
     ) -> Result<bool> {
         if cert_is_due(pem, self.cfg.renew_before_days)? {
             return Ok(false);
         }
-        let leaf = X509::from_pem(pem).context("parsing the leaf certificate")?;
-        let public = root.public_key().context("reading the root public key")?;
+        let mut chain = X509::stack_from_pem(pem).context("parsing the leaf chain")?;
+        if chain.len() < 2 {
+            // A v0.4.0 leaf without its intermediate: reissue with the chain.
+            return Ok(false);
+        }
+        let leaf = chain.remove(0);
+        if chain[0].to_der().ok() != ca.intermediate.to_der().ok() {
+            return Ok(false);
+        }
+        let public = ca
+            .intermediate
+            .public_key()
+            .context("reading the intermediate public key")?;
         if !leaf
             .verify(&public)
             .context("verifying the leaf signature")?
@@ -442,17 +613,45 @@ fn random_serial() -> Result<openssl::asn1::Asn1Integer> {
     openssl::asn1::Asn1Integer::from_bn(&serial).context("encoding a serial")
 }
 
-fn new_root(cfg: &Internal) -> Result<(X509, PKey<Private>)> {
-    let key = new_key(cfg.key_type)?;
-
-    let mut name = X509NameBuilder::new().context("building the root name")?;
-    name.append_entry_by_text("CN", cfg.common_name.trim())
-        .context("setting the root CN")?;
-    if !cfg.organization.trim().is_empty() {
-        name.append_entry_by_text("O", cfg.organization.trim())
-            .context("setting the root O")?;
+/// The subject of every certificate: CN plus whichever identity fields were
+/// set. Empty fields are omitted, so a default configuration produces a clean
+/// certificate instead of empty RDNs.
+fn subject(cfg: &Internal, common_name: &str) -> Result<openssl::x509::X509Name> {
+    let mut name = X509NameBuilder::new().context("building a subject")?;
+    name.append_entry_by_text("CN", common_name)
+        .context("setting CN")?;
+    for (field, value) in [
+        ("O", &cfg.organization),
+        ("OU", &cfg.organizational_unit),
+        ("C", &cfg.country),
+        ("ST", &cfg.state),
+        ("L", &cfg.locality),
+        ("emailAddress", &cfg.email),
+    ] {
+        if !value.trim().is_empty() {
+            name.append_entry_by_text(field, value.trim())
+                .with_context(|| format!("setting {field}"))?;
+        }
     }
-    let name = name.build();
+    Ok(name.build())
+}
+
+fn zone_label(zone: &str) -> &str {
+    if zone.is_empty() {
+        "local"
+    } else {
+        zone
+    }
+}
+
+fn new_root(cfg: &Internal, zone: &str) -> Result<(X509, PKey<Private>)> {
+    let key = new_key(cfg.key_type)?;
+    let common_name = if cfg.common_name.trim().is_empty() {
+        format!("uping {} Root CA", zone_label(zone))
+    } else {
+        cfg.common_name.trim().to_string()
+    };
+    let name = subject(cfg, &common_name)?;
 
     let mut cert = X509::builder().context("creating the root certificate")?;
     cert.set_version(2).context("setting the root version")?;
@@ -475,6 +674,7 @@ fn new_root(cfg: &Internal) -> Result<(X509, PKey<Private>)> {
         BasicConstraints::new()
             .critical()
             .ca()
+            .pathlen(1) // root -> intermediate -> leaf
             .build()
             .context("building the root basic constraints")?,
     )
@@ -489,29 +689,107 @@ fn new_root(cfg: &Internal) -> Result<(X509, PKey<Private>)> {
             .context("building the root key usage")?,
     )
     .context("adding the root key usage")?;
+    let ski = {
+        let context = cert.x509v3_context(None, None);
+        SubjectKeyIdentifier::new()
+            .build(&context)
+            .context("building the root subject key identifier")?
+    };
+    cert.append_extension(ski)
+        .context("adding the root subject key identifier")?;
     cert.sign(&key, digest(cfg.key_type))
         .context("signing the root")?;
     Ok((cert.build(), key))
 }
 
-fn new_leaf(
+fn new_intermediate(
     cfg: &Internal,
     root: &X509,
     root_key: &PKey<Private>,
+    zone: &str,
+) -> Result<(X509, PKey<Private>)> {
+    let key = new_key(cfg.key_type)?;
+    let common_name = format!("uping {} Intermediate CA", zone_label(zone));
+    let name = subject(cfg, &common_name)?;
+
+    let mut cert = X509::builder().context("creating the intermediate certificate")?;
+    cert.set_version(2)
+        .context("setting the intermediate version")?;
+    let serial = random_serial()?;
+    cert.set_serial_number(&serial)
+        .context("setting the intermediate serial")?;
+    cert.set_subject_name(&name)
+        .context("setting the intermediate subject")?;
+    cert.set_issuer_name(root.subject_name())
+        .context("setting the intermediate issuer")?;
+    cert.set_pubkey(&key)
+        .context("setting the intermediate key")?;
+    let not_before = when_in(-86_400)?;
+    cert.set_not_before(&not_before)
+        .context("setting the intermediate not-before")?;
+    let not_after = when_in((cfg.intermediate_days as i64) * 86_400)?;
+    cert.set_not_after(&not_after)
+        .context("setting the intermediate not-after")?;
+    cert.append_extension(
+        BasicConstraints::new()
+            .critical()
+            .ca()
+            .pathlen(0)
+            .build()
+            .context("building the intermediate basic constraints")?,
+    )
+    .context("adding the intermediate basic constraints")?;
+    cert.append_extension(
+        KeyUsage::new()
+            .critical()
+            .key_cert_sign()
+            .crl_sign()
+            .digital_signature()
+            .build()
+            .context("building the intermediate key usage")?,
+    )
+    .context("adding the intermediate key usage")?;
+
+    let (ski, aki) = {
+        let context = cert.x509v3_context(Some(root), None);
+        let ski = SubjectKeyIdentifier::new()
+            .build(&context)
+            .context("building the intermediate subject key identifier")?;
+        // An early v0.4 root has no SKI; then the issuer name is the only
+        // usable reference.
+        let aki = if root.subject_key_id().is_some() {
+            AuthorityKeyIdentifier::new()
+                .keyid(true)
+                .issuer(true)
+                .build(&context)
+                .context("building the intermediate authority key identifier")?
+        } else {
+            AuthorityKeyIdentifier::new()
+                .issuer(true)
+                .build(&context)
+                .context("building the intermediate authority key identifier")?
+        };
+        (ski, aki)
+    };
+    cert.append_extension(ski)
+        .context("adding the intermediate subject key identifier")?;
+    cert.append_extension(aki)
+        .context("adding the intermediate authority key identifier")?;
+
+    cert.sign(root_key, digest(cfg.key_type))
+        .context("signing the intermediate")?;
+    Ok((cert.build(), key))
+}
+
+fn new_leaf(
+    cfg: &Internal,
+    ca: &Ca,
     domain: &str,
     alt_names: &[String],
 ) -> Result<(X509, PKey<Private>)> {
     let key = new_key(cfg.key_type)?;
     let names = sans(domain, alt_names);
-
-    let mut name = X509NameBuilder::new().context("building the leaf name")?;
-    name.append_entry_by_text("CN", &names[0])
-        .context("setting the leaf CN")?;
-    if !cfg.organization.trim().is_empty() {
-        name.append_entry_by_text("O", cfg.organization.trim())
-            .context("setting the leaf O")?;
-    }
-    let name = name.build();
+    let name = subject(cfg, &names[0])?;
 
     let mut cert = X509::builder().context("creating the leaf certificate")?;
     cert.set_version(2).context("setting the leaf version")?;
@@ -520,7 +798,7 @@ fn new_leaf(
         .context("setting the leaf serial")?;
     cert.set_subject_name(&name)
         .context("setting the leaf subject")?;
-    cert.set_issuer_name(root.subject_name())
+    cert.set_issuer_name(ca.intermediate.subject_name())
         .context("setting the leaf issuer")?;
     cert.set_pubkey(&key).context("setting the leaf key")?;
     let not_before = when_in(-3_600)?;
@@ -552,19 +830,33 @@ fn new_leaf(
     )
     .context("adding the leaf extended key usage")?;
 
-    let san = {
-        let mut builder = SubjectAlternativeName::new();
+    let (san, ski, aki) = {
+        let context = cert.x509v3_context(Some(&ca.intermediate), None);
+        let mut san = SubjectAlternativeName::new();
         for name in &names {
-            builder.dns(name);
+            san.dns(name);
         }
-        builder
-            .build(&cert.x509v3_context(Some(root), None))
-            .context("building the leaf SAN extension")?
+        let san = san
+            .build(&context)
+            .context("building the leaf SAN extension")?;
+        let ski = SubjectKeyIdentifier::new()
+            .build(&context)
+            .context("building the leaf subject key identifier")?;
+        let aki = AuthorityKeyIdentifier::new()
+            .keyid(true)
+            .issuer(true)
+            .build(&context)
+            .context("building the leaf authority key identifier")?;
+        (san, ski, aki)
     };
     cert.append_extension(san)
         .context("adding the leaf SAN extension")?;
+    cert.append_extension(ski)
+        .context("adding the leaf subject key identifier")?;
+    cert.append_extension(aki)
+        .context("adding the leaf authority key identifier")?;
 
-    cert.sign(root_key, digest(cfg.key_type))
+    cert.sign(&ca.intermediate_key, digest(cfg.key_type))
         .context("signing the leaf")?;
     Ok((cert.build(), key))
 }
@@ -745,29 +1037,51 @@ mod tests {
         assert_eq!(KeyKind::default(), KeyKind::Ed25519);
     }
 
+    fn cn(cert: &X509) -> String {
+        cert.subject_name()
+            .entries_by_nid(Nid::COMMONNAME)
+            .next()
+            .unwrap()
+            .data()
+            .to_string()
+            .unwrap()
+    }
+
+    fn entry(cert: &X509, nid: Nid) -> Option<String> {
+        cert.subject_name()
+            .entries_by_nid(nid)
+            .next()
+            .map(|e| e.data().to_string().unwrap())
+    }
+
     #[test]
-    fn a_first_run_creates_a_root_and_a_leaf_that_chains() {
+    fn a_first_run_creates_a_root_an_intermediate_and_a_chained_leaf() {
         let dir = std::env::temp_dir().join(format!("uping-ca-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         let (local, _) = ca(&dir, KeyKind::Ed25519);
         local.ensure(&server("app.internal", &[])).unwrap();
 
         let root = X509::from_pem(&local.root_pem().unwrap()).unwrap();
-        let cn = root
-            .subject_name()
-            .entries_by_nid(Nid::COMMONNAME)
-            .next()
-            .unwrap()
-            .data()
-            .to_string()
-            .unwrap();
-        assert_eq!(cn, "uping local CA");
+        assert_eq!(cn(&root), "uping internal Root CA");
+        let intermediate =
+            X509::from_pem(&fs::read(dir.join("ca").join("intermediate.crt")).unwrap()).unwrap();
+        assert_eq!(cn(&intermediate), "uping internal Intermediate CA");
+        assert!(intermediate.verify(&root.public_key().unwrap()).unwrap());
+        assert!(intermediate.subject_key_id().is_some());
+        assert!(intermediate.authority_key_id().is_some());
 
         let (cert_path, key_path) = local.leaf_paths(&server("app.internal", &[]));
-        let pem = fs::read(&cert_path).unwrap();
-        let leaf = X509::from_pem(&pem).unwrap();
-        let public = root.public_key().unwrap();
-        assert!(leaf.verify(&public).unwrap());
+        let stack = X509::stack_from_pem(&fs::read(&cert_path).unwrap()).unwrap();
+        assert_eq!(stack.len(), 2, "leaf + intermediate, the root is not sent");
+        let leaf = &stack[0];
+        assert!(leaf.verify(&intermediate.public_key().unwrap()).unwrap());
+        assert_eq!(
+            stack[1].to_der().unwrap(),
+            intermediate.to_der().unwrap(),
+            "the second certificate is the intermediate"
+        );
+        assert!(leaf.subject_key_id().is_some());
+        assert!(leaf.authority_key_id().is_some());
         assert!(key_path.is_file());
         let key_mode = fs::metadata(&key_path).unwrap().permissions().mode() & 0o777;
         assert_eq!(key_mode, 0o600);
@@ -779,6 +1093,71 @@ mod tests {
             .filter_map(|n| n.dnsname().map(|s| s.to_string()))
             .collect();
         assert_eq!(names, vec!["app.internal".to_string()]);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn subject_fields_are_emitted_only_when_configured() {
+        let dir = std::env::temp_dir().join(format!("uping-ca-subject-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+
+        // Empty defaults: CN and nothing else.
+        let (local, _) = ca(&dir, KeyKind::Ed25519);
+        local.ensure(&server("app.internal", &[])).unwrap();
+        let root = X509::from_pem(&local.root_pem().unwrap()).unwrap();
+        assert_eq!(root.subject_name().entries().count(), 1);
+        let _ = fs::remove_dir_all(&dir);
+
+        let mut cfg = Config::default_for_tests(dir.clone());
+        cfg.internal.domain = "internal".to_string();
+        cfg.internal.ca_dir = "ca".to_string();
+        cfg.internal.cert_dir = "leaves".to_string();
+        cfg.internal.organization = "rao-nagos".to_string();
+        cfg.internal.organizational_unit = "Infrastructure".to_string();
+        cfg.internal.country = "PF".to_string();
+        cfg.internal.state = "Windward Islands".to_string();
+        cfg.internal.locality = "Papeete".to_string();
+        cfg.internal.email = "ops@rao-nagos.pf".to_string();
+        cfg.internal.common_name = "rao-nagos internal Root CA".to_string();
+        let local = LocalCa::new(&cfg, SniResolver::empty("", false));
+        local.ensure(&server("app.internal", &[])).unwrap();
+
+        let root = X509::from_pem(&local.root_pem().unwrap()).unwrap();
+        assert_eq!(cn(&root), "rao-nagos internal Root CA");
+        assert_eq!(
+            entry(&root, Nid::ORGANIZATIONNAME).as_deref(),
+            Some("rao-nagos")
+        );
+        assert_eq!(
+            entry(&root, Nid::ORGANIZATIONALUNITNAME).as_deref(),
+            Some("Infrastructure")
+        );
+        assert_eq!(entry(&root, Nid::COUNTRYNAME).as_deref(), Some("PF"));
+        assert_eq!(
+            entry(&root, Nid::STATEORPROVINCENAME).as_deref(),
+            Some("Windward Islands")
+        );
+        assert_eq!(entry(&root, Nid::LOCALITYNAME).as_deref(), Some("Papeete"));
+        assert_eq!(
+            entry(&root, Nid::PKCS9_EMAILADDRESS).as_deref(),
+            Some("ops@rao-nagos.pf")
+        );
+
+        let intermediate =
+            X509::from_pem(&fs::read(dir.join("ca").join("intermediate.crt")).unwrap()).unwrap();
+        assert_eq!(cn(&intermediate), "uping internal Intermediate CA");
+        assert_eq!(
+            entry(&intermediate, Nid::ORGANIZATIONNAME).as_deref(),
+            Some("rao-nagos")
+        );
+
+        let (cert_path, _) = local.leaf_paths(&server("app.internal", &[]));
+        let leaf = X509::from_pem(&fs::read(cert_path).unwrap()).unwrap();
+        assert_eq!(cn(&leaf), "app.internal");
+        assert_eq!(
+            entry(&leaf, Nid::ORGANIZATIONNAME).as_deref(),
+            Some("rao-nagos")
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -834,35 +1213,97 @@ mod tests {
     }
 
     #[test]
-    fn a_pair_signed_by_another_root_is_replaced() {
+    fn a_new_root_replaces_the_intermediate_and_the_leaves() {
         let dir = std::env::temp_dir().join(format!("uping-ca-root-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         let (local, _) = ca(&dir, KeyKind::Ed25519);
         let s = server("app.internal", &[]);
         local.ensure(&s).unwrap();
         let (cert_path, _) = local.leaf_paths(&s);
-        let first = fs::read(&cert_path).unwrap();
+        let first_leaf = fs::read(&cert_path).unwrap();
+        let first_root = local.root_pem().unwrap();
+        let first_intermediate = fs::read(dir.join("ca").join("intermediate.crt")).unwrap();
 
-        // A fresh CA at the same paths: the leaf must not survive.
+        // A fresh CA at the same paths: leaf and intermediate must not survive.
         fs::remove_file(dir.join("ca").join("root.key")).unwrap();
         fs::remove_file(dir.join("ca").join("root.crt")).unwrap();
         local.ensure(&s).unwrap();
-        assert_ne!(first, fs::read(&cert_path).unwrap());
+        assert_ne!(first_leaf, fs::read(&cert_path).unwrap());
+        assert_ne!(first_root, local.root_pem().unwrap());
+        assert_ne!(
+            first_intermediate,
+            fs::read(dir.join("ca").join("intermediate.crt")).unwrap()
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn a_half_root_pair_is_an_error_not_a_new_ca() {
+    fn the_root_key_can_be_moved_offline_once_the_intermediate_exists() {
+        let dir = std::env::temp_dir().join(format!("uping-ca-offline-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let (local, _) = ca(&dir, KeyKind::Ed25519);
+        local.ensure(&server("app.internal", &[])).unwrap();
+        let root = local.root_pem().unwrap();
+
+        fs::remove_file(dir.join("ca").join("root.key")).unwrap();
+        // A new domain still gets a leaf, and the root does not change.
+        local
+            .ensure(&server("db.internal", &[]))
+            .expect("issuing with an offline root key");
+        assert_eq!(root, local.root_pem().unwrap());
+        let (cert_path, _) = local.leaf_paths(&server("db.internal", &[]));
+        let stack = X509::stack_from_pem(&fs::read(cert_path).unwrap()).unwrap();
+        assert_eq!(stack.len(), 2);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_root_certificate_without_its_key_is_an_error() {
         let dir = std::env::temp_dir().join(format!("uping-ca-half-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         let (local, _) = ca(&dir, KeyKind::Ed25519);
         local.ensure(&server("app.internal", &[])).unwrap();
         fs::remove_file(dir.join("ca").join("root.key")).unwrap();
+        fs::remove_file(dir.join("ca").join("root.crt")).unwrap();
+        fs::write(dir.join("ca").join("root.key"), b"orphan").unwrap();
         let err = local
             .ensure(&server("app.internal", &[]))
             .unwrap_err()
             .to_string();
         assert!(err.contains("exists but"), "{err}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_intermediate_is_created_under_the_existing_root() {
+        let dir = std::env::temp_dir().join(format!("uping-ca-migrate-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let (local, _) = ca(&dir, KeyKind::Ed25519);
+        local.ensure(&server("app.internal", &[])).unwrap();
+        let root = local.root_pem().unwrap();
+
+        // Simulate an early v0.4 tree: root only, no intermediate, and a leaf
+        // signed directly by the root.
+        fs::remove_file(dir.join("ca").join("intermediate.crt")).unwrap();
+        fs::remove_file(dir.join("ca").join("intermediate.key")).unwrap();
+        let (cert_path, _) = local.leaf_paths(&server("app.internal", &[]));
+        let leaf = X509::from_pem(&fs::read(&cert_path).unwrap()).unwrap();
+        let mut old_chain = leaf.to_pem().unwrap();
+        old_chain.extend_from_slice(&root);
+        fs::write(&cert_path, old_chain).unwrap();
+
+        local.ensure(&server("app.internal", &[])).unwrap();
+        assert_eq!(root, local.root_pem().unwrap(), "the root must not change");
+        let intermediate =
+            X509::from_pem(&fs::read(dir.join("ca").join("intermediate.crt")).unwrap()).unwrap();
+        assert!(intermediate
+            .verify(&X509::from_pem(&root).unwrap().public_key().unwrap())
+            .unwrap());
+        let stack = X509::stack_from_pem(&fs::read(&cert_path).unwrap()).unwrap();
+        assert_eq!(stack.len(), 2);
+        assert!(stack[0]
+            .verify(&intermediate.public_key().unwrap())
+            .unwrap());
         let _ = fs::remove_dir_all(&dir);
     }
 

@@ -20,12 +20,13 @@ public ACME such as Let's Encrypt
 .RB ( auto ),
 uping's own certificate authority
 .RB ( internal ),
-which generates a root on first start, signs only
+which generates a root and an intermediate on first start, has the intermediate
+sign only
 .I [internal] domain
-and its subdomains with no network access at all, and can publish that root at
+and its subdomains with no network access at all, and can publish the root at
 the
 .I [internal] serve_root
-URL, or two PEM files you provide
+URL; or two PEM files you provide
 .RB ( manual ).
 .PP
 A

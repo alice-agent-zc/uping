@@ -179,15 +179,22 @@ require a restart and are reported as such.
 
 ### Local CA
 
-`keys = "internal"` never talks to a network. `internal_ca.rs` generates the root
-on first use and signs leaves for one zone only, `[internal] domain`: a name
-outside it is rejected when the config loads and again at issuance, so the CA
-cannot accidentally vouch for someone else's name. Ed25519 by default,
-`alt_names` in the SAN list, renewed before expiry on the same hourly loop as
-ACME. Files are written atomically (`.<name>.tmp-<pid>` then rename) with `0644`
-for the chain and `0600` for the key. A missing half of the root pair is refused
-rather than regenerated: a new root would strand every client that installed the
-old one.
+`keys = "internal"` never talks to a network. `internal_ca.rs` builds a
+two-level PKI: a root signs an intermediate, the intermediate signs the leaves.
+Clients install the root only; the server sends `leaf + intermediate`. Ed25519
+by default, `alt_names` in the SAN list, renewed before expiry on the same
+hourly loop as ACME. Files are written atomically (`.<name>.tmp-<pid>` then
+rename) with `0644` for certificates and `0600` for keys.
+
+The CA signs one zone only, `[internal] domain`: a name outside it is rejected
+when the config loads and again at issuance, so the CA cannot accidentally
+vouch for someone else's name. An intermediate that is due is rotated when the
+root key is present; after the first start `root.key` may be moved offline,
+because leaf issuance only needs `intermediate.key`. A root without an
+intermediate (an early v0.4 tree) gets one created under it, so the root the
+clients installed stays valid. A missing half of the root pair, or of the
+intermediate pair, is refused rather than silently regenerated: a new root
+would strand every client.
 
 `serve_root` is a URL, not an address: the endpoint's host gets a leaf from the
 same CA, so it presents a certificate chaining to the root it serves. The
@@ -199,13 +206,15 @@ like any other listener.
 Generation is in-process through the `openssl` crate — the same libcrypto the
 proxy already uses for TLS. No shell command, no `step-ca`, no `certbot`, no
 ACME client. `PKey::generate_ed25519` is the default; `EcKey::generate` covers
-P-256 and `Rsa::generate` RSA-2048. An `X509Builder` sets CN/O, the SAN list,
-critical Basic Constraints (CA for the root, end-entity for the leaf), Key Usage
-and the `serverAuth` EKU. Ed25519 is signed with `MessageDigest::null()` —
-OpenSSL signs the message itself and rejects a digest there — while P-256 and
-RSA use SHA-256. `rcgen` was not pulled in: it would be a second X.509
-implementation for no gain, and OpenSSL is already linked and already required
-by pingora's dynamic SNI callbacks.
+P-256 and `Rsa::generate` RSA-2048. An `X509Builder` sets CN plus the configured
+identity fields (O, OU, C, ST, L, emailAddress — omitted when empty), the SAN
+list, critical Basic Constraints (`CA:TRUE, pathlen:1` root, `pathlen:0`
+intermediate, `CA:FALSE` leaf), Key Usage, the `serverAuth` EKU on leaves, and
+Subject/Authority Key Identifiers. Ed25519 is signed with
+`MessageDigest::null()` — OpenSSL signs the message itself and rejects a digest
+there — while P-256 and RSA use SHA-256. `rcgen` was not pulled in: it would be
+a second X.509 implementation for no gain, and OpenSSL is already linked and
+already required by pingora's dynamic SNI callbacks.
 Resolution and binding are best-effort, because the VPN address may arrive
 after uping starts.
 

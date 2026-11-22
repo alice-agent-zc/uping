@@ -41,10 +41,20 @@ renew_before_days = 30
 domain      = "internal.rao-nagos.pf"
 ca_dir      = "/var/lib/uping/internal/ca"
 cert_dir    = "/var/lib/uping/internal"
-common_name = "rao-nagos internal CA"
-organization = "rao-nagos"
 ca_days     = 3650                # root lifetime
+intermediate_days = 1825          # intermediate that signs the leaves
 leaf_days   = 397                 # 398 is the Apple/Safari ceiling
+
+# Optional identity written into the root, the intermediate and the leaves.
+# Every field defaults to empty and is omitted when empty, so nothing blocks a
+# first start. `common_name` overrides the root's derived CN only.
+# common_name         = "rao-nagos internal Root CA"
+# organization        = "rao-nagos"
+# organizational_unit = "Infrastructure"
+# country             = "PF"
+# state               = "Windward Islands"
+# locality            = "Papeete"
+# email               = "ops@rao-nagos.pf"
 renew_before_days = 30
 key_type    = "ed25519"           # ed25519 | p256 | rsa2048
 # The root is downloadable at https://internal.rao-nagos.pf:9000/root.crt.

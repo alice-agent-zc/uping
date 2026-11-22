@@ -338,11 +338,17 @@ listener without a restart. Nothing is fetched, so there is no http-01, no port
 | Field | Default | Meaning |
 |---|---|---|
 | `domain` | `""` | the only zone this CA signs; required by any `keys = "internal"` |
-| `ca_dir` | `"cert/internal/ca"` | `root.crt` (0644) + `root.key` (0600) |
+| `ca_dir` | `"cert/internal/ca"` | root and intermediate pairs |
 | `cert_dir` | `"cert/internal"` | `<cert_dir>/<domain>/{fullchain,privkey}.pem` |
-| `common_name` | `"uping local CA"` | root subject CN; not a hostname |
-| `organization` | `"uping"` | root subject O |
+| `common_name` | `""` | root subject CN; empty derives `uping <zone> Root CA` |
+| `organization` | `""` | subject O |
+| `organizational_unit` | `""` | subject OU |
+| `country` | `""` | subject C, exactly two letters |
+| `state` | `""` | subject ST |
+| `locality` | `""` | subject L |
+| `email` | `""` | subject `emailAddress`; informational |
 | `ca_days` | `3650` | root lifetime, clamped to `leaf_days..=7300` |
+| `intermediate_days` | `1825` | intermediate lifetime, clamped to `1..=ca_days` |
 | `leaf_days` | `397` | leaf lifetime, clamped to `1..=825` |
 | `renew_before_days` | `30` | renew a leaf with fewer days left |
 | `key_type` | `"ed25519"` | `ed25519`, `p256` or `rsa2048` |
@@ -365,20 +371,48 @@ serve_http   = false               # no :80 at all, no http-01 to answer
 upstream     = "127.0.0.1:7681"
 ```
 
+Optional identity shown in the certificates (all default to empty, so nothing
+breaks if you skip them):
+
+```toml
+[internal]
+organization         = "rao-nagos"
+organizational_unit  = "Infrastructure"
+country              = "PF"
+state                = "Windward Islands"
+locality             = "Papeete"
+email                = "ops@rao-nagos.pf"
+intermediate_days    = 1825
+```
+
+
+It is a real two-level PKI: a **root** (the only certificate clients install)
+signs an **intermediate**, which signs the leaves. The server sends
+`leaf + intermediate`; the root never travels. The subject of every certificate
+is CN plus whichever identity fields are set — empty fields are simply omitted,
+so a default configuration produces a clean certificate. Only the leaf CN is a
+hostname; the root and intermediate CNs derive from the zone
+(`uping internal.rao-nagos.pf Root CA`, `... Intermediate CA`) unless
+`common_name` overrides the root's.
+
 The files use the ACME names, in their own subtree, so nothing an ACME run
 already wrote is read or overwritten:
 
 ```text
 /var/lib/uping/internal/ca/root.crt                              0644  <- clients
-/var/lib/uping/internal/ca/root.key                              0600
-/var/lib/uping/internal/dsh.internal.rao-nagos.pf/fullchain.pem
+/var/lib/uping/internal/ca/root.key                              0600  optional
+/var/lib/uping/internal/ca/intermediate.crt                      0644
+/var/lib/uping/internal/ca/intermediate.key                      0600
+/var/lib/uping/internal/dsh.internal.rao-nagos.pf/fullchain.pem        leaf + CA
 /var/lib/uping/internal/dsh.internal.rao-nagos.pf/privkey.pem    0600
 ```
 
-The root is created once and never regenerated behind your back. If only one of
-`root.crt` / `root.key` survives, startup logs the pair as inconsistent and
-skips those domains, rather than minting a root every client would reject
-(remove both files to deliberately create a new CA). `alt_names = [...]` on a
+The root is created once and never regenerated behind your back. Once the
+intermediate exists, `root.key` can be moved offline: leaf renewals only need
+`intermediate.key`, and an intermediate that is due is rotated automatically
+when the root key is present (with a warning when it is not). If a root from an
+early v0.4 tree exists without an intermediate, the intermediate is created
+under it — clients keep the root they already trust. `alt_names = [...]` on a
 server adds SANs to the same leaf, and they must be inside the zone too.
 
 #### Publishing the root over HTTPS

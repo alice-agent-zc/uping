@@ -1,11 +1,12 @@
 //! `keys = "internal"`: uping signs its own zone, publishes the root over TLS at
 //! `[internal] serve_root`, and a broken server only costs its own domain.
 //!
-//! This drives the real binary once, because three promises only exist at that
-//! level: the generated chain is accepted by a TLS client that trusts nothing
-//! but `root.crt`, `/root.crt` is fetchable over TLS at the configured URL, and
-//! a listener address that does not exist (here TEST-NET-1, as a VPN that is
-//! not up yet) is a warning rather than a dead process.
+//! This drives the real binary once, because four promises only exist at that
+//! level: the generated leaf chains through an intermediate to a root a TLS
+//! client can trust, `/root.crt` is fetchable over TLS at the configured URL,
+//! the subject carries the configured identity, and a listener address that
+//! does not exist (here TEST-NET-1, as a VPN that is not up yet) is a warning
+//! rather than a dead process.
 
 mod support;
 
@@ -39,6 +40,8 @@ fn config(dir: &Path, http: u16, https: u16, root_port: u16, backend: u16) -> St
     format!(
         "[listen]\nipv4 = \"127.0.0.1\"\nhttp = {http}\nhttps = {https}\n\
          [internal]\ndomain = \"localhost\"\nca_dir = \"ca\"\ncert_dir = \"leaves\"\n\
+         organization = \"rao-nagos\"\ncountry = \"PF\"\n\
+         email = \"ops@rao-nagos.pf\"\n\
          serve_root = \"https://localhost:{root_port}\"\n\
          [[server]]\ndomain = \"app.localhost\"\nkeys = \"internal\"\n\
          serve_http = false\nhttps_listen = \"127.0.0.1:{https}\"\n\
@@ -135,11 +138,42 @@ fn a_local_leaf_is_trusted_by_its_root_and_a_broken_server_is_only_a_warning() {
         .join("localhost")
         .join("fullchain.pem")
         .is_file());
+    // The hierarchy is root -> intermediate -> leaf, and the served chain is
+    // leaf + intermediate: the root stays in the client's trust store.
+    assert!(dir.join("ca").join("intermediate.crt").is_file());
+    assert!(dir.join("ca").join("intermediate.key").is_file());
+    let chain = std::fs::read_to_string(leaf_dir.join("fullchain.pem")).unwrap();
+    assert_eq!(chain.matches("BEGIN CERTIFICATE").count(), 2, "{chain}");
 
-    // A client that trusts only root.crt accepts the chain.
+    // A client that trusts only root.crt accepts the chain, and the leaf shows
+    // the configured identity.
     let (status, text) = curl_with_root(https, "app.localhost", "/", &ca_cert);
     assert_eq!(status, "200", "{text}");
     assert!(text.ends_with("internal-backend"), "{text}");
+    let (subject_status, subject) = Command::new("openssl")
+        .args([
+            "x509",
+            "-noout",
+            "-subject",
+            "-in",
+            &leaf_dir.join("fullchain.pem").display().to_string(),
+        ])
+        .output()
+        .map(|o| {
+            (
+                o.status.success(),
+                String::from_utf8_lossy(&o.stdout).into_owned(),
+            )
+        })
+        .unwrap_or((false, String::new()));
+    if subject_status {
+        assert!(subject.contains("O=rao-nagos"), "{subject}");
+        assert!(subject.contains("C=PF"), "{subject}");
+        assert!(
+            subject.contains("emailAddress=ops@rao-nagos.pf"),
+            "{subject}"
+        );
+    }
 
     // The root is published over TLS at https://<zone>:<port>/root.crt.
     let body = fetch_root(root_port, "/root.crt");

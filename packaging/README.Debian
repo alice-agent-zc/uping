@@ -41,12 +41,14 @@ The local CA signs one zone, `[internal] domain`, and nothing outside it:
 
     [internal]
     domain     = "internal.rao-nagos.pf"       # the only zone it signs
-    ca_dir     = "/var/lib/uping/internal/ca"
-    cert_dir   = "/var/lib/uping/internal"
+    ca_dir     = "/var/lib/uping/internal/ca"   # root + intermediate pairs
+    cert_dir   = "/var/lib/uping/internal"      # leaves, each with its chain
     serve_root = "https://internal.rao-nagos.pf:9000"
 
-`serve_root` serves `root.crt` over TLS at that URL, with a certificate from the
-same CA — so the first fetch needs `curl -k`, and the file it downloads is what
+The root signs an intermediate, the intermediate signs the leaves; clients
+install only `root.crt`, and after the first start `root.key` can be moved
+offline. `serve_root` serves `root.crt` over TLS at that URL, with a certificate
+from the same CA — so the first fetch needs `curl -k`, and the file it downloads is what
 makes the URL verify from then on:
 
     sudo curl -k https://internal.rao-nagos.pf:9000/root.crt \
