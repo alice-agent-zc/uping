@@ -22,7 +22,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 
 use async_trait::async_trait;
-use log::{debug, error};
+use log::{debug, error, warn};
 use pingora::listeners::TlsAccept;
 use pingora::protocols::tls::TlsRef;
 use pingora::tls::{ext, pkey, ssl, x509};
@@ -95,6 +95,42 @@ impl SniResolver {
             }
         }
         Ok((resolver, pending))
+    }
+
+    /// Like [`SniResolver::from_config`], but a broken server is logged and
+    /// skipped instead of aborting the whole start: one domain with a missing
+    /// or unreadable pair must not take the other domains down. Returns the
+    /// domains that still need a certificate (`auto` and `internal`).
+    pub fn from_config_lossy(cfg: &Config) -> (Self, Vec<Server>) {
+        let default_domain = cfg
+            .servers
+            .first()
+            .map(|s| s.domain.to_ascii_lowercase())
+            .unwrap_or_default();
+        let resolver = SniResolver::empty(default_domain, cfg.tls.fallback_cert);
+        let mut pending = Vec::new();
+
+        for s in &cfg.servers {
+            let (cert, key) = cfg.key_paths(s);
+            if cert.is_file() && key.is_file() {
+                if let Err(e) = resolver.load_files(&s.domain, &cert, &key) {
+                    warn!(
+                        "TLS: skipping `{}` (the other domains keep running): {e:#}",
+                        s.domain
+                    );
+                }
+            } else if s.key_mode() == KeyMode::Manual {
+                warn!(
+                    "TLS: skipping `{}`: its manual certificate is missing (`{}` / `{}`)",
+                    s.domain,
+                    cert.display(),
+                    key.display()
+                );
+            } else {
+                pending.push(s.clone());
+            }
+        }
+        (resolver, pending)
     }
 
     /// Load every cert/key pair from the explicit `pub_key`/`priv_key` fields.
@@ -314,6 +350,7 @@ mod tests {
             keys: None,
             pub_key: cert.clone(),
             priv_key: key.clone(),
+            alt_names: Vec::new(),
             upstream: "127.0.0.1:8080".to_string(),
             upstream_tls: false,
             upstream_sni: String::new(),

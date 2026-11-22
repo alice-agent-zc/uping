@@ -32,11 +32,13 @@
 //! cert_dir          = "cert"           # <config dir>/cert/<domain>/
 //! renew_before_days = 30               # clamped to 1..=89
 //!
-//! # Optional: a private ACME CA. `keys = "internal"` selects it, and step-ca
-//! # works as-is because it speaks ACME. The directory is the provisioner URL.
-//! [acme.internal]
-//! directory = "https://step-ca.internal/acme/acme/directory"
-//! ca_bundle = "certs/root_ca.pem"
+//! # Optional: uping's own CA. `keys = "internal"` selects it. No ACME server,
+//! # no network: uping generates the root once and issues the leaves itself.
+//! [internal]
+//! ca_dir      = "cert/internal/ca"     # root.crt (public) + root.key (0600)
+//! cert_dir    = "cert/internal"        # <cert_dir>/<domain>/{fullchain,privkey}.pem
+//! key_type    = "ed25519"              # ed25519 | p256 | rsa2048
+//! serve_root  = "10.8.0.1:9000"        # plain HTTP: serves root.crt; empty = off
 //!
 //! [[server]]
 //! domain   = "www.example.com"
@@ -45,7 +47,7 @@
 //! limits   = { per_ip_rps = 1220 }     # override [limits] for this domain
 //! health   = { interval_ms = 10000 }   # or `health = false` to skip the 503 gate
 //! # https_listen = "203.0.113.10"     # own HTTPS socket instead of the global one
-//! # serve_http   = false              # no :80 redirect/ACME (manual keys only)
+//! # serve_http   = false              # no :80 at all (manual and internal keys)
 //!
 //! # One target per path prefix; the longest prefix wins.
 //! routes = [
@@ -96,6 +98,11 @@ pub struct Config {
     /// Certificate acquisition and storage (`keys = "auto"`).
     #[serde(default)]
     pub acme: Acme,
+
+    /// uping's own certificate authority and the leaves it issues for
+    /// `keys = "internal"`. No ACME server is involved.
+    #[serde(default)]
+    pub internal: Internal,
 
     /// One entry per reverse-proxied domain.
     #[serde(rename = "server", default)]
@@ -633,9 +640,10 @@ pub enum KeyMode {
     /// Request and renew through the default ACME directory (Let's Encrypt, or
     /// `[acme] directory`). This is the default when no key paths are given.
     Auto,
-    /// Request and renew through `[acme.internal]` — a private ACME CA such as
-    /// step-ca or Pebble. `step-ca` is accepted as an alias.
-    #[serde(alias = "step-ca", alias = "step_ca")]
+    /// Issued by uping's own CA (`[internal]`): generated locally on first
+    /// start, renewed locally, no ACME server and no network. Clients trust the
+    /// root once. This used to mean "a private ACME CA such as step-ca"; that
+    /// profile was removed in v0.4.0.
     Internal,
     /// Read the two PEM files named by `pub_key` and `priv_key`; renew them
     /// yourself (certbot, an ACME client, a paid CA, …).
@@ -646,7 +654,12 @@ impl KeyMode {
     /// True for the modes that talk ACME and therefore may need a certificate
     /// requested at startup.
     pub fn is_acme(self) -> bool {
-        matches!(self, Self::Auto | Self::Internal)
+        matches!(self, Self::Auto)
+    }
+
+    /// True for the mode whose leaves uping issues and renews itself.
+    pub fn is_local_ca(self) -> bool {
+        matches!(self, Self::Internal)
     }
 }
 
@@ -676,10 +689,11 @@ pub struct Acme {
     #[serde(default)]
     pub ca_bundle: String,
 
-    /// A private ACME CA, selected by `keys = "internal"`. `step-ca` and
-    /// `step_ca` are accepted as aliases for the table name.
+    /// Removed in v0.4.0. Kept only so that an old `[acme.internal]` (or
+    /// `[acme.step-ca]`) table produces a migration message instead of a bare
+    /// "unknown field". Any value here is a load error.
     #[serde(default, alias = "step-ca", alias = "step_ca")]
-    pub internal: Option<AcmeCa>,
+    pub internal: Option<toml::Value>,
 
     /// Where generated certificates live, relative to the config file (or
     /// absolute). One subdirectory per domain:
@@ -693,17 +707,112 @@ pub struct Acme {
     pub renew_before_days: u64,
 }
 
-/// One private ACME directory: `[acme.internal]` (or `[acme.step-ca]`).
+/// Which key algorithm the local CA uses for the root and the leaves.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum KeyKind {
+    /// Ed25519: small, fast, no parameters, and every current TLS stack
+    /// supports it. The default.
+    #[default]
+    Ed25519,
+    /// ECDSA P-256: wider legacy support than Ed25519 on old stacks.
+    P256,
+    /// RSA-2048: only for clients that cannot do either of the above.
+    Rsa2048,
+}
+
+/// uping's own certificate authority (`keys = "internal"`).
+///
+/// Unlike `[acme]`, nothing here leaves the host: the root is generated once
+/// and the leaves are signed locally. Clients trust the root once — the same
+/// install step a private ACME CA required, without the extra daemon.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct AcmeCa {
-    /// The provisioner's ACME directory URL, e.g.
-    /// `https://step-ca.internal/acme/acme/directory`.
-    pub directory: String,
-    /// PEM root that signs the ACME server's certificate. Empty inherits the
-    /// top-level `ca_bundle`.
+pub struct Internal {
+    /// Where the root lives: `root.crt` (public, 0644) and `root.key` (0600).
+    /// Created on first start; an existing pair is reused, never regenerated.
+    #[serde(default = "default_internal_ca_dir")]
+    pub ca_dir: String,
+
+    /// Where the leaves live, one subdirectory per domain:
+    /// `<cert_dir>/<domain>/{fullchain,privkey}.pem`.
+    #[serde(default = "default_internal_cert_dir")]
+    pub cert_dir: String,
+
+    /// Subject CN of the root certificate. Informational; it is not a hostname.
+    #[serde(default = "default_internal_common_name")]
+    pub common_name: String,
+
+    /// Subject O of the root certificate.
+    #[serde(default = "default_internal_organization")]
+    pub organization: String,
+
+    /// Root lifetime in days.
+    #[serde(default = "default_internal_ca_days")]
+    pub ca_days: u64,
+
+    /// Leaf lifetime in days. 397 is the Apple/Safari ceiling.
+    #[serde(default = "default_internal_leaf_days")]
+    pub leaf_days: u64,
+
+    /// Renew a leaf with fewer than this many days left.
+    #[serde(default = "default_internal_renew_before_days")]
+    pub renew_before_days: u64,
+
+    /// Key algorithm for the root and every leaf.
     #[serde(default)]
-    pub ca_bundle: String,
+    pub key_type: KeyKind,
+
+    /// Plain-HTTP address that publishes `root.crt` (e.g. `10.8.0.1:9000`), so
+    /// a client on the VPN can fetch the root before it trusts it. Empty means
+    /// off. Binding is best-effort: if the address does not exist yet, uping
+    /// warns and serves everything else.
+    #[serde(default)]
+    pub serve_root: String,
+}
+
+impl Default for Internal {
+    fn default() -> Self {
+        Internal {
+            ca_dir: default_internal_ca_dir(),
+            cert_dir: default_internal_cert_dir(),
+            common_name: default_internal_common_name(),
+            organization: default_internal_organization(),
+            ca_days: default_internal_ca_days(),
+            leaf_days: default_internal_leaf_days(),
+            renew_before_days: default_internal_renew_before_days(),
+            key_type: KeyKind::default(),
+            serve_root: String::new(),
+        }
+    }
+}
+
+fn default_internal_ca_dir() -> String {
+    "cert/internal/ca".to_string()
+}
+
+fn default_internal_cert_dir() -> String {
+    "cert/internal".to_string()
+}
+
+fn default_internal_common_name() -> String {
+    "uping local CA".to_string()
+}
+
+fn default_internal_organization() -> String {
+    "uping".to_string()
+}
+
+fn default_internal_ca_days() -> u64 {
+    3650
+}
+
+fn default_internal_leaf_days() -> u64 {
+    397
+}
+
+fn default_internal_renew_before_days() -> u64 {
+    30
 }
 
 impl Default for Acme {
@@ -748,23 +857,10 @@ impl Acme {
                 directory: self.directory_url().to_string(),
                 ca_bundle: self.ca_bundle.clone(),
             }),
-            KeyMode::Internal => {
-                let ca = self.internal.as_ref().context(
-                    "`keys = \"internal\"` needs an `[acme.internal]` (or \
-                     `[acme.step-ca]`) table",
-                )?;
-                if ca.directory.trim().is_empty() {
-                    anyhow::bail!("`[acme.internal] directory` is empty");
-                }
-                Ok(AcmeProfile {
-                    directory: ca.directory.trim().to_string(),
-                    ca_bundle: if ca.ca_bundle.trim().is_empty() {
-                        self.ca_bundle.clone()
-                    } else {
-                        ca.ca_bundle.trim().to_string()
-                    },
-                })
-            }
+            KeyMode::Internal => anyhow::bail!(
+                "`keys = \"internal\"` selects uping's own CA in `[internal]`, not an \
+                 ACME directory"
+            ),
             KeyMode::Manual => anyhow::bail!("`manual` mode has no ACME directory"),
         }
     }
@@ -829,7 +925,7 @@ pub struct Server {
     #[serde(default)]
     pub limits: Option<LimitsOverride>,
 
-    /// `auto` (default ACME), `internal` (private ACME, e.g. step-ca) or
+    /// `auto` (default ACME), `internal` (uping's own CA, `[internal]`) or
     /// `manual` (read `pub_key`/`priv_key`). When omitted, naming both key
     /// paths selects `manual`; naming neither selects `auto`.
     #[serde(default)]
@@ -837,13 +933,21 @@ pub struct Server {
 
     /// Path to the PEM certificate (leaf first, then any intermediates /
     /// fullchain). Required in `manual` mode; in `auto` mode it optionally
-    /// overrides where the generated certificate is written.
+    /// overrides where the generated certificate is written. Refused in
+    /// `internal` mode, which stores its own pair.
     #[serde(default)]
     pub pub_key: String,
 
     /// Path to the PEM private key. Same rules as `pub_key`.
     #[serde(default)]
     pub priv_key: String,
+
+    /// Extra names that go into the leaf's SAN list, in addition to `domain`.
+    /// Only meaningful with `keys = "internal"`; a wildcard is refused because
+    /// SNI resolution is an exact match. Example:
+    /// `alt_names = ["www.example.com"]`.
+    #[serde(default)]
+    pub alt_names: Vec<String>,
 
     /// Where to forward traffic, e.g. `127.0.0.1:8080` or `localhost:3000`.
     /// Exactly one of `upstream` and `root` must be set.
@@ -1013,9 +1117,20 @@ impl Config {
         resolve_path(&self.root_dir, raw)
     }
 
-    /// Where `keys = "auto"` / `keys = "internal"` write certificates.
+    /// Where `keys = "auto"` writes certificates.
     pub fn cert_dir(&self) -> PathBuf {
         self.resolve(&self.acme.cert_dir)
+    }
+
+    /// Where `keys = "internal"` writes leaves.
+    pub fn internal_cert_dir(&self) -> PathBuf {
+        self.resolve(&self.internal.cert_dir)
+    }
+
+    /// The local CA's `(root.crt, root.key)`.
+    pub fn ca_paths(&self) -> (PathBuf, PathBuf) {
+        let dir = self.resolve(&self.internal.ca_dir);
+        (dir.join("root.crt"), dir.join("root.key"))
     }
 
     /// The effective `[health]` defaults for one server.
@@ -1030,13 +1145,19 @@ impl Config {
 
     /// The certificate and key paths for one server. In `auto`/`internal` mode
     /// they are either the optional `pub_key`/`priv_key` overrides or
-    /// `<cert_dir>/<domain>/{fullchain,privkey}.pem`.
+    /// `<cert_dir>/<domain>/{fullchain,privkey}.pem`; `internal` uses
+    /// `[internal] cert_dir`, the ACME modes use `[acme] cert_dir`.
     pub fn key_paths(&self, server: &Server) -> (PathBuf, PathBuf) {
         if !server.pub_key.trim().is_empty() {
             (
                 self.resolve(&server.pub_key),
                 self.resolve(&server.priv_key),
             )
+        } else if server.key_mode().is_local_ca() {
+            let dir = self
+                .internal_cert_dir()
+                .join(server.domain.trim().to_ascii_lowercase());
+            (dir.join("fullchain.pem"), dir.join("privkey.pem"))
         } else {
             let dir = self
                 .cert_dir()
@@ -1080,6 +1201,9 @@ impl Config {
             s.index = s.index.trim().to_string();
             s.https_listen = s.https_listen.trim().to_string();
             s.https_listen6 = s.https_listen6.trim().to_string();
+            for name in &mut s.alt_names {
+                *name = name.trim().trim_end_matches('.').to_string();
+            }
             for r in &mut s.routes {
                 r.path = r.path.trim().to_string();
                 r.index = r.index.trim().to_string();
@@ -1092,7 +1216,9 @@ impl Config {
             }
         }
         cfg.acme.renew_before_days = cfg.acme.renew_before_days.clamp(1, 89);
+        validate_acme_removed(&cfg.acme)?;
         validate_acme(&cfg.acme, &cfg.root_dir)?;
+        validate_internal(&mut cfg.internal, &cfg.root_dir)?;
         validate_streams(&mut cfg)?;
         validate_listeners(&cfg)?;
         Ok(cfg)
@@ -1187,7 +1313,11 @@ fn validate_server(
     match mode {
         KeyMode::Manual if !pub_set => anyhow::bail!("`{domain}` has an empty `pub_key`"),
         KeyMode::Manual if !priv_set => anyhow::bail!("`{domain}` has an empty `priv_key`"),
-        KeyMode::Auto | KeyMode::Internal if pub_set != priv_set => anyhow::bail!(
+        KeyMode::Internal if pub_set || priv_set => anyhow::bail!(
+            "`{domain}`: `keys = \"internal\"` issues and stores its own certificate; \
+             remove `pub_key`/`priv_key`"
+        ),
+        KeyMode::Auto if pub_set != priv_set => anyhow::bail!(
             "`{domain}`: give both `pub_key` and `priv_key` to override the certificate paths, or neither"
         ),
         _ => {}
@@ -1196,16 +1326,108 @@ fn validate_server(
         acme.profile(mode)
             .with_context(|| format!("`{domain}` certificate mode"))?;
     }
+    validate_alt_names(s, mode)?;
 
     if !s.serve_http && mode.is_acme() {
         anyhow::bail!(
             "`{domain}` sets `serve_http = false` but uses an ACME key mode: the ACME \
-             http-01 challenge needs the HTTP listener. Use `keys = \"manual\"` \
-             with a certificate from an internal CA, or keep `serve_http = true`."
+             http-01 challenge needs the HTTP listener. Use `keys = \"internal\"` for \
+             a local certificate, or `keys = \"manual\"` with an external one."
         );
     }
 
     validate_routes(&s.routes, &format!("`{domain}`"), root_dir, health)?;
+    Ok(())
+}
+
+/// `alt_names` are extra SANs for a locally issued leaf. They only make sense
+/// with `keys = "internal"`, and they must be exact hostnames: SNI resolution
+/// is an exact match, so a wildcard SAN could never be selected.
+fn validate_alt_names(s: &Server, mode: KeyMode) -> Result<()> {
+    if s.alt_names.is_empty() {
+        return Ok(());
+    }
+    if !mode.is_local_ca() {
+        anyhow::bail!(
+            "`{}`: `alt_names` only applies to `keys = \"internal\"`; the other modes \
+             name their certificate themselves",
+            s.domain.trim()
+        );
+    }
+    let domain = s.domain.trim().to_ascii_lowercase();
+    let mut seen = std::collections::HashSet::new();
+    for raw in &s.alt_names {
+        let name = raw.trim().trim_end_matches('.');
+        if name.is_empty() {
+            anyhow::bail!("`{}` has an empty `alt_names` entry", s.domain.trim());
+        }
+        if name.contains('/')
+            || name.contains(':')
+            || name.contains(char::is_whitespace)
+            || name.contains('*')
+        {
+            anyhow::bail!(
+                "`{}`: `alt_names` entry `{name}` is not a hostname: no scheme, path, \
+                 port or wildcard",
+                s.domain.trim()
+            );
+        }
+        let name = name.to_ascii_lowercase();
+        if name == domain {
+            continue;
+        }
+        if !seen.insert(name.clone()) {
+            anyhow::bail!("`{}` repeats the SAN `{name}`", s.domain.trim());
+        }
+    }
+    Ok(())
+}
+
+/// The local CA settings must produce an oath of trust that lasts: a leaf
+/// cannot outlive the root that signs it, and renewal has to happen before
+/// expiry.
+fn validate_internal(internal: &mut Internal, root_dir: &Path) -> Result<()> {
+    if internal.ca_dir.trim().is_empty() {
+        anyhow::bail!("`[internal] ca_dir` is empty; give a directory or omit the field");
+    }
+    if internal.cert_dir.trim().is_empty() {
+        anyhow::bail!("`[internal] cert_dir` is empty; give a directory or omit the field");
+    }
+    if internal.common_name.trim().is_empty() {
+        anyhow::bail!("`[internal] common_name` is empty; give a name or omit the field");
+    }
+    if !internal.serve_root.trim().is_empty() {
+        parse_addr(&internal.serve_root, "`[internal] serve_root`")?;
+    }
+
+    internal.leaf_days = internal.leaf_days.clamp(1, 825);
+    internal.ca_days = internal.ca_days.clamp(internal.leaf_days, 7300);
+    internal.renew_before_days = internal
+        .renew_before_days
+        .clamp(1, internal.leaf_days.saturating_sub(1).max(1));
+
+    // Touch the resolved paths here so a relative `ca_dir` is reported against
+    // the directory that will actually hold it, not against the current one.
+    let (root_cert, root_key) = (
+        resolve_path(root_dir, &internal.ca_dir).join("root.crt"),
+        resolve_path(root_dir, &internal.ca_dir).join("root.key"),
+    );
+    if root_cert == root_key {
+        anyhow::bail!("`[internal] ca_dir` resolves to the same file for cert and key");
+    }
+    Ok(())
+}
+
+/// `[acme.internal]` was the step-ca profile in v0.3.x. Say what replaced it
+/// instead of letting serde report an unknown field.
+fn validate_acme_removed(acme: &Acme) -> Result<()> {
+    if acme.internal.is_some() {
+        anyhow::bail!(
+            "`[acme.internal]` was removed in v0.4.0: uping now runs its own CA. \
+             Replace it with an `[internal]` table (ca_dir, cert_dir, key_type, …); \
+             `keys = \"internal\"` then issues leaves locally instead of talking to step-ca"
+        );
+    }
     Ok(())
 }
 
@@ -1309,24 +1531,6 @@ fn validate_acme(acme: &Acme, root_dir: &Path) -> Result<()> {
         "`[acme]`",
         root_dir,
     )?;
-    if let Some(ca) = &acme.internal {
-        if ca.directory.trim().is_empty() {
-            anyhow::bail!("`[acme.internal] directory` is empty");
-        }
-        // Empty per-CA values inherit the top-level ones, exactly as
-        // `Acme::profile` does when it builds an order.
-        validate_acme_ca(
-            ca.directory.trim(),
-            if ca.ca_bundle.trim().is_empty() {
-                acme.ca_bundle.trim()
-            } else {
-                ca.ca_bundle.trim()
-            },
-            acme.email.trim(),
-            "`[acme.internal]`",
-            root_dir,
-        )?;
-    }
     Ok(())
 }
 
@@ -1526,6 +1730,34 @@ fn validate_listeners(cfg: &Config) -> Result<()> {
     if !cfg.servers.is_empty() && groups.is_empty() {
         anyhow::bail!("servers are configured but no HTTPS listener was produced");
     }
+    if !cfg.internal.serve_root.trim().is_empty() {
+        let root = parse_addr(&cfg.internal.serve_root, "`[internal] serve_root`")?;
+        for addr in cfg.listen.http_addrs()? {
+            if addrs_conflict(&root, &addr) {
+                anyhow::bail!("`[internal] serve_root` {root} clashes with `[listen] http` {addr}");
+            }
+        }
+        for group in &groups {
+            for addr in &group.addrs {
+                if addrs_conflict(&root, addr) {
+                    anyhow::bail!(
+                        "`[internal] serve_root` {root} clashes with the HTTPS listener {addr}"
+                    );
+                }
+            }
+        }
+        for st in &cfg.streams {
+            if let Ok(addr) = st.listen.parse::<SocketAddr>() {
+                if addrs_conflict(&root, &addr) {
+                    anyhow::bail!(
+                        "`[internal] serve_root` {root} clashes with [[stream]] `{}` on {}",
+                        st.label(),
+                        st.listen
+                    );
+                }
+            }
+        }
+    }
     Ok(())
 }
 
@@ -1605,6 +1837,24 @@ fn addrs_conflict(a: &std::net::SocketAddr, b: &std::net::SocketAddr) -> bool {
         }
         (std::net::IpAddr::V4(_), std::net::IpAddr::V6(v6))
         | (std::net::IpAddr::V6(v6), std::net::IpAddr::V4(_)) => v6.is_unspecified(),
+    }
+}
+
+/// A minimal config for unit tests: real defaults, empty tables, no servers.
+#[cfg(test)]
+impl Config {
+    pub fn default_for_tests(root_dir: std::path::PathBuf) -> Self {
+        Config {
+            root_dir,
+            listen: Listen::default(),
+            limits: Limits::default(),
+            tls: Tls::default(),
+            health: Health::default(),
+            acme: Acme::default(),
+            internal: Internal::default(),
+            servers: Vec::new(),
+            streams: Vec::new(),
+        }
     }
 }
 
@@ -2705,8 +2955,7 @@ upstream = "127.0.0.1:8080"
         let path = write_temp(
             "http-follows-acme.toml",
             "[listen]\nipv4 = \"203.0.113.10\"\nhttp = 80\nhttps = 443\n\
-             [acme.internal]\ndirectory = \"https://step-ca.internal/acme/acme/directory\"\n\
-             [[server]]\ndomain = \"site1.internal.rao-nagos.pf\"\nkeys = \"internal\"\n\
+             [[server]]\ndomain = \"site1.example.pf\"\nkeys = \"auto\"\n\
              https_listen = \"10.8.0.1\"\nhttps_listen6 = \"2001:db8::10\"\n\
              upstream = \"127.0.0.1:8080\"\n",
         );
@@ -2720,6 +2969,25 @@ upstream = "127.0.0.1:8080"
         assert_eq!(
             http,
             vec!["203.0.113.10:80", "10.8.0.1:80", "[2001:db8::10]:80"]
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn an_internal_site_needs_no_http_listener() {
+        let path = write_temp(
+            "internal-private.toml",
+            "[listen]\nipv4 = \"10.8.0.1\"\n\
+             [[server]]\ndomain = \"app.vpn.internal\"\nkeys = \"internal\"\n\
+             serve_http = false\nhttps_listen = \"10.8.0.1\"\n\
+             upstream = \"127.0.0.1:8080\"\n",
+        );
+        let cfg = Config::load(&path).unwrap();
+        assert_eq!(cfg.servers[0].key_mode(), KeyMode::Internal);
+        // Only the global :80 socket: an internal site publishes no challenge.
+        assert_eq!(
+            cfg.http_addrs().unwrap(),
+            vec!["10.8.0.1:80".parse().unwrap()]
         );
         let _ = std::fs::remove_file(path);
     }
@@ -2894,30 +3162,9 @@ limits = { per_ip_conns_per_sec = 1 }
     }
 
     #[test]
-    fn internal_mode_selects_the_private_acme_profile() {
+    fn internal_mode_uses_the_local_ca_defaults() {
         let path = write_temp(
             "internal.toml",
-            r#"
-[acme.step-ca]
-directory = "https://ca.local/acme/acme/directory"
-
-[[server]]
-domain = "private.local"
-keys = "step-ca"
-upstream = "127.0.0.1:8080"
-"#,
-        );
-        let cfg = Config::load(&path).unwrap();
-        assert_eq!(cfg.servers[0].key_mode(), KeyMode::Internal);
-        let profile = cfg.acme.profile(KeyMode::Internal).unwrap();
-        assert_eq!(profile.directory, "https://ca.local/acme/acme/directory");
-        let _ = std::fs::remove_file(path);
-    }
-
-    #[test]
-    fn internal_mode_without_a_private_ca_is_refused() {
-        let path = write_temp(
-            "internal-missing.toml",
             r#"
 [[server]]
 domain = "private.local"
@@ -2925,8 +3172,146 @@ keys = "internal"
 upstream = "127.0.0.1:8080"
 "#,
         );
+        let cfg = Config::load(&path).unwrap();
+        assert_eq!(cfg.servers[0].key_mode(), KeyMode::Internal);
+        assert_eq!(cfg.internal.key_type, KeyKind::Ed25519);
+        assert_eq!(cfg.internal.leaf_days, 397);
+        assert_eq!(cfg.internal.renew_before_days, 30);
+        let (cert, key) = cfg.key_paths(&cfg.servers[0]);
+        assert!(
+            cert.ends_with("cert/internal/private.local/fullchain.pem"),
+            "{cert:?}"
+        );
+        assert!(
+            key.ends_with("cert/internal/private.local/privkey.pem"),
+            "{key:?}"
+        );
+        let (root, root_key) = cfg.ca_paths();
+        assert!(root.ends_with("cert/internal/ca/root.crt"), "{root:?}");
+        assert!(
+            root_key.ends_with("cert/internal/ca/root.key"),
+            "{root_key:?}"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn the_removed_acme_internal_table_explains_what_replaced_it() {
+        let path = write_temp(
+            "step-ca.toml",
+            r#"
+[acme.step-ca]
+directory = "https://ca.local/acme/acme/directory"
+
+[[server]]
+domain = "private.local"
+keys = "internal"
+upstream = "127.0.0.1:8080"
+"#,
+        );
         let err = format!("{:#}", Config::load(&path).unwrap_err());
-        assert!(err.contains("acme.internal"), "unexpected error: {err}");
+        assert!(err.contains("removed in v0.4.0"), "unexpected error: {err}");
+        assert!(err.contains("[internal]"), "unexpected error: {err}");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn internal_mode_rejects_explicit_key_paths() {
+        let path = write_temp(
+            "internal-paths.toml",
+            r#"
+[[server]]
+domain = "private.local"
+keys = "internal"
+pub_key = "a.pem"
+priv_key = "b.pem"
+upstream = "127.0.0.1:8080"
+"#,
+        );
+        let err = Config::load(&path).unwrap_err().to_string();
+        assert!(
+            err.contains("issues and stores its own"),
+            "unexpected error: {err}"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn alt_names_are_for_internal_leaves_only_and_must_be_hostnames() {
+        let good = write_temp(
+            "alt-good.toml",
+            r#"
+[[server]]
+domain = "private.local"
+keys = "internal"
+alt_names = ["vpn.private.local", "Private.local."]
+upstream = "127.0.0.1:8080"
+"#,
+        );
+        let cfg = Config::load(&good).unwrap();
+        assert_eq!(
+            cfg.servers[0].alt_names,
+            vec!["vpn.private.local", "Private.local"]
+        );
+        let _ = std::fs::remove_file(good);
+
+        let wrong_mode = write_temp(
+            "alt-auto.toml",
+            "[acme]\nemail = \"a@b.c\"\n[[server]]\ndomain = \"a.local\"\n\
+             alt_names = [\"b.local\"]\nupstream = \"127.0.0.1:8080\"\n",
+        );
+        let err = Config::load(&wrong_mode).unwrap_err().to_string();
+        assert!(
+            err.contains("only applies to `keys = \"internal\"`"),
+            "{err}"
+        );
+        let _ = std::fs::remove_file(wrong_mode);
+
+        let wildcard = write_temp(
+            "alt-wild.toml",
+            "[[server]]\ndomain = \"a.local\"\nkeys = \"internal\"\n\
+             alt_names = [\"*.a.local\"]\nupstream = \"127.0.0.1:8080\"\n",
+        );
+        let err = Config::load(&wildcard).unwrap_err().to_string();
+        assert!(err.contains("not a hostname"), "{err}");
+        let _ = std::fs::remove_file(wildcard);
+    }
+
+    #[test]
+    fn serve_root_must_be_a_concrete_address() {
+        let ok = write_temp(
+            "root-ok.toml",
+            "[[server]]\ndomain = \"a.local\"\nkeys = \"internal\"\n\
+             upstream = \"127.0.0.1:8080\"\n[internal]\nserve_root = \"10.8.0.1:9000\"\n",
+        );
+        assert_eq!(
+            Config::load(&ok).unwrap().internal.serve_root,
+            "10.8.0.1:9000"
+        );
+        let _ = std::fs::remove_file(ok);
+
+        let zero = write_temp(
+            "root-zero.toml",
+            "[[server]]\ndomain = \"a.local\"\nkeys = \"internal\"\n\
+             upstream = \"127.0.0.1:8080\"\n[internal]\nserve_root = \"10.8.0.1:0\"\n",
+        );
+        let err = Config::load(&zero).unwrap_err().to_string();
+        assert!(err.contains("port 0"), "{err}");
+        let _ = std::fs::remove_file(zero);
+    }
+
+    #[test]
+    fn internal_lifetimes_are_clamped_and_the_leaf_never_outlives_the_root() {
+        let path = write_temp(
+            "internal-days.toml",
+            "[[server]]\ndomain = \"a.local\"\nkeys = \"internal\"\n\
+             upstream = \"127.0.0.1:8080\"\n\
+             [internal]\nleaf_days = 900\nca_days = 400\nrenew_before_days = 900\n",
+        );
+        let cfg = Config::load(&path).unwrap();
+        assert_eq!(cfg.internal.leaf_days, 825);
+        assert_eq!(cfg.internal.ca_days, 825);
+        assert_eq!(cfg.internal.renew_before_days, 824);
         let _ = std::fs::remove_file(path);
     }
 

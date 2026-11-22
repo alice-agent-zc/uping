@@ -1,4 +1,4 @@
-# uping v0.3.2 — example configuration
+# uping v0.4.0 — example configuration
 #
 # Copy:   cp config.toml.example config.toml
 # Run:    ./target/release/uping config.toml
@@ -6,7 +6,7 @@
 # DNS:    ./target/release/uping --dns-zone config.toml   (hosts records)
 # Apply:  pkill -HUP -x uping               (SIGHUP, no restart)
 # Restart only after installing a new binary, or after changing [listen],
-# a server's https_listen/https_listen6, [acme]/[acme.internal], or [[stream]].
+# a server's https_listen/https_listen6, [acme]/[internal], or [[stream]].
 #
 # Every path (certificates, static roots, cert_dir, CA bundles) is resolved
 # from the directory that holds this file. An absolute path is used as written,
@@ -32,19 +32,24 @@
 # directory         = ""           # another public ACME directory URL
 # ca_bundle         = ""           # PEM root for the ACME server; empty = system roots
 
-# Optional. A private ACME CA, selected by keys = "internal" (alias "step-ca").
-# uping does NOT create the step-ca root or a client certificate. Run
-# `sudo step ca init --deployment-type standalone --acme` once, copy its root
-# certificate (root_ca.crt, public part only; not intermediate_ca.crt alone)
-# where uping can read it, and point `ca_bundle` at that file. `ca_bundle` only
-# lets uping trust the ACME API's TLS certificate; it is not pushed to clients.
-# The leaf for the domain is requested and renewed by uping automatically.
-# [acme.internal]
-# directory = "https://step-ca.internal/acme/acme/directory"
-# ca_bundle = "cert/step-ca-root.pem"
+# Optional. uping's own certificate authority, selected by keys = "internal".
+# No ACME server and no step-ca: uping generates a root on first start and
+# signs every leaf itself. Clients install `root.crt` once; the leaves renew
+# locally, so nothing reaches the network and no port 80 is needed.
 #
-# keys = "internal" still uses http-01: step-ca must resolve the name (internal
-# DNS) and reach the host on port 80. If it cannot, use keys = "manual".
+# [internal]
+# ca_dir      = "cert/internal/ca"   # root.crt (0644) + root.key (0600)
+# cert_dir    = "cert/internal"      # <cert_dir>/<domain>/{fullchain,privkey}.pem
+# common_name = "uping local CA"
+# organization = "uping"
+# ca_days     = 3650                 # root lifetime
+# leaf_days   = 397                  # 398 is the Apple/Safari ceiling
+# renew_before_days = 30
+# key_type    = "ed25519"            # ed25519 | p256 | rsa2048
+# serve_root  = "10.8.0.1:9000"      # plain HTTP that publishes /root.crt; empty = off
+#
+# Binding is best-effort: an address that does not exist yet (VPN down) is
+# logged and skipped, and the other listeners keep running.
 
 # Optional. Abuse protection, counted per client IP over a 1-second window.
 # Set any of them to 0 to switch that limit off.
@@ -120,15 +125,16 @@ upstream = "127.0.0.1:8080"       # catch-all: every path without its own route
 # priv_key = "cert/manual.rao-nagos.pf/privkey.pem"
 # upstream = "127.0.0.1:8080"
 
-# A private site on a VPN address, with a certificate from an internal ACME CA.
-# keys = "internal" still uses http-01, so the CA must reach this domain on
-# port 80. If it cannot, issue the pair out of band and use keys = "manual".
+# A private site on a VPN address, served by uping's own CA. No http-01, so
+# port 80 is not needed; `alt_names` adds SANs to the same leaf.
 #
 # [[server]]
 # domain        = "app.vpn.rao-nagos.pf"
 # keys          = "internal"
+# alt_names     = ["vpn.rao-nagos.pf"]
 # upstream      = "127.0.0.1:8080"
 # https_listen  = "10.8.0.1"      # the rupa VPN address
+# serve_http    = false
 # limits        = { per_ip_rps = 50 }
 # health        = { interval_ms = 15000 }
 

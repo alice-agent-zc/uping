@@ -479,13 +479,13 @@ fn a_rejected_order_does_not_stop_the_process() {
     let mut text = String::new();
     while Instant::now() < deadline {
         text = std::fs::read_to_string(&log).unwrap_or_default();
-        if text.contains("some certificates are still missing") {
+        if text.contains("some are still missing") {
             break;
         }
         std::thread::sleep(Duration::from_millis(25));
     }
     assert!(
-        text.contains("some certificates are still missing"),
+        text.contains("some are still missing"),
         "the rejected order was not reported; log:\n{text}"
     );
     assert!(

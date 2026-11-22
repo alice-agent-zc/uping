@@ -52,6 +52,10 @@ The suite needs no root, no network and no certificate checked into the tree:
   :80 and still works on :443;
 - `--dns-zone` (`tests/dns_zone_e2e.rs`): records, a wildcard refusal, and the
   `--check` conflict;
+- the local CA (`src/internal_ca.rs` unit tests): an Ed25519 root and leaf that
+  chains, `alt_names` in the same leaf, a second run that reuses the pair, a
+  pair signed by another root replaced, a half root pair refused, and `/root.crt`
+  over HTTP;
 - a SIGHUP config-swap test: new root, invalid TOML, listener change;
 - end-to-end static serving and raw TCP forwarding.
 
@@ -66,6 +70,7 @@ src/
   sighup.rs        # SIGHUP -> swap routes/certs/limits/domains
   tls.rs           # SNI resolver; renewals replace entries live
   acme.rs          # account, http-01 orders, storage, renewal thread
+  internal_ca.rs   # keys = "internal": local root, leaf issuance, /root.crt
   static_files.rs  # safe path resolution + streamed files
   health.rs        # upstream probes, 503 when a backend is down
   limits.rs        # per-IP, per-domain rate + connection limiters
@@ -73,6 +78,7 @@ src/
   stream.rs        # experimental raw TCP forwarder
 tests/
   config_check.rs  # bad-config corpus and --check
+  (internal_ca.rs)  # root/leaf generation, SANs, reuse, half-root refusal
   acme_e2e.rs      # fake ACME CA over TLS, real first start
   route_e2e.rs     # routes inside their server
   listen_e2e.rs    # a per-server listener and its 421 isolation
@@ -131,19 +137,17 @@ The HTTP challenge listener follows an ACME server's explicit
 `Config::http_addrs`. That is what lets a private site on the rupa VPN answer
 http-01 on `10.8.0.1:80` without a second address setting.
 
-Startup issuance is best effort: `obtain_missing` returns whether every order
-succeeded, and a failure is logged rather than returned as an error. Only
-failing to bind the temporary `:80` listener aborts startup. A failed startup
+Startup issuance is best effort: `obtain_missing` returns whether every pair
+was obtained, and a failure is logged rather than returned as an error — even a
+temporary `:80` listener that cannot bind is now a warning. A failed startup
 order delays the renewal thread's first pass by an hour; a clean start checks
 after 30 seconds. This is deliberate: an exited process under a supervisor
 would be restarted every few seconds and exhaust the failed-authorization rate
 limit. Do not turn an order failure back into a fatal startup error.
 
-Two profiles exist: the public `[acme]` directory and the private
-`[acme.internal]` directory. The account file is hashed by directory URL, so
-public and private CAs never share one. `ca_bundle` is the trust anchor for
-uping's connection to the ACME server; client trust is separate and is the
-operator's responsibility.
+The local CA has no account and no directory. `ca_bundle` (when `[acme]` uses a
+custom server) is the trust anchor for uping's connection to the ACME server;
+client trust is separate and is the operator's responsibility.
 
 ### Limits
 
@@ -166,8 +170,28 @@ unresolved address. A down backend is answered with a static `503` page and
 The `SIGHUP` handler re-reads the same file and validates the whole candidate
 before touching live state. Routes, limits, health, `[tls] fallback_cert`, manual
 certificates and listener domain sets are applied live. `[listen]`,
-`https_listen`/`https_listen6`, `[[stream]]`, `[acme]` and `[acme.internal]`
+`https_listen`/`https_listen6`, `[[stream]]`, `[acme]` and `[internal]`
 require a restart and are reported as such.
+
+### Local CA
+
+`keys = "internal"` never talks to a network. `internal_ca.rs` generates the root
+on first use, signs a leaf per domain (Ed25519 by default, `alt_names` in the
+SAN list), and renews it before expiry on the same hourly loop as ACME. Files are
+written atomically (`.<name>.tmp-<pid>` then rename) with `0644` for the chain and
+`0600` for the key. A missing half of the root pair is refused rather than
+regenerated: a new root would strand every client that installed the old one.
+`serve_root` publishes `root.crt` on a plain-HTTP socket; binding it is
+best-effort, because the VPN address may arrive after uping starts.
+
+### Failure isolation
+
+A domain is not the process. A missing manual pair, an unwritable CA directory,
+a CA that refuses an order and a listener address that does not exist yet are all
+`log::warn` and skip that domain or socket; the other domains keep serving. The
+listener probe in `main.rs` mirrors pingora's own socket (`SO_REUSEADDR`) because
+pingora panics on a failed bind, which would take every listener of that service
+down with it.
 
 ### Streams
 

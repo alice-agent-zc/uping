@@ -5,11 +5,11 @@ uping obtain the certificate, done. It also serves a directory without a
 backend, works over IPv4 and IPv6, and applies a new config on `SIGHUP` — no
 restart for a config change.
 
-## Status — v0.3.2
+## Status — v0.4.0
 
 - ✅ HTTPS reverse proxy with SNI, one certificate per domain
-- ✅ Let's Encrypt (`keys = "auto"`) and private ACME CAs, including step-ca
-  (`keys = "internal"`)
+- ✅ Let's Encrypt (`keys = "auto"`), and `keys = "internal"`: uping's own CA,
+  no ACME server, no step-ca, Ed25519 by default
 - ✅ Static files (`root`) and path routing (`routes = [...]`)
 - ✅ One `[listen]` for the host, plus per-domain `https_listen` / `https_listen6`
 - ✅ Private sites on a VPN address, `serve_http = false`, and `uping --dns-zone`
@@ -23,7 +23,7 @@ restart for a config change.
   relay. `routes` is HTTP path routing, not the mail feature.
 
 Not here: changing listeners or `[[stream]]` without a restart, load balancing,
-upstream mutual TLS, DNS-01.
+upstream mutual TLS, DNS-01, and wildcard SANs (SNI resolution is exact).
 
 ## Quick start
 
@@ -92,7 +92,7 @@ pkill -HUP -x uping
 
 The new file is validated first; an invalid file changes nothing. Changes to
 `[listen]`, `https_listen`/`https_listen6`, `[[stream]]`, `[acme]` or
-`[acme.internal]` need a restart instead: restart it through your user service
+`[internal]` need a restart instead: restart it through your user service
 manager.
 
 To upgrade, rebuild and re-apply `setcap`; the configuration and `cert/` stay
@@ -240,109 +240,58 @@ challenge. A failed startup order is retried after one hour (not seconds), so a
 rejection cannot turn into a restart loop that burns the CA's
 failed-authorization budget.
 
-### `[acme.internal]` — private ACME CA (step-ca)
+### `[internal]` — uping's own CA
 
-`keys = "internal"` (alias `"step-ca"`) selects this profile. It still uses
-**http-01**: the private CA must resolve the domain and reach the host on port
-80, and `serve_http = true` is required. `staging` does not apply to this
-profile. Accounts are stored per directory URL, so public and private CAs never
-share one.
+`keys = "internal"` no longer depends on any CA server. On first start uping
+generates a root pair under `ca_dir` and signs each domain's leaf itself; a leaf
+is renewed locally before it expires and swapped into the live listener without
+a restart. Nothing is fetched, so there is no http-01, no port 80 and no
+requirement that the CA resolve or reach the host.
 
 | Field | Default | Meaning |
 |---|---|---|
-| `directory` | required | The provisioner's ACME directory URL |
-| `ca_bundle` | inherits `[acme] ca_bundle` | PEM root that signs the ACME server |
+| `ca_dir` | `"cert/internal/ca"` | `root.crt` (0644) + `root.key` (0600) |
+| `cert_dir` | `"cert/internal"` | `<cert_dir>/<domain>/{fullchain,privkey}.pem` |
+| `common_name` | `"uping local CA"` | root subject CN; not a hostname |
+| `organization` | `"uping"` | root subject O |
+| `ca_days` | `3650` | root lifetime, clamped to `leaf_days..=7300` |
+| `leaf_days` | `397` | leaf lifetime, clamped to `1..=825` |
+| `renew_before_days` | `30` | renew a leaf with fewer days left |
+| `key_type` | `"ed25519"` | `ed25519`, `p256` or `rsa2048` |
+| `serve_root` | `""` | plain HTTP address that publishes `/root.crt`; empty means off |
 
-uping does **not** initialize step-ca, create its root CA, or generate a client
-certificate. You install step-ca once, then give uping two things: the
-provisioner's ACME directory URL and the root certificate that signs the ACME
-server's TLS certificate.
+The files use the ACME names, in their own subtree, so nothing an ACME run
+already wrote is read or overwritten:
 
-#### Set up step-ca once
+```text
+~/uping/cert/internal/ca/root.crt                       0644  <- install on clients
+~/uping/cert/internal/ca/root.key                       0600
+~/uping/cert/internal/app.vpn.rao-nagos.pf/fullchain.pem
+~/uping/cert/internal/app.vpn.rao-nagos.pf/privkey.pem  0600
+```
 
-1. Initialize the CA on the step-ca host. At the deployment-type prompt choose
-   **Standalone**: `Linked` adds Smallstep cloud configuration/reporting and
-   `Hosted` is Smallstep's managed CA. For a CA you run yourself on rupa,
-   Standalone is the right choice. `--acme` creates the ACME provisioner:
+The root is created once and never regenerated behind your back. If only one of
+`root.crt` / `root.key` survives, startup logs the pair as inconsistent and
+skips those domains, rather than minting a root every client would reject
+(remove both files to deliberately create a new CA). `alt_names = [...]` on a
+server adds SANs to the same leaf.
 
-   ```sh
-   sudo step ca init --deployment-type standalone --acme
-   ```
+On each client, once:
 
-   Without `--acme`, add the provisioner after step-ca is running:
+```sh
+curl -o /usr/local/share/ca-certificates/uping-local-ca.crt \
+  http://10.8.0.1:9000/root.crt
+sudo update-ca-certificates
+```
 
-   ```sh
-   sudo step ca provisioner add acme --type ACME
-   ```
+`serve_root` publishes that one file over plain HTTP on the address you name —
+typically the rupa VPN address. It is best-effort: an address that does not
+exist yet (the tunnel is not up) is logged and skipped, and every other listener
+keeps running.
 
-   The directory URL for a provisioner named `acme` is
-   `https://<ca-host>/acme/acme/directory`; adjust the path for another
-   provisioner name.
-
-   This creates the root and intermediate CA — often
-   `/root/.step/certs/root_ca.crt` and `intermediate_ca.crt` when run with
-   `sudo` — plus the CA configuration.
-
-2. Start step-ca and check the provisioner once it is reachable:
-
-   ```sh
-   sudo step ca provisioner list
-   ```
-
-3. Copy the **root** certificate — the public certificate only, never the root
-   private key — somewhere uping can read:
-
-   ```sh
-   sudo install -m644 "$(sudo step path)/certs/root_ca.crt" "$HOME/uping/cert/step-ca-root.pem"
-   ```
-
-   `sudo step ca init` writes under `/root/.step`, so use `sudo step path` here,
-   not the unprivileged user's path. If step-ca runs as a dedicated user,
-   initialize as that user (or pass `--root`/`--key`) so it can read the keys.
-
-   Do **not** copy `intermediate_ca.crt` alone in place of the root: it is a
-   chain certificate, not the long-lived trust anchor. step-ca normally sends
-   its intermediate during the TLS handshake; if it does not, concatenate
-   `root_ca.crt` and `intermediate_ca.crt` into the bundle.
-
-4. Point uping at the directory and that root:
-
-   ```toml
-   [acme.internal]                    # [acme.step-ca] is an accepted alias
-   directory = "https://step-ca.internal/acme/acme/directory"
-   ca_bundle = "cert/step-ca-root.pem"
-   ```
-
-   `ca_bundle` is the trust anchor for uping → ACME server. It is **not** a
-   client certificate and **not** the leaf certificate for your domain. If the
-   ACME endpoint has a publicly trusted certificate, `ca_bundle` may be empty;
-   with step-ca's own certificate, point it at the root.
-
-5. Use the private profile on the server:
-
-   ```toml
-   [[server]]
-   domain       = "site1.internal.rao-nagos.pf"
-   keys         = "internal"
-   upstream     = "127.0.0.1:8080"
-   https_listen = "10.8.0.1"      # the rupa VPN address
-   # serve_http = true (default): http-01 answers on 10.8.0.1:80
-   ```
-
-   uping creates the ACME account and the leaf certificate automatically:
-
-   ```text
-   ~/uping/cert/acme-account-<hash>.json
-   ~/uping/cert/site1.internal.rao-nagos.pf/fullchain.pem
-   ~/uping/cert/site1.internal.rao-nagos.pf/privkey.pem
-   ```
-
-**Important:** `ca_bundle` is only the trust anchor for uping → ACME server. It
-is **not** pushed to clients. Clients must trust the step-ca **root** themselves
-(install `root_ca.crt` once in the OS/browser/MDM). Without that, the issued
-certificate is not trusted, no matter what uping does. Do not put the root
-private key or a manually generated leaf certificate in uping's `cert_dir`:
-uping writes the leaf itself.
+The check the old `[acme.internal]` profile could not avoid still exists: the
+**client** has to install the root once. What disappears is the second daemon —
+no step-ca, no account, no ACME directory, no port 80.
 
 ## `[[server]]` — every shape
 
@@ -421,8 +370,9 @@ serve_http = false
 ```
 
 `serve_http = false` removes the domain from port 80: a request for it there is
-`404`, not a redirect. It is refused with any ACME mode because http-01 needs
-port 80; use `keys = "manual"` (or a private ACME CA that can reach :80).
+`404`, not a redirect. It is refused with an ACME mode because http-01 needs
+port 80; use `keys = "internal"` (uping's own CA) or `keys = "manual"` with an
+externally issued pair.
 
 ### 6. HTTPS to the backend
 
@@ -461,28 +411,27 @@ upstream = "127.0.0.1:8080"
 ```
 
 Both paths are required. uping reads them at startup and on `SIGHUP`; renew
-them yourself (certbot, step-ca, a paid CA, …) and send `SIGHUP`.
+them yourself (certbot, an ACME client, a paid CA, …) and send `SIGHUP`.
 
-### 9. Private site with step-ca
+### 9. Private site with the local CA
 
 ```toml
-[acme.internal]
-directory = "https://step-ca.internal/acme/acme/directory"
-ca_bundle = "cert/step-ca-root.pem"
+[internal]
+serve_root = "10.8.0.1:9000"   # optional: publish /root.crt over plain HTTP
 
 [[server]]
 domain       = "site1.internal.rao-nagos.pf"
 keys         = "internal"
+alt_names    = ["vpn.rao-nagos.pf"]
 upstream     = "127.0.0.1:8080"
-https_listen = "10.8.0.1"       # the rupa VPN address
-# serve_http = true (default): step-ca validates via http-01
+https_listen = "10.8.0.1"      # the rupa VPN address
+serve_http   = false           # no :80 at all, and no http-01 to answer
 ```
 
-This is automatic leaf issuance and renewal, but the **client** must trust the
-step-ca root. You install that root once per client; you do not install each
-leaf. The private CA can validate a name that only exists in your internal DNS:
-no public zone change is required, provided step-ca can resolve the name and
-reach the host on port 80. See [Private names, rupa and
+This is automatic leaf issuance and renewal with no CA server on the network.
+The **client** trusts the root once (fetch it from `serve_root`, or copy
+`cert/internal/ca/root.crt`); the leaves rotate underneath that trust. The name
+may exist only in your internal DNS. See [Private names, rupa and
 DNS](#private-names-rupa-and-dns).
 
 ### 10. Explicit `keys = "auto"`
@@ -502,8 +451,9 @@ optionally override where the pair is written.
 | `[[server]]` field | Default |
 |---|---|
 | `domain` | required |
-| `keys` | `auto` without key paths; `manual` with both |
-| `pub_key`, `priv_key` | `""` (manual requires both) |
+| `keys` | `auto` without key paths; `manual` with both; `internal` for a local leaf |
+| `pub_key`, `priv_key` | `""` (manual requires both; refused with `internal`) |
+| `alt_names` | `[]` (extra SANs, `internal` only) |
 | `upstream`, `root` | `""` (exactly one required) |
 | `https_listen`, `https_listen6` | `""` (use the global HTTPS group) |
 | `serve_http` | `true` |
@@ -572,14 +522,14 @@ uping --dns-zone config.toml
 
 ### Trust model for private names
 
-`keys = "internal"` means "use this private ACME CA", not "make a private name
-publicly trusted". The possible combinations are:
+`keys = "internal"` means "uping signs this name itself", not "this private name
+becomes publicly trusted". The possible combinations are:
 
 | Goal | Public DNS | Root on clients | uping |
 |---|---|---|---|
 | Public name, public trust | A record + port 80 | no (public root) | `keys = "auto"` |
 | Public name, DNS-01 | TXT record; A may be private | no | not implemented; external ACME client + `keys = "manual"` |
-| Private name, automatic leaf | no (internal DNS) | **yes** (step-ca root) | `keys = "internal"` |
+| Private name, automatic leaf | no (internal DNS) | **yes** (`root.crt`) | `keys = "internal"` |
 | Fully manual | no | yes | `keys = "manual"` |
 
 A publicly trusted root will not sign `.internal`, `.localhost`, unqualified
@@ -587,25 +537,22 @@ names or private IPs. A public CA only signs names it can validate publicly.
 There is no setup that gives public trust + private DNS + zero client
 installation.
 
-For step-ca:
+For `keys = "internal"`:
 
-1. Run step-ca on (or reachable from) the rupa network, with a root CA; see
-   [Set up step-ca once](#set-up-step-ca-once).
-2. Configure its ACME provisioner and its DNS so it resolves the private names
-   (the internal resolver, or `/etc/hosts`).
-3. Keep `serve_http = true` so http-01 can answer on port 80.
-4. Install the step-ca **root** once on each client.
-5. Add one `[[server]]` per name with `keys = "internal"`; one root covers all
-   of them, and each leaf renews automatically.
+1. Let uping create `cert/internal/ca/root.crt` on first start.
+2. Publish it with `serve_root = "10.8.0.1:9000"`, or copy the file out of band.
+3. Install that root once on each client.
+4. Add one `[[server]]` per name with `keys = "internal"`; one root covers all of
+   them, and each leaf renews automatically.
 
 The certificate is for the **name**, not the IP. The A record may point to
 `10.8.0.1`; the client resolves the name, connects to the private IP, and
-trusts the leaf because it trusts the step-ca root. No IP SAN is needed.
+trusts the leaf because it trusts uping's root. No IP SAN is needed.
 
-`.localhost` is special and not suitable for remote clients. `.internal` works
-if the private CA's policy allows it. A subdomain you own, such as
-`site1.internal.rao-nagos.pf` or `vpn.rao-nagos.pf`, is the least surprising
-choice.
+`.localhost` is special and not suitable for remote clients. A subdomain you own,
+such as `site1.internal.rao-nagos.pf` or `vpn.rao-nagos.pf`, is the least
+surprising choice. `alt_names` lets one leaf cover the bare and the `www` name;
+a wildcard SAN is refused because SNI resolution is an exact match.
 
 ## `uping --dns-zone`
 

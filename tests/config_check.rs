@@ -360,12 +360,29 @@ fn an_auto_server_without_a_certificate_is_accepted_by_check() {
     let body = "[[server]]\ndomain = \"auto.example\"\nupstream = \"127.0.0.1:8080\"\n";
     let ok = assert_accepted("good-auto-missing.toml", body);
     assert!(
-        ok.contains("1 certificate(s) to request"),
+        ok.contains("1 certificate(s) to obtain"),
         "the pending certificate must be visible, got: {ok:?}"
     );
     assert!(
         !fixtures().join("cert").exists(),
         "`--check` must not create the certificate directory"
+    );
+}
+
+/// `keys = "internal"` is a local signature, not a network order: `--check`
+/// must accept a first start with nothing on disk and must not create the CA.
+#[test]
+fn an_internal_server_without_a_certificate_is_accepted_by_check() {
+    let body = "[[server]]\ndomain = \"private.example\"\nkeys = \"internal\"\n\
+                serve_http = false\nupstream = \"127.0.0.1:8080\"\n";
+    let ok = assert_accepted("good-internal-missing.toml", body);
+    assert!(
+        ok.contains("1 certificate(s) to obtain"),
+        "the local pair must be counted, got: {ok:?}"
+    );
+    assert!(
+        !fixtures().join("cert").exists(),
+        "`--check` must not create the CA directory"
     );
 }
 
