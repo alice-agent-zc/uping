@@ -15,7 +15,7 @@
 # Apply an edited config without dropping connections:
 #   systemctl --user reload uping
 # A new binary, or a change to [listen], https_listen/https_listen6,
-# [acme]/[acme.internal] or [[stream]], needs a restart:
+# [acme]/[internal] or [[stream]], needs a restart:
 #   systemctl --user restart uping
 #
 # The capability lives on the binary and is lost on every rebuild; re-apply it.

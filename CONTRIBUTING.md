@@ -229,22 +229,12 @@ upstream and a `0.0.0.0` bind.
 ## Running it locally
 
 `test.config.toml` listens on `127.0.0.1:8088`/`:8443` and proxies to
-`127.0.0.1:8080`. It expects a `test.local` pair in `certs/`:
+`127.0.0.1:8080`. `keys = "internal"` makes uping create its own CA and leaf
+under `cert/internal/` on first start, so there is nothing to generate first:
 
 ```sh
-mkdir -p certs
-openssl req -x509 -newkey rsa:2048 -nodes -days 365 \
-  -keyout certs/test.local.key \
-  -out certs/test.local.crt \
-  -subj "/CN=test.local" \
-  -addext "subjectAltName=DNS:test.local"
-```
-
-Then, in one terminal a throwaway backend and in another uping:
-
-```sh
-python3 -m http.server 8080
-cargo run -- test.config.toml
+python3 -m http.server 8080        # in one terminal
+cargo run -- test.config.toml      # in another
 ```
 
 ```sh
@@ -252,8 +242,9 @@ curl -k  --resolve test.local:8443:127.0.0.1 https://test.local:8443/
 curl -i  --resolve test.local:8088:127.0.0.1 http://test.local:8088/   # 301
 ```
 
-`-k` for the self-signed cert, `--resolve` because `test.local` is not in DNS
-(the handshake needs an SNI hostname).
+`-k` because the leaf is signed by the local CA (trust
+`cert/internal/ca/root.crt` to drop it), `--resolve` because `test.local` is not
+in DNS (the handshake needs an SNI hostname).
 
 ## Deployment
 
@@ -383,16 +374,17 @@ Publishing is tag-driven. A tag names the exact commit that becomes the
 release, so the asset and the crate cannot drift from the source:
 
 ```sh
-git tag v0.3.2
-git push origin v0.3.2
+git tag v0.4.0
+git push origin v0.4.0
 ```
 
 Two workflows run on `v*` tags:
 
 - `.github/workflows/release.yml` — builds the Linux binary, runs the tests,
-  packages `uping-<target>.tar.gz` + `.sha256`, and creates/updates the GitHub
-  release. It uses the built-in `GITHUB_TOKEN`; `permissions: contents: write`
-  is already set, so there is no secret to add.
+  packages `uping-<target>.tar.gz` + `.sha256` and the
+  `uping_<version>_amd64.deb`, and creates/updates the GitHub release. It uses
+  the built-in `GITHUB_TOKEN`; `permissions: contents: write` is already set, so
+  there is no secret to add.
 - `.github/workflows/crates.yml` — publishes the crate to crates.io. It needs
   **`CARGO_REGISTRY_TOKEN`**, holding a crates.io API token scoped to `uping`.
   Put it in the GitHub Environment named **`crates.io`** (Settings →

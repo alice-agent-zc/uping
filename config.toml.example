@@ -16,7 +16,10 @@
 # checkout directory.
 
 [listen]
-ipv4  = "0.0.0.0"
+# The public address of this host. A per-server `https_listen` cannot be a
+# second address on a wildcard listener, so the global one is concrete; replace
+# the placeholder with your address.
+ipv4  = "203.0.113.10"
 http  = 80
 https = 443
 # ipv6 = "2607:f1c0:f031:4500::1"   # omit for no IPv6

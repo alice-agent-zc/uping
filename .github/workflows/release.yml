@@ -11,7 +11,7 @@ run-name: release ${{ github.event.inputs.tag || github.ref_name }}
 # deliberate: it can replace a published asset.
 #
 # Asset layout:
-#   uping-<target>.tar.gz         contains uping, config.toml.example, uping.service
+#   uping-<target>.tar.gz         uping, config.toml.example, uping.service, uping.8
 #   uping-<target>.tar.gz.sha256  bare "<hash>  <file>" from sha256sum
 #   uping_<version>_amd64.deb     system package (binary, unit, tmpfiles, docs)
 on:
@@ -20,7 +20,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Existing tag to publish (e.g. v0.3.2)"
+        description: "Existing tag to publish (e.g. v0.4.0)"
         required: true
 
 permissions:
@@ -42,13 +42,14 @@ jobs:
         id: tag
         run: echo "name=${{ inputs.tag || github.ref_name }}" >> "$GITHUB_OUTPUT"
 
-      # pingora builds zlib-ng through cmake, and the openssl backend needs the
-      # headers; neither is on a bare runner.
+      # pingora builds zlib-ng through cmake, and pingora-openssl vendors
+      # OpenSSL (its `vendored` feature), which needs perl and the C toolchain
+      # the runner already has. No system libssl headers are involved.
       - name: build deps
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq --no-install-recommends \
-            cmake pkg-config libssl-dev
+            cmake perl
 
       - uses: Swatinem/rust-cache@v2
         with:
@@ -79,16 +80,18 @@ jobs:
           strip dist/uping
           cp config.toml.example dist/config.toml.example
           cp uping.service dist/uping.service
+          cp packaging/uping.8 dist/uping.8
           # tar -C dist writes the archive beside the workflow's cwd, so the
           # checksum is taken there too.
-          tar -C dist -czf "uping-$TARGET.tar.gz" uping config.toml.example uping.service
+          tar -C dist -czf "uping-$TARGET.tar.gz" \
+            uping config.toml.example uping.service uping.8
           sha256sum "uping-$TARGET.tar.gz" > "uping-$TARGET.tar.gz.sha256"
           ls -l uping-"$TARGET".tar.gz*
           cat uping-"$TARGET".tar.gz.sha256
 
       # Same binary the tarball carries, packaged for dpkg. The runner is the
-      # glibc baseline the package targets; packaging/build-deb.sh does the same
-      # locally inside ubuntu:24.04.
+      # glibc baseline the package targets; CONTRIBUTING has the container
+      # command that builds the same way locally.
       - name: package the .deb
         run: |
           cargo install cargo-deb --version 3.8.0

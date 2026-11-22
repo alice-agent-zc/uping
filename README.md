@@ -1,15 +1,17 @@
 # uping
 
 A tiny, TOML-configured reverse proxy. Point a domain at a local service, let
-uping obtain the certificate, done. It also serves a directory without a
-backend, works over IPv4 and IPv6, and applies a new config on `SIGHUP` — no
-restart for a config change.
+uping obtain the certificate — from Let's Encrypt or from its own CA, with no
+external daemon — and it is done. It also serves a directory without a backend,
+works over IPv4 and IPv6, and applies a new config on `SIGHUP` without a
+restart.
 
 ## Status — v0.4.0
 
 - ✅ HTTPS reverse proxy with SNI, one certificate per domain
 - ✅ Let's Encrypt (`keys = "auto"`), and `keys = "internal"`: uping's own CA,
-  no ACME server, no step-ca, Ed25519 by default
+  scoped to one zone, Ed25519 by default, root published over HTTPS at
+  `serve_root`
 - ✅ Static files (`root`) and path routing (`routes = [...]`)
 - ✅ One `[listen]` for the host, plus per-domain `https_listen` / `https_listen6`
 - ✅ Private sites on a VPN address, `serve_http = false`, and `uping --dns-zone`
@@ -26,6 +28,18 @@ restart for a config change.
 
 Not here: changing listeners or `[[stream]]` without a restart, load balancing,
 upstream mutual TLS, DNS-01, and wildcard SANs (SNI resolution is exact).
+
+### Upgrading from v0.3
+
+* `[acme.internal]` and `keys = "step-ca"` are gone. `keys = "internal"` now
+  selects uping's own CA, configured by `[internal]`: remove the old table and
+  set `domain` (the one zone it signs), `ca_dir` and `cert_dir`.
+* `[internal] serve_root` is an HTTPS URL (`https://internal.example.com:9000`),
+  not an address; the root is served over TLS at `/root.crt`.
+* `[[stream]]` is stable; its configuration is unchanged.
+* `[[server]]` and `routes` shapes are unchanged. ACME certificates under
+  `[acme] cert_dir` are untouched; local leaves live under `[internal]
+  cert_dir`.
 
 ## Quick start
 
