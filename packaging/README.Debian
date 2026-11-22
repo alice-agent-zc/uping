@@ -46,7 +46,7 @@ holds nothing else. There is no `setcap` to re-apply after an upgrade.
     /usr/bin/uping                                  the binary
     /usr/lib/systemd/system/uping.service           the system unit
     /usr/lib/tmpfiles.d/uping.conf                  creates /var/lib/uping
-    /usr/share/man/man8/uping.8                     man uping
+    /usr/share/man/man8/uping.8.gz                     man uping
     /usr/share/uping/config.toml.default            the installed default
     /usr/share/uping/config.toml.example            commented template
     /usr/share/uping/www/                           the default landing page

@@ -109,7 +109,21 @@ The repository also builds a `.deb` for the system deployment, and installing
 it is one command:
 
 ```sh
-packaging/build-deb.sh                 # compiles in ubuntu:24.04, then cargo-deb
+# Build in the release's glibc: the host's is newer, and a binary linked
+# against it would not run on the target. The container keeps its toolchain
+# and crate cache under target/deb-cargo, which is git-ignored.
+docker run --rm -v "$PWD:/src" -w /src \
+    -e CARGO_HOME=/src/target/deb-cargo \
+    -e RUSTUP_HOME=/src/target/deb-cargo/rustup \
+    -e CARGO_BUILD_JOBS=2 ubuntu:24.04 sh -euc '
+        apt-get update -qq
+        apt-get install -y -qq ca-certificates curl build-essential cmake perl
+        curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs \
+            | sh -s -- -y --profile minimal --default-toolchain 1.100.0
+        . "$CARGO_HOME/env"
+        cargo build --release --locked --target x86_64-unknown-linux-gnu'
+cargo deb --no-build --target x86_64-unknown-linux-gnu
+
 sudo dpkg -i target/debian/uping_*.deb
 ```
 
@@ -139,16 +153,16 @@ the default is written only when the file is absent, on install and on upgrade.
 it and `/etc/uping` on purpose, because deleting the CA would silently untrust
 every client.
 
-The container in `build-deb.sh` is what makes the binary portable: it compiles
-in the release's glibc (Ubuntu 24.04), and `packaging/build-deb.sh debian:12`
-builds against an older baseline.
+The container is what makes the binary portable: it compiles in the release's
+glibc (Ubuntu 24.04). For an older baseline, put `debian:12` on that docker
+line instead; the package then depends on glibc 2.36 rather than 2.38.
 
 | Path | Contents |
 |---|---|
 | `/usr/bin/uping` | the binary |
 | `/usr/lib/systemd/system/uping.service` | unit, ambient capability, no `setcap` |
 | `/usr/lib/tmpfiles.d/uping.conf` | creates `/var/lib/uping` |
-| `/usr/share/man/man8/uping.8` | `man uping` |
+| `/usr/share/man/man8/uping.8.gz` | `man uping` |
 | `/usr/share/uping/` | default and example config, static landing page |
 | `/usr/share/doc/uping/` | README, README.Debian, copyright |
 | `/etc/uping/config.toml` | your configuration |

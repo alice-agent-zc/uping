@@ -268,7 +268,8 @@ installs live in `packaging/`:
 ```
 packaging/uping.service         system unit: User=uping, ambient bind capability
 packaging/uping.tmpfiles.conf   creates /var/lib/uping, owner uping, mode 0750
-packaging/uping.8               man page, installed as /usr/share/man/man8/uping.8
+packaging/uping.8               man page; cargo-deb installs it gzipped as
+                                /usr/share/man/man8/uping.8.gz
 packaging/config.toml.default   the working default installed on a fresh install
 packaging/config.toml.example   commented template, absolute paths under /var/lib
 packaging/www/index.html        the page the default serves on https://localhost:8443
@@ -276,9 +277,12 @@ packaging/README.Debian         install, paths, upgrade and purge notes
 packaging/debian/postinst       user, data dir, default config, enable and start
 packaging/debian/prerm          stops the unit on remove
 packaging/debian/postrm         disables the unit; keeps /etc and /var/lib
-packaging/build-deb.sh          compiles in a container, then runs cargo-deb
-packaging/test-deb.sh           installs the result in the target image
 ```
+
+The `packaging/debian/` maintainer scripts are the only shell in the tree. That
+is not a choice: dpkg runs those files itself, and they are what makes `dpkg -i`
+create the user, the default configuration and the enabled service. Everything
+else (build, test, release) is plain commands in this document.
 
 Four rules shape it:
 
@@ -292,8 +296,7 @@ Four rules shape it:
 * **An existing configuration is never replaced.** The package does not ship
   `/etc/uping/config.toml` in its archive; the postinst copies
   `config.toml.default` there only when the file is absent. There is no
-  conffile prompt, and a reinstall cannot clobber a real configuration —
-  `test-deb.sh` checks the checksum across a reinstall.
+  conffile prompt, and a reinstall cannot clobber a real configuration.
 * **No `setcap`.** The unit carries `AmbientCapabilities=CAP_NET_BIND_SERVICE`
   and a bounding set with nothing else, so the capability survives binary
   upgrades — unlike an xattr on the file, which a rebuild silently drops.
@@ -309,33 +312,58 @@ static page from `/usr/share/uping/www`, and a `localhost` leaf from the local
 CA. Installing a package must not bind `:80`/`:443`, contact an ACME server, or
 compete with a webserver that is already running.
 
-The `.deb` must be built where the target glibc lives, which is why
-`packaging/build-deb.sh` compiles inside `ubuntu:24.04` (the release runner's
-image) and runs `cargo deb --no-build` on the host afterwards:
+The `.deb` must be built where the target glibc lives: this host's is newer
+than the release runner's, so the compile happens inside the release image and
+`cargo deb --no-build` runs on the host afterwards.
 
 ```sh
-packaging/build-deb.sh
+docker run --rm -v "$PWD:/src" -w /src \
+    -e CARGO_HOME=/src/target/deb-cargo \
+    -e RUSTUP_HOME=/src/target/deb-cargo/rustup \
+    -e CARGO_BUILD_JOBS=2 ubuntu:24.04 sh -euc '
+        apt-get update -qq
+        apt-get install -y -qq ca-certificates curl build-essential cmake perl
+        curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs \
+            | sh -s -- -y --profile minimal --default-toolchain 1.100.0
+        . "$CARGO_HOME/env"
+        cargo build --release --locked --target x86_64-unknown-linux-gnu'
+cargo deb --no-build --target x86_64-unknown-linux-gnu
 dpkg-deb -c target/debian/uping_*.deb      # file list and modes
 dpkg-deb -I target/debian/uping_*.deb      # control fields
 ```
 
-Test the package in the same image, not on the build host:
+Test the package in the image it targets, not on the build host:
 
 ```sh
-packaging/build-deb.sh
-packaging/test-deb.sh
+docker run --rm -v "$PWD/target/debian:/debs:ro" ubuntu:24.04 sh -euc '
+    apt-get update -qq
+    apt-get install -y -qq --no-install-recommends /debs/uping_*.deb
+    id uping && test -f /etc/uping/config.toml
+    runuser -u uping -- /usr/bin/uping --check /etc/uping/config.toml
+    dpkg-deb -c /debs/uping_*.deb | grep -q usr/share/man/man8/uping.8.gz
+    dpkg -P uping >/dev/null && test -f /etc/uping/config.toml'
 ```
 
-`test-deb.sh` installs the `.deb` and checks what only exists after dpkg ran:
-the user and group, `/var/lib/uping` ownership, `/usr/share/man/man8/uping.8`
-in the archive, the default `/etc/uping/config.toml` with a passing `--check`,
-the default page fetched over TLS with the generated root as the only trust
-anchor, an upgrade that leaves an edited configuration's checksum unchanged, and
-a purge that keeps `/etc/uping` and `/var/lib/uping`.
+That covers the parts that only exist after dpkg ran: the user and group, the
+data directory, the default `/etc/uping/config.toml` with a passing `--check`,
+the man page in the archive, and a purge that keeps the CA. To watch the
+installed default serve its page, add `curl` and run:
 
-For a wider baseline, `packaging/build-deb.sh debian:12` builds against glibc
-2.36; the release workflow uses `ubuntu:24.04` for both the tarball and the
-package so the two assets agree.
+```sh
+docker run --rm -v "$PWD/target/debian:/debs:ro" ubuntu:24.04 sh -euc '
+    apt-get update -qq
+    apt-get install -y -qq --no-install-recommends /debs/uping_*.deb curl
+    runuser -u uping -- /usr/bin/uping /etc/uping/config.toml &
+    sleep 2
+    curl -fsS --resolve localhost:8443:127.0.0.1 \
+        --cacert /var/lib/uping/internal/ca/root.crt https://localhost:8443/ \
+        | grep "uping is running"'
+```
+
+For a wider baseline, use `debian:12` instead of `ubuntu:24.04` in the build
+command: the package then depends on glibc 2.36 rather than 2.38. The release
+workflow uses `ubuntu:24.04` for both the tarball and the package so the two
+assets agree.
 
 ## Release
 

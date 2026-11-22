@@ -40,9 +40,9 @@ signal-hook = "0.3"
 socket2 = "0.6"
 
 # Debian package metadata. The packaging files (unit, tmpfiles, maintainer
-# scripts, example config) live under `packaging/`; `packaging/build-deb.sh`
-# builds in a container so the binary targets the release's glibc, not the
-# builder's.
+# scripts, configs, man page, static page) live under `packaging/`. Build the
+# binary inside the release's glibc before `cargo deb --no-build`; CONTRIBUTING
+# has the exact container command.
 [package.metadata.deb]
 maintainer = "tetuaoro <65575727+tetuaoro@users.noreply.github.com>"
 copyright = "2026, tetuaoro"
