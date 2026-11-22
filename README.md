@@ -19,6 +19,8 @@ restart for a config change.
 - ✅ Upstream health checks (`503` at once when a backend dies), per-domain
   intervals, and HTTPS to the backend with a private CA, SNI and verify opt-out
 - ✅ Live config swap on `SIGHUP`
+- ✅ `.deb` for Debian/Ubuntu: `dpkg -i` creates the user, a working default on
+  loopback, `man uping`, and enables the service
 - ⚠️ `[[stream]]` raw TCP forwarding is **experimental** — the mail/database
   relay. `routes` is HTTP path routing, not the mail feature.
 
@@ -103,37 +105,54 @@ resolver.
 
 ## Debian package
 
-The repository also builds a `.deb`: the binary in `/usr/bin/uping`, a system
-unit carrying `AmbientCapabilities=CAP_NET_BIND_SERVICE` (so there is no
-`setcap` to re-apply), a system user `uping` and `/var/lib/uping` for keys and
-leaves. It ships **no** `/etc/uping/config.toml`, so installing or upgrading
-the package never touches an existing configuration.
+The repository also builds a `.deb` for the system deployment, and installing
+it is one command:
 
 ```sh
 packaging/build-deb.sh                 # compiles in ubuntu:24.04, then cargo-deb
 sudo dpkg -i target/debian/uping_*.deb
 ```
 
-The container is what makes the package portable: the binary needs the target's
-glibc, so one built on a newer host would not run. The default image is the one
-the release workflow uses; `packaging/build-deb.sh debian:12` builds against an
-older baseline.
-
-Then create the configuration and start:
+That is the whole install. The post-installation script creates the
+unprivileged `uping` user and group, `/var/lib/uping`, a **working default**
+`/etc/uping/config.toml` (loopback only, a static page on
+`https://localhost:8443` signed by uping's own CA), installs `man uping`, and
+enables and starts `uping.service`. Nothing has to be created by hand.
 
 ```sh
-sudo install -d -o root -g uping -m 0750 /etc/uping
-sudo install -o root -g uping -m 0640 \
-    /usr/share/uping/config.toml.example /etc/uping/config.toml
-sudo -u uping /usr/bin/uping --check /etc/uping/config.toml
-sudo systemctl enable --now uping
+man uping
+systemctl status uping
+sudo curl --cacert /var/lib/uping/internal/ca/root.crt https://localhost:8443/
 ```
 
-`/etc/uping/config.toml` is yours: it is not a conffile, so there is no prompt
-and nothing to overwrite. `/var/lib/uping` holds the local CA and the leaves;
-`apt purge` keeps that directory on purpose, because deleting the CA would
-silently untrust every client. The package is an alternative to the `~/uping`
-checkout install above, not a replacement for it.
+Point it at your domains when you are ready:
+
+```sh
+sudo editor /etc/uping/config.toml
+sudo -u uping /usr/bin/uping --check /etc/uping/config.toml
+sudo systemctl restart uping
+```
+
+The package never overwrites a `/etc/uping/config.toml` that is already there:
+the default is written only when the file is absent, on install and on upgrade.
+`/var/lib/uping` holds the local CA and the leaves, and `apt purge` keeps both
+it and `/etc/uping` on purpose, because deleting the CA would silently untrust
+every client.
+
+The container in `build-deb.sh` is what makes the binary portable: it compiles
+in the release's glibc (Ubuntu 24.04), and `packaging/build-deb.sh debian:12`
+builds against an older baseline.
+
+| Path | Contents |
+|---|---|
+| `/usr/bin/uping` | the binary |
+| `/usr/lib/systemd/system/uping.service` | unit, ambient capability, no `setcap` |
+| `/usr/lib/tmpfiles.d/uping.conf` | creates `/var/lib/uping` |
+| `/usr/share/man/man8/uping.8` | `man uping` |
+| `/usr/share/uping/` | default and example config, static landing page |
+| `/usr/share/doc/uping/` | README, README.Debian, copyright |
+| `/etc/uping/config.toml` | your configuration |
+| `/var/lib/uping/` | CA, leaves, writable state |
 
 ## Paths
 

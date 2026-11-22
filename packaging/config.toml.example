@@ -1,9 +1,12 @@
-# uping — system deployment example for /etc/uping/config.toml
+# uping — commented template for /etc/uping/config.toml
 #
-# Copy it, then edit:
-#   sudo install -d -o root -g uping -m 0750 /etc/uping
-#   sudo install -o root -g uping -m 0640 config.toml.example /etc/uping/config.toml
+# The package installs a working loopback default in /etc/uping/config.toml
+# (see /usr/share/uping/config.toml.default). This file is the reference for
+# the shapes it does not use: public ACME names, a public listener on :80/:443,
+# a private local-CA site. Start from it when you replace the default:
+#   sudo editor /etc/uping/config.toml
 #   sudo -u uping /usr/bin/uping --check /etc/uping/config.toml
+#   sudo systemctl restart uping
 #
 # Every relative path resolves against the directory holding this file
 # (/etc/uping), but /etc is not writable by the service user, so everything

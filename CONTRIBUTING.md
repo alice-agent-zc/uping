@@ -245,10 +245,20 @@ curl -i  --resolve test.local:8088:127.0.0.1 http://test.local:8088/   # 301
 
 ## Deployment
 
-Production is the `~/uping` checkout: `target/release/uping` with `config.toml`
-and `cert/` beside it. The binary carries `CAP_NET_BIND_SERVICE` via `setcap`,
-so the process stays an ordinary user. `uping.service` is the user unit; it can
-order itself after `rupa.service` when both run in the same user manager.
+Two supported shapes, same binary:
+
+* **The Debian package** (next section) for the standard directories:
+  `/usr/bin/uping`, `/etc/uping/config.toml`, `/var/lib/uping`, a system unit
+  with an ambient bind capability. `dpkg -i` also creates the service user and
+  a working loopback default.
+* **The `~/uping` checkout**, for a single-user host or a development machine:
+  `target/release/uping` with `config.toml` and `cert/` beside it. The binary
+  carries `CAP_NET_BIND_SERVICE` via `setcap`, which a rebuild drops, so
+  re-apply it. `uping.service` in the repository root is the user unit for this
+  shape; it can order itself after `rupa.service` when both run in the same
+  user manager.
+
+Use one shape per host for a given port.
 
 ## Debian package
 
@@ -256,32 +266,48 @@ order itself after `rupa.service` when both run in the same user manager.
 installs live in `packaging/`:
 
 ```
-packaging/uping.service        system unit: User=uping, ambient bind capability
-packaging/uping.tmpfiles.conf  creates /var/lib/uping, owner uping, mode 0750
-packaging/config.toml.example  system example; absolute paths under /var/lib
-packaging/README.Debian        first-start, paths, upgrade and purge notes
-packaging/debian/postinst      creates the user, the data dir, daemon-reload
-packaging/debian/prerm         stops the unit on remove
-packaging/debian/postrm        disables the unit; keeps /etc and /var/lib
-packaging/build-deb.sh         compiles in a container, then runs cargo-deb
-packaging/test-deb.sh          installs the result in the target image
+packaging/uping.service         system unit: User=uping, ambient bind capability
+packaging/uping.tmpfiles.conf   creates /var/lib/uping, owner uping, mode 0750
+packaging/uping.8               man page, installed as /usr/share/man/man8/uping.8
+packaging/config.toml.default   the working default installed on a fresh install
+packaging/config.toml.example   commented template, absolute paths under /var/lib
+packaging/www/index.html        the page the default serves on https://localhost:8443
+packaging/README.Debian         install, paths, upgrade and purge notes
+packaging/debian/postinst       user, data dir, default config, enable and start
+packaging/debian/prerm          stops the unit on remove
+packaging/debian/postrm         disables the unit; keeps /etc and /var/lib
+packaging/build-deb.sh          compiles in a container, then runs cargo-deb
+packaging/test-deb.sh           installs the result in the target image
 ```
 
-Two rules shape it:
+Four rules shape it:
 
-* **No configuration is shipped.** `/etc/uping/config.toml` is the admin's file;
-  a package that shipped one would either overwrite an existing configuration on
-  first install or force a conffile prompt nobody asked for. The postinst only
-  prints the copy command when the file is absent.
+* **`dpkg -i` is the whole install.** The postinst creates the user and group
+  (`adduser` if present, `useradd`/`groupadd` otherwise — minimal containers
+  have neither adduser nor systemd-tmpfiles), the data directory, a working
+  default configuration, then enables and starts the unit. It distinguishes a
+  fresh install from an upgrade with `$2` (empty on a fresh install): a fresh
+  install starts the default, an upgrade only `try-restart`s a unit that is
+  already enabled, so a service the admin disabled stays disabled.
+* **An existing configuration is never replaced.** The package does not ship
+  `/etc/uping/config.toml` in its archive; the postinst copies
+  `config.toml.default` there only when the file is absent. There is no
+  conffile prompt, and a reinstall cannot clobber a real configuration —
+  `test-deb.sh` checks the checksum across a reinstall.
 * **No `setcap`.** The unit carries `AmbientCapabilities=CAP_NET_BIND_SERVICE`
   and a bounding set with nothing else, so the capability survives binary
   upgrades — unlike an xattr on the file, which a rebuild silently drops.
-* **The example config is not in `/usr/share/doc`.** Ubuntu and Debian ship a
-  dpkg path exclude that keeps only `copyright` under that tree
-  (`/etc/dpkg/dpkg.cfg.d/excludes`), so a first-start template there would
-  simply not exist on a minimal image. It lives in
-  `/usr/share/uping/config.toml.example`, and `packaging/test-deb.sh` proves it
-  is installed and valid with `--check`.
+* **Functional files are not under `/usr/share/doc` or `/usr/share/man`.**
+  Ubuntu and Debian ship dpkg path excludes that drop both trees (only
+  `copyright` survives under doc), so the default and example configs live in
+  `/usr/share/uping/`. The man page is installed in the standard
+  `/usr/share/man/man8/` and is simply absent on images that exclude man pages;
+  `man uping` is the standard path, not a promise that every image has it.
+
+The default config is loopback-only on purpose: `127.0.0.1:8080`/`:8443`, a
+static page from `/usr/share/uping/www`, and a `localhost` leaf from the local
+CA. Installing a package must not bind `:80`/`:443`, contact an ACME server, or
+compete with a webserver that is already running.
 
 The `.deb` must be built where the target glibc lives, which is why
 `packaging/build-deb.sh` compiles inside `ubuntu:24.04` (the release runner's
@@ -300,10 +326,12 @@ packaging/build-deb.sh
 packaging/test-deb.sh
 ```
 
-`test-deb.sh` installs the `.deb`, checks the user, the data directory, the
-unit, the docs and the packaged example with `--check`, proves that reinstalling
-over an existing `/etc/uping/config.toml` leaves its checksum unchanged, and
-that a purge keeps `/etc/uping` and `/var/lib/uping`.
+`test-deb.sh` installs the `.deb` and checks what only exists after dpkg ran:
+the user and group, `/var/lib/uping` ownership, `/usr/share/man/man8/uping.8`
+in the archive, the default `/etc/uping/config.toml` with a passing `--check`,
+the default page fetched over TLS with the generated root as the only trust
+anchor, an upgrade that leaves an edited configuration's checksum unchanged, and
+a purge that keeps `/etc/uping` and `/var/lib/uping`.
 
 For a wider baseline, `packaging/build-deb.sh debian:12` builds against glibc
 2.36; the release workflow uses `ubuntu:24.04` for both the tarball and the

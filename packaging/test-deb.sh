@@ -1,9 +1,11 @@
 #!/bin/sh
 # Install the freshly built .deb in the image it targets and check what only
-# exists after dpkg ran: the user, the data directory, the unit, the docs, the
-# packaged example, an upgrade that leaves /etc alone, and a purge that keeps
-# the CA. Runtime behaviour is covered by tests/internal_ca_e2e.rs; this is
-# about the package.
+# exists after dpkg ran: the user, the data directory, the default config the
+# postinst writes, the man page, the service the default describes, an upgrade
+# that leaves /etc alone, and a purge that keeps the CA.
+#
+# Runtime behaviour of the proxy is covered by tests/internal_ca_e2e.rs; this
+# script is about the package.
 #
 #   packaging/test-deb.sh [image]
 set -eu
@@ -28,80 +30,78 @@ apt-get install -y -qq --no-install-recommends /debs/uping_*.deb
 echo "--- control fields"
 dpkg-query -W -f='${Package} ${Version} ${Architecture} ${Priority} ${Section}\n' uping
 
-# Ubuntu's default dpkg config excludes /usr/share/doc, keeping only the
-# copyright file, so a functional asset must not live there. The example is in
-# /usr/share/uping for that reason; the docs are checked in the archive itself.
-echo "--- the archive carries the documentation"
-dpkg-deb -c /debs/uping_*.deb > /tmp/uping-files
-grep -q 'usr/share/doc/uping/README.Debian' /tmp/uping-files
-grep -q 'usr/share/doc/uping/README.md' /tmp/uping-files
+echo "--- the postinst created the user, the group, the data dir and a config"
+id uping
+getent group uping >/dev/null
+test -f /etc/uping/config.toml
+[ "$(stat -c '%U:%G %a' /etc/uping/config.toml)" = "root:uping 640" ]
+[ "$(stat -c '%U:%G %a' /var/lib/uping)" = "uping:uping 750" ]
 
-echo "--- files, modes and ownership"
+echo "--- standard paths: binary, unit, tmpfiles, man, example, page, docs"
+dpkg-deb -c /debs/uping_*.deb > /tmp/uping-files
+for f in \
+    usr/bin/uping \
+    usr/lib/systemd/system/uping.service \
+    usr/lib/tmpfiles.d/uping.conf \
+    usr/share/man/man8/uping.8 \
+    usr/share/uping/config.toml.default \
+    usr/share/uping/config.toml.example \
+    usr/share/uping/www/index.html \
+    usr/share/doc/uping/README.Debian \
+    usr/share/doc/uping/README.md; do
+    grep -q "$f" /tmp/uping-files || {
+        echo "missing from the archive: $f" >&2
+        exit 1
+    }
+done
 test -x /usr/bin/uping
 test -f /usr/lib/systemd/system/uping.service
 test -f /usr/lib/tmpfiles.d/uping.conf
-test -f /usr/share/uping/config.toml.example
+test -f /usr/share/uping/config.toml.default
+test -f /usr/share/uping/www/index.html
 test -f /usr/share/doc/uping/copyright
-runuser -u uping -- test -r /usr/bin/uping
-stat -c '%a %U:%G %n' /var/lib/uping
 
-echo "--- the packaged example is a valid config, and --check writes nothing"
-runuser -u uping -- /usr/bin/uping --check /usr/share/uping/config.toml.example
-test ! -e /var/lib/uping/internal
+echo "--- the default config is valid and --check writes nothing"
+runuser -u uping -- /usr/bin/uping --check /etc/uping/config.toml
+[ ! -e /var/lib/uping/internal ]
 
-echo "--- the service user can write its state directory"
-runuser -u uping -- sh -c 'touch /var/lib/uping/.probe && rm /var/lib/uping/.probe'
-
-echo "--- the packaged binary creates its local CA as the service user"
-cat > /tmp/pkg.toml <<'CONFIG'
-[listen]
-ipv4  = "127.0.0.1"
-http  = 18080
-https = 18443
-[internal]
-ca_dir   = "/var/lib/uping/internal/ca"
-cert_dir = "/var/lib/uping/internal"
-[[server]]
-domain       = "app.internal"
-keys         = "internal"
-serve_http   = false
-https_listen = "127.0.0.1:18443"
-upstream     = "127.0.0.1:9"
-CONFIG
-chown uping:uping /tmp/pkg.toml
-runuser -u uping -- /usr/bin/uping /tmp/pkg.toml >/tmp/pkg.log 2>&1 &
+echo "--- the packaged binary serves the default page as uping"
+apt-get install -y -qq --no-install-recommends curl >/dev/null
+runuser -u uping -- /usr/bin/uping /etc/uping/config.toml >/tmp/uping.log 2>&1 &
 pkg_pid=$!
 i=0
-while [ "$i" -lt 100 ]; do
-    [ -f /var/lib/uping/internal/ca/root.crt ] && break
+page=
+while [ "$i" -lt 150 ]; do
+    if [ -f /var/lib/uping/internal/ca/root.crt ] &&
+       page=$(curl -fsS --resolve localhost:8443:127.0.0.1 \
+                  --cacert /var/lib/uping/internal/ca/root.crt \
+                  https://localhost:8443/ 2>/dev/null); then
+        break
+    fi
     i=$((i + 1))
     sleep 0.1
 done
-test -f /var/lib/uping/internal/ca/root.crt
-test -f /var/lib/uping/internal/ca/root.key
-test -f /var/lib/uping/internal/app.internal/fullchain.pem
-stat -c '%a %U:%G %n' /var/lib/uping/internal/ca/root.key
+printf '%s' "$page" | grep -q 'uping is running'
+[ "$(stat -c '%U:%G %a' /var/lib/uping/internal/ca/root.key)" = "uping:uping 600" ]
 kill "$pkg_pid" 2>/dev/null || true
-pkill -f '/usr/bin/uping /tmp/pkg.toml' 2>/dev/null || true
-rm -f /tmp/pkg.toml /tmp/pkg.log
+pkill -f '/usr/bin/uping /etc/uping/config.toml' 2>/dev/null || true
 
-echo "--- an upgrade never touches an existing /etc/uping/config.toml"
-install -d -m 0750 /etc/uping
+echo "--- an upgrade keeps an existing configuration byte for byte"
 printf '# admin configuration\n' > /etc/uping/config.toml
 chown root:uping /etc/uping/config.toml
 chmod 0640 /etc/uping/config.toml
 before=$(sha256sum /etc/uping/config.toml)
 dpkg -i /debs/uping_*.deb >/dev/null
 after=$(sha256sum /etc/uping/config.toml)
-[ "$before" = "$after" ] || { echo "config was modified by the upgrade" >&2; exit 1; }
+[ "$before" = "$after" ] || { echo "the upgrade replaced the configuration" >&2; exit 1; }
 
 echo "--- purge keeps the configuration and the CA on purpose"
 dpkg -P uping >/dev/null
 test -f /etc/uping/config.toml
-test -d /var/lib/uping
+test -d /var/lib/uping/internal/ca
 ! dpkg-query -W uping >/dev/null 2>&1
 
-echo "ok: package installs, upgrades and purges as documented"
+echo "ok: dpkg -i installs everything; upgrade and purge behave as documented"
 INSIDE
 
 echo "tested $(basename "$DEB") in $IMAGE" >&2
