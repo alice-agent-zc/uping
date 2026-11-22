@@ -101,6 +101,40 @@ in place.
 `./target/release/uping --dns-zone config.toml` prints hosts records for a VPN
 resolver.
 
+## Debian package
+
+The repository also builds a `.deb`: the binary in `/usr/bin/uping`, a system
+unit carrying `AmbientCapabilities=CAP_NET_BIND_SERVICE` (so there is no
+`setcap` to re-apply), a system user `uping` and `/var/lib/uping` for keys and
+leaves. It ships **no** `/etc/uping/config.toml`, so installing or upgrading
+the package never touches an existing configuration.
+
+```sh
+packaging/build-deb.sh                 # compiles in ubuntu:24.04, then cargo-deb
+sudo dpkg -i target/debian/uping_*.deb
+```
+
+The container is what makes the package portable: the binary needs the target's
+glibc, so one built on a newer host would not run. The default image is the one
+the release workflow uses; `packaging/build-deb.sh debian:12` builds against an
+older baseline.
+
+Then create the configuration and start:
+
+```sh
+sudo install -d -o root -g uping -m 0750 /etc/uping
+sudo install -o root -g uping -m 0640 \
+    /usr/share/uping/config.toml.example /etc/uping/config.toml
+sudo -u uping /usr/bin/uping --check /etc/uping/config.toml
+sudo systemctl enable --now uping
+```
+
+`/etc/uping/config.toml` is yours: it is not a conffile, so there is no prompt
+and nothing to overwrite. `/var/lib/uping` holds the local CA and the leaves;
+`apt purge` keeps that directory on purpose, because deleting the CA would
+silently untrust every client. The package is an alternative to the `~/uping`
+checkout install above, not a replacement for it.
+
 ## Paths
 
 Every path in the file is resolved from the directory that holds `config.toml`.

@@ -13,3 +13,6 @@ cert/
 # it to `config.toml` and edit the copy. Ignoring the local file keeps a `git
 # pull` from conflicting with the running deployment.
 config.toml
+
+# Debian packages built by packaging/build-deb.sh.
+*.deb

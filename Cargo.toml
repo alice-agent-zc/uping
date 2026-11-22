@@ -38,3 +38,26 @@ signal-hook = "0.3"
 # Listening-socket probe before pingora binds: same SO_REUSEADDR as its own
 # listener, so "this address does not exist yet" is caught before a panic.
 socket2 = "0.6"
+
+# Debian package metadata. The packaging files (unit, tmpfiles, maintainer
+# scripts, example config) live under `packaging/`; `packaging/build-deb.sh`
+# builds in a container so the binary targets the release's glibc, not the
+# builder's.
+[package.metadata.deb]
+maintainer = "tetuaoro <65575727+tetuaoro@users.noreply.github.com>"
+copyright = "2026, tetuaoro"
+license-file = ["LICENSE", "4"]
+extended-description = "uping terminates TLS with SNI for one or more domains and forwards each to a local backend: static files, path routing, per-IP request and connection limits, upstream health checks and raw TCP forwarding. Certificates come from public ACME, from manual files, or from uping's own local CA, which needs no ACME server. This package installs the system deployment: /usr/bin/uping, a systemd unit carrying CAP_NET_BIND_SERVICE, and /var/lib/uping for keys and leaves. It ships no /etc/uping/config.toml, so an existing configuration is never touched; see README.Debian for the first start."
+depends = "$auto"
+recommends = "systemd"
+section = "net"
+priority = "optional"
+maintainer-scripts = "packaging/debian"
+assets = [
+    ["target/release/uping", "usr/bin/", "755"],
+    ["packaging/uping.service", "usr/lib/systemd/system/", "644"],
+    ["packaging/uping.tmpfiles.conf", "usr/lib/tmpfiles.d/uping.conf", "644"],
+    ["packaging/config.toml.example", "usr/share/uping/config.toml.example", "644"],
+    ["packaging/README.Debian", "usr/share/doc/uping/README.Debian", "644"],
+    ["README.md", "usr/share/doc/uping/README.md", "644"],
+]

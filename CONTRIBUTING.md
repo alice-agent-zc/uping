@@ -250,6 +250,65 @@ and `cert/` beside it. The binary carries `CAP_NET_BIND_SERVICE` via `setcap`,
 so the process stays an ordinary user. `uping.service` is the user unit; it can
 order itself after `rupa.service` when both run in the same user manager.
 
+## Debian package
+
+`cargo deb` reads `[package.metadata.deb]` from `Cargo.toml`. The files it
+installs live in `packaging/`:
+
+```
+packaging/uping.service        system unit: User=uping, ambient bind capability
+packaging/uping.tmpfiles.conf  creates /var/lib/uping, owner uping, mode 0750
+packaging/config.toml.example  system example; absolute paths under /var/lib
+packaging/README.Debian        first-start, paths, upgrade and purge notes
+packaging/debian/postinst      creates the user, the data dir, daemon-reload
+packaging/debian/prerm         stops the unit on remove
+packaging/debian/postrm        disables the unit; keeps /etc and /var/lib
+packaging/build-deb.sh         compiles in a container, then runs cargo-deb
+packaging/test-deb.sh          installs the result in the target image
+```
+
+Two rules shape it:
+
+* **No configuration is shipped.** `/etc/uping/config.toml` is the admin's file;
+  a package that shipped one would either overwrite an existing configuration on
+  first install or force a conffile prompt nobody asked for. The postinst only
+  prints the copy command when the file is absent.
+* **No `setcap`.** The unit carries `AmbientCapabilities=CAP_NET_BIND_SERVICE`
+  and a bounding set with nothing else, so the capability survives binary
+  upgrades — unlike an xattr on the file, which a rebuild silently drops.
+* **The example config is not in `/usr/share/doc`.** Ubuntu and Debian ship a
+  dpkg path exclude that keeps only `copyright` under that tree
+  (`/etc/dpkg/dpkg.cfg.d/excludes`), so a first-start template there would
+  simply not exist on a minimal image. It lives in
+  `/usr/share/uping/config.toml.example`, and `packaging/test-deb.sh` proves it
+  is installed and valid with `--check`.
+
+The `.deb` must be built where the target glibc lives, which is why
+`packaging/build-deb.sh` compiles inside `ubuntu:24.04` (the release runner's
+image) and runs `cargo deb --no-build` on the host afterwards:
+
+```sh
+packaging/build-deb.sh
+dpkg-deb -c target/debian/uping_*.deb      # file list and modes
+dpkg-deb -I target/debian/uping_*.deb      # control fields
+```
+
+Test the package in the same image, not on the build host:
+
+```sh
+packaging/build-deb.sh
+packaging/test-deb.sh
+```
+
+`test-deb.sh` installs the `.deb`, checks the user, the data directory, the
+unit, the docs and the packaged example with `--check`, proves that reinstalling
+over an existing `/etc/uping/config.toml` leaves its checksum unchanged, and
+that a purge keeps `/etc/uping` and `/var/lib/uping`.
+
+For a wider baseline, `packaging/build-deb.sh debian:12` builds against glibc
+2.36; the release workflow uses `ubuntu:24.04` for both the tarball and the
+package so the two assets agree.
+
 ## Release
 
 Publishing is tag-driven. A tag names the exact commit that becomes the

@@ -1,0 +1,15 @@
+#!/bin/sh
+set -e
+
+if [ "$1" = remove ] || [ "$1" = purge ]; then
+    if [ -d /run/systemd/system ]; then
+        systemctl --no-reload disable uping.service >/dev/null 2>&1 || true
+        systemctl daemon-reload >/dev/null 2>&1 || true
+    fi
+fi
+
+# /etc/uping (admin configuration) and /var/lib/uping (local CA and leaves) are
+# kept on purge: deleting the CA would silently untrust every client. See
+# /usr/share/doc/uping/README.Debian if you really want them gone.
+
+exit 0

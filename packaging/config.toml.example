@@ -1,0 +1,40 @@
+# uping — system deployment example for /etc/uping/config.toml
+#
+# Copy it, then edit:
+#   sudo install -d -o root -g uping -m 0750 /etc/uping
+#   sudo install -o root -g uping -m 0640 config.toml.example /etc/uping/config.toml
+#   sudo -u uping /usr/bin/uping --check /etc/uping/config.toml
+#
+# Every relative path resolves against the directory holding this file
+# (/etc/uping), but /etc is not writable by the service user, so everything
+# that uping writes uses an absolute path under /var/lib/uping.
+
+[listen]
+ipv4  = "0.0.0.0"
+http  = 80
+https = 443
+
+# Public names, via ACME.
+# [acme]
+# email             = "ops@example.com"
+# cert_dir          = "/var/lib/uping/cert"
+# renew_before_days = 30
+
+# Private names, signed by uping itself. No ACME server, no step-ca.
+# [internal]
+# ca_dir   = "/var/lib/uping/internal/ca"    # root.crt + root.key
+# cert_dir = "/var/lib/uping/internal"
+# serve_root = "10.8.0.1:9000"               # plain HTTP: GET /root.crt
+# key_type = "ed25519"
+
+[[server]]
+domain   = "www.example.com"
+upstream = "127.0.0.1:8080"
+
+# [[server]]
+# domain       = "app.vpn.example.com"
+# keys         = "internal"
+# alt_names    = ["vpn.example.com"]
+# upstream     = "127.0.0.1:8080"
+# https_listen = "10.8.0.1"
+# serve_http   = false

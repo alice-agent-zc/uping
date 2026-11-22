@@ -1,0 +1,60 @@
+# uping — Debian/Ubuntu package notes
+#
+# This package installs a system deployment: one binary in /usr/bin, a systemd
+# unit, and a writable data directory under /var/lib. The `~/uping` checkout
+# documented in the README keeps working and is unaffected; use one or the
+# other for a given port.
+
+## First start
+
+The package deliberately ships **no** `/etc/uping/config.toml`: an existing
+configuration is never overwritten, and there is no useful default to guess.
+Create it from the packaged example:
+
+    sudo install -d -o root -g uping -m 0750 /etc/uping
+    sudo install -o root -g uping -m 0640 \
+        /usr/share/uping/config.toml.example /etc/uping/config.toml
+    sudo editor /etc/uping/config.toml
+
+Then validate it and start the service:
+
+    sudo -u uping /usr/bin/uping --check /etc/uping/config.toml
+    sudo systemctl enable --now uping
+
+`serve_http`/`https_listen` failures (for example a VPN address that is not up
+yet) do not stop the process; check `journalctl -u uping` for warnings.
+
+## Paths
+
+    /usr/bin/uping                                  the binary
+    /usr/lib/systemd/system/uping.service           the system unit
+    /usr/lib/tmpfiles.d/uping.conf                  creates /var/lib/uping
+    /etc/uping/config.toml                          yours; the package never ships it
+    /usr/share/uping/config.toml.example            template for /etc/uping/config.toml
+    /var/lib/uping/                                 writable state, owner uping
+
+The packaged example puts the local CA and the generated leaves under
+`/var/lib/uping` because `/etc` is not writable by the service user:
+
+    [internal]
+    ca_dir   = "/var/lib/uping/internal/ca"
+    cert_dir = "/var/lib/uping/internal"
+
+An ACME deployment can keep `cert_dir = "/var/lib/uping/cert"` instead.
+
+## Capability
+
+The unit carries `AmbientCapabilities=CAP_NET_BIND_SERVICE` and an empty
+capability bounding set apart from it. That is why there is no `setcap` step in
+this package: upgrading the binary does not need one.
+
+## Upgrades and removal
+
+* `/etc/uping/config.toml` is not part of the package, so an upgrade never
+  touches it.
+* `/var/lib/uping` holds the local CA (`root.key`) and the leaves. `apt purge`
+  leaves it in place on purpose: deleting the CA would silently untrust every
+  client that installed its root. Remove the directory by hand if you really
+  mean to.
+* A removed package stops the service; the unit is not re-enabled on a later
+  install unless you enable it again.

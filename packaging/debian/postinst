@@ -1,0 +1,59 @@
+#!/bin/sh
+set -e
+
+# The unit runs as this unprivileged user. It owns /var/lib/uping, where the
+# local CA and the generated leaves are written.
+#
+# `adduser` is a Debian convenience, not a base package (minimal containers do
+# not have it), so fall back to shadow's `useradd`/`groupadd` and declare no
+# extra dependency for what is two syscalls' worth of work.
+if ! getent group uping >/dev/null 2>&1; then
+    if command -v addgroup >/dev/null 2>&1; then
+        addgroup --system uping >/dev/null
+    else
+        groupadd --system uping
+    fi
+fi
+if ! getent passwd uping >/dev/null 2>&1; then
+    if command -v adduser >/dev/null 2>&1; then
+        adduser --system --ingroup uping --home /var/lib/uping --no-create-home \
+            --shell /usr/sbin/nologin --disabled-login \
+            --gecos "uping reverse proxy" uping >/dev/null
+    else
+        useradd --system --gid uping --home-dir /var/lib/uping \
+            --shell /usr/sbin/nologin --no-create-home \
+            --comment "uping reverse proxy" uping
+    fi
+fi
+
+if command -v systemd-tmpfiles >/dev/null 2>&1; then
+    systemd-tmpfiles --create /usr/lib/tmpfiles.d/uping.conf >/dev/null 2>&1 || true
+else
+    install -d -o uping -g uping -m 0750 /var/lib/uping
+fi
+
+# The package never ships /etc/uping/config.toml, precisely so an existing
+# configuration is never overwritten. Say once what the first step is.
+if [ ! -e /etc/uping/config.toml ]; then
+    cat >&2 <<'MESSAGE'
+uping: /etc/uping/config.toml does not exist yet; the service will not start.
+  sudo install -d -o root -g uping -m 0750 /etc/uping
+  sudo install -o root -g uping -m 0640 \
+      /usr/share/uping/config.toml.example /etc/uping/config.toml
+  sudo editor /etc/uping/config.toml
+  sudo -u uping /usr/bin/uping --check /etc/uping/config.toml
+  sudo systemctl enable --now uping
+MESSAGE
+fi
+
+if [ -d /run/systemd/system ]; then
+    systemctl daemon-reload >/dev/null 2>&1 || true
+    # A package upgrade replaces the binary; restart only if it was running, and
+    # leave a service the admin disabled alone.
+    if systemctl is-enabled uping.service >/dev/null 2>&1; then
+        systemctl try-restart uping.service >/dev/null 2>&1 || true
+    fi
+fi
+
+# dh_installdeb convention.
+exit 0
