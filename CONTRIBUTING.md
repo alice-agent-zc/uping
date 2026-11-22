@@ -13,7 +13,11 @@ uping is a single Rust binary. Building it needs:
 - **CMake.** The HTTP stack pins `flate2` to the `zlib-ng` backend, and
   `libz-ng-sys` builds that backend with CMake. Without `cmake` on `PATH` the
   build stops several crates deep, with an error that never mentions CMake.
-- OpenSSL development headers (`libssl-dev` on Debian/Ubuntu).
+- **Perl.** `pingora-openssl` enables `openssl/vendored`, so `openssl-sys`
+  compiles OpenSSL from its C sources during the build (Perl's `Configure`
+  plus the C toolchain). System `libssl-dev` headers are not needed, and the
+  resulting binary links libcrypto statically: `ldd` on the Linux build shows
+  only libc, libm and libgcc.
 
 TLS is on the **OpenSSL** backend deliberately: dynamic per-SNI certificate
 selection — one listener, many domains — only exists for OpenSSL/BoringSSL in
@@ -181,6 +185,17 @@ SAN list), and renews it before expiry on the same hourly loop as ACME. Files ar
 written atomically (`.<name>.tmp-<pid>` then rename) with `0644` for the chain and
 `0600` for the key. A missing half of the root pair is refused rather than
 regenerated: a new root would strand every client that installed the old one.
+
+Generation is in-process through the `openssl` crate — the same libcrypto the
+proxy already uses for TLS. No shell command, no `step-ca`, no `certbot`, no
+ACME client. `PKey::generate_ed25519` is the default; `EcKey::generate` covers
+P-256 and `Rsa::generate` RSA-2048. An `X509Builder` sets CN/O, the SAN list,
+critical Basic Constraints (CA for the root, end-entity for the leaf), Key Usage
+and the `serverAuth` EKU. Ed25519 is signed with `MessageDigest::null()` —
+OpenSSL signs the message itself and rejects a digest there — while P-256 and
+RSA use SHA-256. `rcgen` was not pulled in: it would be a second X.509
+implementation for no gain, and OpenSSL is already linked and already required
+by pingora's dynamic SNI callbacks.
 `serve_root` publishes `root.crt` on a plain-HTTP socket; binding it is
 best-effort, because the VPN address may arrive after uping starts.
 

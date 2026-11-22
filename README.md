@@ -276,6 +276,23 @@ skips those domains, rather than minting a root every client would reject
 (remove both files to deliberately create a new CA). `alt_names = [...]` on a
 server adds SANs to the same leaf.
 
+#### How the certificates are made
+
+No external tool, no daemon, no package to install. uping calls the **OpenSSL
+library it already links for TLS**, through the `openssl` Rust crate: the same
+process generates the key pair (`PKey::generate_ed25519`, or EC/RSA according to
+`key_type`), builds the X.509 structures (subject, SANs, basic constraints, key
+usage, `serverAuth` EKU), signs them and writes the PEM files. Nothing is
+shelled out — there is no call to the `openssl` command, to `step`, to `certbot`
+or to any CA.
+
+The released binary carries OpenSSL statically: `pingora-openssl` enables
+`openssl/vendored`, so libcrypto is compiled into the executable (the Linux
+build reports OpenSSL 3.6.3 and `ldd` shows no `libssl`). Installing uping is
+still one binary and one config file; building it needs a C toolchain, CMake
+and Perl for that vendored OpenSSL build, but no system `libssl-dev` and no
+step-ca.
+
 On each client, once:
 
 ```sh
