@@ -37,6 +37,25 @@ ACME, private local-CA and static shapes. Every relative path in the file is
 resolved against `/etc/uping`, which the service user cannot write, so anything
 uping generates belongs under `/var/lib/uping`.
 
+The local CA signs one zone, `[internal] domain`, and nothing outside it:
+
+    [internal]
+    domain     = "internal.rao-nagos.pf"       # the only zone it signs
+    ca_dir     = "/var/lib/uping/internal/ca"
+    cert_dir   = "/var/lib/uping/internal"
+    serve_root = "https://internal.rao-nagos.pf:9000"
+
+`serve_root` serves `root.crt` over TLS at that URL, with a certificate from the
+same CA — so the first fetch needs `curl -k`, and the file it downloads is what
+makes the URL verify from then on:
+
+    sudo curl -k https://internal.rao-nagos.pf:9000/root.crt \
+        -o /usr/local/share/ca-certificates/uping-internal.crt
+    sudo update-ca-certificates
+
+A `keys = "internal"` name outside the zone is refused when the configuration
+loads.
+
 Listening on `:80`/`:443` needs no extra step: the unit carries
 `AmbientCapabilities=CAP_NET_BIND_SERVICE`, with a capability bounding set that
 holds nothing else. There is no `setcap` to re-apply after an upgrade.
@@ -46,7 +65,7 @@ holds nothing else. There is no `setcap` to re-apply after an upgrade.
     /usr/bin/uping                                  the binary
     /usr/lib/systemd/system/uping.service           the system unit
     /usr/lib/tmpfiles.d/uping.conf                  creates /var/lib/uping
-    /usr/share/man/man8/uping.8.gz                     man uping
+    /usr/share/man/man8/uping.8.gz                  man uping
     /usr/share/uping/config.toml.default            the installed default
     /usr/share/uping/config.toml.example            commented template
     /usr/share/uping/www/                           the default landing page

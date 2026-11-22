@@ -2,10 +2,19 @@
 //!
 //! There is no ACME server here: the first start with an `[internal]` table
 //! generates a root pair under `ca_dir`, and every `keys = "internal"` server
-//! gets a leaf signed by it on first start and renewed before it expires. The
-//! root is the only thing a client has to install, exactly as it would have
-//! installed a private ACME CA's root — minus that CA's daemon, its DNS and its
-//! port 80.
+//! under `[internal] domain` gets a leaf signed by it on first start and
+//! renewed before it expires. The root is the only thing a client installs,
+//! exactly as it would have installed a private ACME CA's root — minus that
+//! CA's daemon, its DNS and its port 80.
+//!
+//! The CA signs one zone and nothing else: `domain = "internal.example.com"`
+//! issues `internal.example.com` and `*.internal.example.com`. A name outside
+//! it is a config error, and issuance refuses it again at the last moment.
+//!
+//! `serve_root` publishes `root.crt` over TLS at a URL inside that zone
+//! (`https://internal.example.com:9000`), so the endpoint presents a
+//! certificate from the CA whose root it serves: `curl -k` once, install the
+//! file, and the same URL verifies from then on.
 //!
 //! Files follow the ACME layout so an operator has one mental model:
 //!
@@ -16,14 +25,15 @@
 //! <cert_dir>/<domain>/privkey.pem     0600
 //! ```
 //!
-//! Everything is best-effort at runtime: a domain whose leaf cannot be written
-//! is logged and skipped, and the other domains keep serving. A missing root is
-//! never regenerated silently — that would break every client that installed
-//! the old one, so the operator is told to restore or remove both files.
+//! Everything here is best-effort at runtime: a domain whose leaf cannot be
+//! written, or a `serve_root` host that does not resolve yet, is logged and
+//! skipped, and the other domains keep serving. A missing root is never
+//! regenerated silently — that would break every client that installed the old
+//! one, so the operator is told to restore or remove both files.
 
 use std::fs;
 use std::io::{Read, Write};
-use std::net::SocketAddr;
+use std::net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -38,13 +48,14 @@ use openssl::hash::MessageDigest;
 use openssl::nid::Nid;
 use openssl::pkey::{PKey, Private};
 use openssl::rsa::Rsa;
+use openssl::ssl::{SslAcceptor, SslMethod};
 use openssl::x509::extension::{
     BasicConstraints, ExtendedKeyUsage, KeyUsage, SubjectAlternativeName,
 };
 use openssl::x509::{X509NameBuilder, X509};
 
 use crate::acme::cert_is_due;
-use crate::config::{Config, Internal, KeyKind, Server};
+use crate::config::{in_zone, parse_serve_root, Config, Internal, KeyKind, ServeRoot, Server};
 use crate::tls::SniResolver;
 
 /// The local CA: its settings, its two paths, and the live resolver it feeds.
@@ -54,6 +65,9 @@ pub struct LocalCa {
     ca_cert: PathBuf,
     ca_key: PathBuf,
     cert_dir: PathBuf,
+    /// The zone this CA signs, lowercased.
+    zone: String,
+    serve_root: Option<ServeRoot>,
     resolver: SniResolver,
     /// One issuance at a time: a renewal and a reload can both find the same
     /// leaf due, and two writers must not interleave a pair on disk.
@@ -63,11 +77,23 @@ pub struct LocalCa {
 impl LocalCa {
     pub fn new(cfg: &Config, resolver: SniResolver) -> Self {
         let (ca_cert, ca_key) = cfg.ca_paths();
+        let serve_root = if cfg.internal.serve_root.trim().is_empty() {
+            None
+        } else {
+            parse_serve_root(&cfg.internal.serve_root).ok()
+        };
         Self {
             cfg: cfg.internal.clone(),
             ca_cert,
             ca_key,
             cert_dir: cfg.internal_cert_dir(),
+            zone: cfg
+                .internal
+                .domain
+                .trim()
+                .trim_end_matches('.')
+                .to_ascii_lowercase(),
+            serve_root,
             resolver,
             lock: Arc::new(Mutex::new(())),
         }
@@ -75,9 +101,13 @@ impl LocalCa {
 
     /// `(fullchain.pem, privkey.pem)` for one domain.
     pub fn leaf_paths(&self, server: &Server) -> (PathBuf, PathBuf) {
+        self.leaf_paths_for(&server.domain)
+    }
+
+    fn leaf_paths_for(&self, domain: &str) -> (PathBuf, PathBuf) {
         let dir = self
             .cert_dir
-            .join(server.domain.trim().to_ascii_lowercase());
+            .join(domain.trim().trim_end_matches('.').to_ascii_lowercase());
         (dir.join("fullchain.pem"), dir.join("privkey.pem"))
     }
 
@@ -94,23 +124,41 @@ impl LocalCa {
     /// due for renewal, or does not carry the SANs the config now asks for.
     /// Otherwise it only reads the files and installs them in the resolver.
     pub fn ensure(&self, server: &Server) -> Result<()> {
+        self.ensure_named(&server.domain, &server.alt_names)
+    }
+
+    /// The same for a name that is not a `[[server]]` — `serve_root` uses it
+    /// for the endpoint that publishes the root itself.
+    pub fn ensure_named(&self, domain: &str, alt_names: &[String]) -> Result<()> {
+        let domain = domain.trim().trim_end_matches('.').to_ascii_lowercase();
+        if !in_zone(&domain, &self.zone) {
+            anyhow::bail!(
+                "`{domain}` is outside `[internal] domain` `{}`; this CA signs only that \\
+                 zone and its subdomains",
+                self.zone
+            );
+        }
+        for alt in alt_names {
+            if !in_zone(alt, &self.zone) {
+                anyhow::bail!("`{alt}` is outside `[internal] domain` `{}`", self.zone);
+            }
+        }
+
         let _guard = self.lock.lock().unwrap_or_else(|e| e.into_inner());
         let (root, root_key) = self.ensure_root()?;
-        let (cert_path, key_path) = self.leaf_paths(server);
+        let (cert_path, key_path) = self.leaf_paths_for(&domain);
 
         if cert_path.is_file() && key_path.is_file() {
             let pem = fs::read(&cert_path)
                 .with_context(|| format!("reading `{}`", cert_path.display()))?;
-            match self.pair_is_current(&pem, &root, server) {
+            match self.pair_is_current(&pem, &root, &domain, alt_names) {
                 Ok(true) => {
-                    self.resolver
-                        .load_files(server.domain.trim(), &cert_path, &key_path)?;
+                    self.resolver.load_files(&domain, &cert_path, &key_path)?;
                     return Ok(());
                 }
-                Ok(false) => info!(
-                    "internal CA: reissuing `{}` (expired, other root, or new SANs)",
-                    server.domain.trim()
-                ),
+                Ok(false) => {
+                    info!("internal CA: reissuing `{domain}` (expired, other root, or new SANs)")
+                }
                 Err(e) => warn!(
                     "internal CA: `{}` is not usable ({e:#}); reissuing",
                     cert_path.display()
@@ -118,7 +166,7 @@ impl LocalCa {
             }
         }
 
-        let (leaf, key) = new_leaf(&self.cfg, &root, &root_key, server)?;
+        let (leaf, key) = new_leaf(&self.cfg, &root, &root_key, &domain, alt_names)?;
         let mut fullchain = leaf.to_pem().context("encoding the leaf")?;
         fullchain.extend_from_slice(&root.to_pem().context("encoding the root")?);
 
@@ -129,12 +177,10 @@ impl LocalCa {
                 .context("encoding the leaf key")?,
             0o600,
         )?;
-        self.resolver
-            .load_files(server.domain.trim(), &cert_path, &key_path)?;
+        self.resolver.load_files(&domain, &cert_path, &key_path)?;
         info!(
-            "internal CA: issued `{}` (SANs: {})",
-            server.domain.trim(),
-            sans(server).join(", ")
+            "internal CA: issued `{domain}` (SANs: {})",
+            sans(&domain, alt_names).join(", ")
         );
         Ok(())
     }
@@ -212,19 +258,26 @@ impl LocalCa {
                     0o600,
                 )?;
                 info!(
-                    "internal CA: created `{}` ({:?} root, {} days); install it on the \
-                     clients that must trust these names",
+                    "internal CA: created `{}` ({:?} root, {} days) for zone `{}`; \
+                     install it on the clients that must trust these names",
                     self.ca_cert.display(),
                     self.cfg.key_type,
-                    self.cfg.ca_days
+                    self.cfg.ca_days,
+                    self.zone
                 );
                 Ok((root, key))
             }
         }
     }
 
-    /// Is the pair on disk still exactly what this server needs?
-    fn pair_is_current(&self, pem: &[u8], root: &X509, server: &Server) -> Result<bool> {
+    /// Is the pair on disk still exactly what this name needs?
+    fn pair_is_current(
+        &self,
+        pem: &[u8],
+        root: &X509,
+        domain: &str,
+        alt_names: &[String],
+    ) -> Result<bool> {
         if cert_is_due(pem, self.cfg.renew_before_days)? {
             return Ok(false);
         }
@@ -236,7 +289,7 @@ impl LocalCa {
         {
             return Ok(false);
         }
-        let sanctioned: Vec<String> = sans(server)
+        let sanctioned: Vec<String> = sans(domain, alt_names)
             .iter()
             .map(|s| s.to_ascii_lowercase())
             .collect();
@@ -252,35 +305,79 @@ impl LocalCa {
         Ok(actual == sanctioned)
     }
 
-    /// Publish `root.crt` over plain HTTP when `serve_root` names an address.
+    /// Publish `root.crt` over TLS when `serve_root` names a URL.
     ///
-    /// Best-effort by design: the VPN address may not exist before the tunnel
-    /// is up, and that must not stop the rest of uping. The caller logs the
-    /// error and carries on.
+    /// Best-effort by design: the host may not resolve before the VPN is up,
+    /// and that must not stop the rest of uping. The caller logs the error and
+    /// carries on.
     pub fn spawn_root_server(&self) -> Result<()> {
-        let raw = self.cfg.serve_root.trim();
-        if raw.is_empty() {
+        let Some(root) = &self.serve_root else {
             return Ok(());
+        };
+        if !in_zone(&root.host, &self.zone) {
+            anyhow::bail!(
+                "`[internal] serve_root` host `{}` is outside `[internal] domain` `{}`",
+                root.host,
+                self.zone
+            );
         }
-        let addr: SocketAddr = raw
-            .parse()
-            .with_context(|| format!("`[internal] serve_root` `{raw}` is not an `IP:port`"))?;
-        let listener = std::net::TcpListener::bind(addr)
-            .with_context(|| format!("binding `[internal] serve_root` {addr}"))?;
-        let local = listener.local_addr().unwrap_or(addr);
-        let cert_path = self.ca_cert.clone();
+
+        // The endpoint gets a leaf from this CA for its own name.
+        self.ensure_named(&root.host, &[])?;
+        let (cert_path, key_path) = self.leaf_paths_for(&root.host);
+        let cert_pem =
+            fs::read(&cert_path).with_context(|| format!("reading `{}`", cert_path.display()))?;
+        let key_pem =
+            fs::read(&key_path).with_context(|| format!("reading `{}`", key_path.display()))?;
+        let acceptor = tls_acceptor(&cert_pem, &key_pem)
+            .with_context(|| format!("building the TLS context for {}", root.url()))?;
+
+        // Resolve the name the URL points at: that is the VPN address, not a
+        // wildcard. IPv4 first, so a dual-stack localhost does not pick ::1 by
+        // accident.
+        let mut addrs: Vec<SocketAddr> = (root.host.as_str(), root.port)
+            .to_socket_addrs()
+            .with_context(|| format!("resolving `{}`", root.host))?
+            .collect();
+        addrs.sort_by_key(|a| a.is_ipv6());
+        if addrs.is_empty() {
+            anyhow::bail!("`{}` resolved to no address", root.host);
+        }
+        let mut last = None;
+        let mut listener = None;
+        for addr in &addrs {
+            match TcpListener::bind(addr) {
+                Ok(bound) => {
+                    listener = Some(bound);
+                    break;
+                }
+                Err(e) => last = Some((*addr, e)),
+            }
+        }
+        let listener = match (listener, last) {
+            (Some(listener), _) => listener,
+            (None, Some((addr, e))) => {
+                anyhow::bail!("binding {addr} for `[internal] serve_root`: {e}")
+            }
+            (None, None) => anyhow::bail!("no address to bind for `[internal] serve_root`"),
+        };
+        let local = listener.local_addr().unwrap_or(addrs[0]);
+        let url = root.url();
+        // The TLS certificate is the endpoint's leaf; the file this serves is
+        // the CA root itself.
+        let cert_for_thread = self.ca_cert.clone();
+
         std::thread::Builder::new()
-            .name("uping-root-http".into())
+            .name("uping-root-tls".into())
             .spawn(move || {
                 info!(
-                    "internal CA: root published on http://{local}/root.crt \
-                     (from `{}`)",
-                    cert_path.display()
+                    "internal CA: root published on {url}/root.crt (bound {local}); \
+                     first fetch needs `curl -k`"
                 );
                 for stream in listener.incoming() {
                     match stream {
                         Ok(stream) => {
-                            if let Err(e) = serve_root_request(stream, &cert_path) {
+                            if let Err(e) = serve_tls_request(&acceptor, stream, &cert_for_thread) {
                                 warn!("internal CA: root request failed: {e}");
                             }
                         }
@@ -293,11 +390,11 @@ impl LocalCa {
     }
 }
 
-/// The DNS names a leaf must carry, in config order, `domain` first.
-fn sans(server: &Server) -> Vec<String> {
-    let domain = server.domain.trim().to_string();
-    let mut out = vec![domain.clone()];
-    for name in &server.alt_names {
+/// The DNS names a leaf must carry, `domain` first, then `alt_names`, deduped
+/// case-insensitively.
+fn sans(domain: &str, alt_names: &[String]) -> Vec<String> {
+    let mut out = vec![domain.trim().trim_end_matches('.').to_string()];
+    for name in alt_names {
         let name = name.trim().trim_end_matches('.').to_string();
         if !name.is_empty() && !out.iter().any(|n| n.eq_ignore_ascii_case(&name)) {
             out.push(name);
@@ -401,10 +498,11 @@ fn new_leaf(
     cfg: &Internal,
     root: &X509,
     root_key: &PKey<Private>,
-    server: &Server,
+    domain: &str,
+    alt_names: &[String],
 ) -> Result<(X509, PKey<Private>)> {
     let key = new_key(cfg.key_type)?;
-    let names = sans(server);
+    let names = sans(domain, alt_names);
 
     let mut name = X509NameBuilder::new().context("building the leaf name")?;
     name.append_entry_by_text("CN", &names[0])
@@ -490,16 +588,49 @@ fn write_atomic(path: &Path, bytes: &[u8], mode: u32) -> Result<()> {
     Ok(())
 }
 
-/// One request on the root-certificate listener. No keep-alive, no HEAD body:
+/// TLS context for the root endpoint: the leaf for the URL's host, then the CA
+/// certificate as its chain.
+fn tls_acceptor(cert_pem: &[u8], key_pem: &[u8]) -> Result<SslAcceptor> {
+    let mut certs = X509::stack_from_pem(cert_pem).context("parsing the endpoint certificate")?;
+    if certs.is_empty() {
+        anyhow::bail!("no certificate found for the `[internal] serve_root` endpoint");
+    }
+    let leaf = certs.remove(0);
+    let key = PKey::private_key_from_pem(key_pem).context("parsing the endpoint key")?;
+    let mut builder =
+        SslAcceptor::mozilla_intermediate(SslMethod::tls()).context("creating the TLS acceptor")?;
+    builder
+        .set_private_key(&key)
+        .context("setting the endpoint key")?;
+    builder
+        .set_certificate(&leaf)
+        .context("setting the endpoint certificate")?;
+    for chain in certs {
+        builder
+            .add_extra_chain_cert(chain)
+            .context("adding the CA to the endpoint chain")?;
+    }
+    builder
+        .check_private_key()
+        .context("the endpoint key does not match its certificate")?;
+    Ok(builder.build())
+}
+
+/// One HTTPS request on the root endpoint. No keep-alive, no body parsing:
 /// this exists so a client can fetch one small public file.
-fn serve_root_request(mut stream: std::net::TcpStream, cert: &Path) -> std::io::Result<()> {
-    stream.set_read_timeout(Some(Duration::from_secs(5)))?;
-    stream.set_write_timeout(Some(Duration::from_secs(5)))?;
+fn serve_tls_request(acceptor: &SslAcceptor, stream: TcpStream, cert: &Path) -> Result<()> {
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .context("setting the read timeout")?;
+    stream
+        .set_write_timeout(Some(Duration::from_secs(5)))
+        .context("setting the write timeout")?;
+    let mut stream = acceptor.accept(stream).context("TLS handshake")?;
 
     let mut request = Vec::with_capacity(1024);
     let mut chunk = [0u8; 1024];
     while request.len() < 4096 {
-        let n = stream.read(&mut chunk)?;
+        let n = stream.read(&mut chunk).context("reading the request")?;
         if n == 0 {
             break;
         }
@@ -513,44 +644,67 @@ fn serve_root_request(mut stream: std::net::TcpStream, cert: &Path) -> std::io::
     let mut line = head.lines().next().unwrap_or("").split_whitespace();
     let method = line.next().unwrap_or("");
     let target = line.next().unwrap_or("/");
+    let (status, reason, content_type, body, head_only) = respond(method, target, cert);
 
-    let (status, content_type, body): (&str, &str, Vec<u8>) = match method {
+    let mut response = format!(
+        "HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\n\
+         Content-Length: {}\r\nConnection: close\r\n",
+        body.len()
+    );
+    if status == 200 {
+        response.push_str("Content-Disposition: attachment; filename=\"root.crt\"\r\n");
+    }
+    response.push_str("\r\n");
+    stream
+        .write_all(response.as_bytes())
+        .context("writing the response head")?;
+    if !head_only {
+        stream
+            .write_all(&body)
+            .context("writing the response body")?;
+    }
+    stream.flush().context("flushing the response")
+}
+
+/// The routing of the root endpoint, kept pure so the tests do not need TLS.
+fn respond(
+    method: &str,
+    target: &str,
+    cert: &Path,
+) -> (u16, &'static str, &'static str, Vec<u8>, bool) {
+    match method {
         "GET" | "HEAD" if target == "/" || target == "/root.crt" => match fs::read(cert) {
-            Ok(pem) => ("200 OK", "application/x-pem-file", pem),
+            Ok(pem) => (200, "OK", "application/x-pem-file", pem, method == "HEAD"),
             Err(_) => (
-                "503 Service Unavailable",
+                503,
+                "Service Unavailable",
                 "text/plain",
                 b"the local CA root does not exist yet\n".to_vec(),
+                false,
             ),
         },
         "GET" | "HEAD" => (
-            "404 Not Found",
+            404,
+            "Not Found",
             "text/plain",
             b"only /root.crt is served here\n".to_vec(),
+            method == "HEAD",
         ),
         _ => (
-            "405 Method Not Allowed",
+            405,
+            "Method Not Allowed",
             "text/plain",
             b"GET or HEAD only\n".to_vec(),
+            false,
         ),
-    };
-
-    let head = format!(
-        "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\n\
-         Connection: close\r\n\r\n",
-        body.len()
-    );
-    stream.write_all(head.as_bytes())?;
-    if method != "HEAD" {
-        stream.write_all(&body)?;
     }
-    stream.flush()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{Config, Server};
+    use crate::config::Config;
+    use openssl::ssl::{SslConnector, SslVerifyMode};
     use std::io::BufRead;
 
     fn server(domain: &str, alt: &[&str]) -> Server {
@@ -579,6 +733,7 @@ mod tests {
     fn ca(dir: &Path, key_type: KeyKind) -> (LocalCa, SniResolver) {
         let mut cfg = Config::default_for_tests(dir.to_path_buf());
         cfg.internal.key_type = key_type;
+        cfg.internal.domain = "internal".to_string();
         cfg.internal.ca_dir = "ca".to_string();
         cfg.internal.cert_dir = "leaves".to_string();
         let resolver = SniResolver::empty("", false);
@@ -624,6 +779,20 @@ mod tests {
             .filter_map(|n| n.dnsname().map(|s| s.to_string()))
             .collect();
         assert_eq!(names, vec!["app.internal".to_string()]);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_name_outside_the_zone_is_refused() {
+        let dir = std::env::temp_dir().join(format!("uping-ca-zone-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let (local, _) = ca(&dir, KeyKind::Ed25519);
+        let err = local
+            .ensure(&server("app.other", &[]))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("outside `[internal] domain`"), "{err}");
+        assert!(!local.leaf_paths(&server("app.other", &[])).0.exists());
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -698,36 +867,46 @@ mod tests {
     }
 
     #[test]
-    fn the_root_is_served_over_http_without_binding_a_global_address() {
-        let dir = std::env::temp_dir().join(format!("uping-ca-serve-{}", std::process::id()));
+    fn the_root_is_served_over_tls_with_the_ca_as_its_own_anchor() {
+        let dir = std::env::temp_dir().join(format!("uping-ca-tls-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         let mut cfg = Config::default_for_tests(dir.clone());
+        cfg.internal.domain = "localhost".to_string();
         cfg.internal.ca_dir = "ca".to_string();
         cfg.internal.cert_dir = "leaves".to_string();
-        cfg.internal.serve_root = "127.0.0.1:0".to_string();
         let local = LocalCa::new(&cfg, SniResolver::empty("", false));
-        local.ensure(&server("app.internal", &[])).unwrap();
+        local.ensure_named("localhost", &[]).unwrap();
 
-        // Port 0 is refused by the loader but useful here: bind it directly.
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let (cert_path, key_path) = local.leaf_paths_for("localhost");
+        let acceptor = tls_acceptor(
+            &fs::read(&cert_path).unwrap(),
+            &fs::read(&key_path).unwrap(),
+        )
+        .unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
-        let cert = local.ca_cert.clone();
+        let cert_for_thread = local.ca_cert.clone();
         std::thread::spawn(move || {
             for stream in listener.incoming().take(1).flatten() {
-                serve_root_request(stream, &cert).unwrap();
+                serve_tls_request(&acceptor, stream, &cert_for_thread).unwrap();
             }
         });
 
-        let mut stream = std::net::TcpStream::connect(addr).unwrap();
-        stream
-            .write_all(b"GET /root.crt HTTP/1.1\r\nHost: x\r\n\r\n")
+        // Trust only the generated root: this fails if the endpoint's own leaf
+        // is not signed by it.
+        let mut builder = SslConnector::builder(SslMethod::tls()).unwrap();
+        builder.set_ca_file(&local.ca_cert).unwrap();
+        builder.set_verify(SslVerifyMode::PEER);
+        let connector = builder.build();
+        let tcp = TcpStream::connect(addr).unwrap();
+        let mut tls = connector.connect("localhost", tcp).unwrap();
+        tls.write_all(b"GET /root.crt HTTP/1.1\r\nHost: localhost\r\n\r\n")
             .unwrap();
-        let mut reader = std::io::BufReader::new(stream);
+        let mut reader = std::io::BufReader::new(tls);
         let mut status = String::new();
         reader.read_line(&mut status).unwrap();
         assert!(status.contains("200 OK"), "{status}");
 
-        let mut body = String::new();
         loop {
             let mut line = String::new();
             reader.read_line(&mut line).unwrap();
@@ -735,33 +914,60 @@ mod tests {
                 break;
             }
         }
+        let mut body = String::new();
         let _ = std::io::Read::read_to_string(&mut reader, &mut body);
         assert!(body.contains("BEGIN CERTIFICATE"), "{body}");
+        assert_eq!(body, std::fs::read_to_string(&local.ca_cert).unwrap());
         let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn an_unknown_path_is_404() {
-        let dir = std::env::temp_dir().join(format!("uping-ca-404-{}", std::process::id()));
+    fn the_endpoint_routes_only_the_root() {
+        let dir = std::env::temp_dir().join(format!("uping-ca-routes-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         let (local, _) = ca(&dir, KeyKind::Ed25519);
         local.ensure(&server("app.internal", &[])).unwrap();
         let cert = local.ca_cert.clone();
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = listener.local_addr().unwrap();
-        std::thread::spawn(move || {
-            for stream in listener.incoming().take(1).flatten() {
-                serve_root_request(stream, &cert).unwrap();
-            }
-        });
-        let mut stream = std::net::TcpStream::connect(addr).unwrap();
-        stream
-            .write_all(b"GET /nope HTTP/1.1\r\nHost: x\r\n\r\n")
-            .unwrap();
-        let mut reader = std::io::BufReader::new(stream);
-        let mut status = String::new();
-        reader.read_line(&mut status).unwrap();
-        assert!(status.contains("404"), "{status}");
+
+        let (status, _, ctype, body, head) = respond("GET", "/root.crt", &cert);
+        assert_eq!(
+            (status, ctype, head),
+            (200, "application/x-pem-file", false)
+        );
+        assert!(body.starts_with(b"-----BEGIN CERTIFICATE-----"));
+
+        let (status, _, _, _, head) = respond("HEAD", "/root.crt", &cert);
+        assert_eq!((status, head), (200, true));
+
+        let (status, _, _, _, _) = respond("POST", "/root.crt", &cert);
+        assert_eq!(status, 405);
+
+        let (status, _, _, _, _) = respond("GET", "/nope", &cert);
+        assert_eq!(status, 404);
+
+        let (status, _, _, _, _) = respond("GET", "/root.crt", &dir.join("missing.crt"));
+        assert_eq!(status, 503);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn serve_root_urls_are_https_and_inside_the_zone() {
+        let dir = std::env::temp_dir().join(format!("uping-ca-url-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let mut cfg = Config::default_for_tests(dir.clone());
+        cfg.internal.domain = "internal.local".to_string();
+        cfg.internal.ca_dir = "ca".to_string();
+        cfg.internal.cert_dir = "leaves".to_string();
+        cfg.internal.serve_root = "https://internal.local:9000".to_string();
+        let local = LocalCa::new(&cfg, SniResolver::empty("", false));
+        assert_eq!(
+            local.serve_root.as_ref().map(|r| r.url()),
+            Some("https://internal.local:9000".to_string())
+        );
+
+        cfg.internal.serve_root = "http://internal.local:9000".to_string();
+        let local = LocalCa::new(&cfg, SniResolver::empty("", false));
+        assert!(local.serve_root.is_none(), "http must not be accepted");
         let _ = fs::remove_dir_all(&dir);
     }
 }

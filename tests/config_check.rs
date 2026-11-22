@@ -373,7 +373,8 @@ fn an_auto_server_without_a_certificate_is_accepted_by_check() {
 /// must accept a first start with nothing on disk and must not create the CA.
 #[test]
 fn an_internal_server_without_a_certificate_is_accepted_by_check() {
-    let body = "[[server]]\ndomain = \"private.example\"\nkeys = \"internal\"\n\
+    let body = "[internal]\ndomain = \"example\"\n\
+                [[server]]\ndomain = \"private.example\"\nkeys = \"internal\"\n\
                 serve_http = false\nupstream = \"127.0.0.1:8080\"\n";
     let ok = assert_accepted("good-internal-missing.toml", body);
     assert!(

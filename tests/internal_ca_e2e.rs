@@ -1,11 +1,11 @@
-//! `keys = "internal"`: uping signs its own leaves, publishes the root, and a
-//! broken server only costs its own domain.
+//! `keys = "internal"`: uping signs its own zone, publishes the root over TLS at
+//! `[internal] serve_root`, and a broken server only costs its own domain.
 //!
 //! This drives the real binary once, because three promises only exist at that
 //! level: the generated chain is accepted by a TLS client that trusts nothing
-//! but `root.crt`, `/root.crt` is fetchable over plain HTTP, and a listener
-//! address that does not exist (here TEST-NET-1, as a VPN that is not up yet)
-//! is a warning rather than a dead process.
+//! but `root.crt`, `/root.crt` is fetchable over TLS at the configured URL, and
+//! a listener address that does not exist (here TEST-NET-1, as a VPN that is
+//! not up yet) is a warning rather than a dead process.
 
 mod support;
 
@@ -38,12 +38,12 @@ fn backend() -> u16 {
 fn config(dir: &Path, http: u16, https: u16, root_port: u16, backend: u16) -> String {
     format!(
         "[listen]\nipv4 = \"127.0.0.1\"\nhttp = {http}\nhttps = {https}\n\
-         [internal]\nca_dir = \"ca\"\ncert_dir = \"leaves\"\n\
-         serve_root = \"127.0.0.1:{root_port}\"\n\
-         [[server]]\ndomain = \"app.internal\"\nkeys = \"internal\"\n\
+         [internal]\ndomain = \"localhost\"\nca_dir = \"ca\"\ncert_dir = \"leaves\"\n\
+         serve_root = \"https://localhost:{root_port}\"\n\
+         [[server]]\ndomain = \"app.localhost\"\nkeys = \"internal\"\n\
          serve_http = false\nhttps_listen = \"127.0.0.1:{https}\"\n\
          upstream = \"127.0.0.1:{backend}\"\n\
-         [[server]]\ndomain = \"offline.internal\"\nkeys = \"internal\"\n\
+         [[server]]\ndomain = \"offline.localhost\"\nkeys = \"internal\"\n\
          serve_http = false\nhttps_listen = \"192.0.2.1:{https}\"\n\
          upstream = \"127.0.0.1:9\"\n\
          [[server]]\ndomain = \"broken.local\"\nkeys = \"manual\"\n\
@@ -83,17 +83,20 @@ fn curl_with_root(port: u16, host: &str, path: &str, ca: &Path) -> (String, Stri
     (status, text)
 }
 
-fn fetch_plain(port: u16, path: &str) -> String {
-    let mut stream = std::net::TcpStream::connect(("127.0.0.1", port))
-        .expect("the root-certificate listener must be up");
-    write!(
-        stream,
-        "GET {path} HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"
-    )
-    .unwrap();
-    let mut body = String::new();
-    stream.read_to_string(&mut body).unwrap();
-    body
+/// The root endpoint is TLS: fetch it with `-k`, because the root it serves is
+/// what would make the name trusted in the first place.
+fn fetch_root(port: u16, path: &str) -> String {
+    let out = Command::new("curl")
+        .args(["-sk", "--resolve", &format!("localhost:{port}:127.0.0.1")])
+        .arg(format!("https://localhost:{port}{path}"))
+        .output()
+        .expect("curl is needed for the integration tests");
+    assert!(
+        out.status.success(),
+        "curl failed on the root endpoint: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8_lossy(&out.stdout).into_owned()
 }
 
 #[test]
@@ -123,23 +126,25 @@ fn a_local_leaf_is_trusted_by_its_root_and_a_broken_server_is_only_a_warning() {
     assert!(ca_key.is_file());
 
     // The leaf lives under [internal] cert_dir, not the ACME one.
-    let leaf_dir = dir.join("leaves").join("app.internal");
+    let leaf_dir = dir.join("leaves").join("app.localhost");
     assert!(leaf_dir.join("fullchain.pem").is_file());
     assert!(leaf_dir.join("privkey.pem").is_file());
+    // The serve_root endpoint got a leaf for its own name from the same CA.
+    assert!(dir
+        .join("leaves")
+        .join("localhost")
+        .join("fullchain.pem")
+        .is_file());
 
     // A client that trusts only root.crt accepts the chain.
-    let (status, text) = curl_with_root(https, "app.internal", "/", &ca_cert);
+    let (status, text) = curl_with_root(https, "app.localhost", "/", &ca_cert);
     assert_eq!(status, "200", "{text}");
     assert!(text.ends_with("internal-backend"), "{text}");
 
-    // The root is published over plain HTTP for clients that have nothing yet.
-    let plain = fetch_plain(root_port, "/root.crt");
-    assert!(plain.contains("200 OK"), "{plain}");
-    assert!(plain.contains("BEGIN CERTIFICATE"), "{plain}");
-    assert_eq!(
-        plain.split("\r\n\r\n").nth(1).unwrap_or(""),
-        std::fs::read_to_string(&ca_cert).unwrap(),
-    );
+    // The root is published over TLS at https://<zone>:<port>/root.crt.
+    let body = fetch_root(root_port, "/root.crt");
+    assert!(body.contains("BEGIN CERTIFICATE"), "{body}");
+    assert_eq!(body, std::fs::read_to_string(&ca_cert).unwrap());
 
     // The VPN address was not available; the other domains must be unaffected.
     let text = wait_for_log(&log, "is not available");
@@ -151,7 +156,7 @@ fn a_local_leaf_is_trusted_by_its_root_and_a_broken_server_is_only_a_warning() {
     assert!(server.is_alive());
 
     // And the good domain still answers while the broken one did not kill it.
-    let (status, text) = curl_with_root(https, "app.internal", "/again", &ca_cert);
+    let (status, text) = curl_with_root(https, "app.localhost", "/again", &ca_cert);
     assert_eq!(status, "200", "{text}");
 
     drop(server);

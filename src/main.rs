@@ -5,7 +5,7 @@
 //! HTTPS, and keeps a lid on abusive clients. A `[[server]]` or route may also
 //! serve a directory directly (`root`), forward to a TLS backend, and is probed
 //! for liveness so a dead backend is a fast `503`. `[[stream]]` raw TCP
-//! forwarding is experimental.
+//! forwarding is stable.
 
 mod acme;
 mod config;
@@ -414,15 +414,9 @@ fn main() -> Result<()> {
     health.clone().spawn(live_routes.clone());
     info!("SIGHUP applies a new config");
 
-    // --- Raw TCP streams (experimental in v0.3) ---
+    // --- Raw TCP streams ---
     // One listener per [[stream]]. The upstream is whatever holds the port on
     // loopback; uping neither starts nor watches it.
-    if !cfg.streams.is_empty() {
-        warn!(
-            "[[stream]] is experimental: its config, behaviour and support may change \
-             before it is declared stable"
-        );
-    }
     for s in cfg.streams.iter().filter(|s| {
         match s.listen.parse::<std::net::SocketAddr>() {
             Ok(addr) => match bindable(addr) {

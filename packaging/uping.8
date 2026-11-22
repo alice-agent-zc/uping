@@ -20,8 +20,12 @@ public ACME such as Let's Encrypt
 .RB ( auto ),
 uping's own certificate authority
 .RB ( internal ),
-which generates a root on first start and signs leaves locally with no network
-access at all, or two PEM files you provide
+which generates a root on first start, signs only
+.I [internal] domain
+and its subdomains with no network access at all, and can publish that root at
+the
+.I [internal] serve_root
+URL, or two PEM files you provide
 .RB ( manual ).
 .PP
 A
@@ -29,7 +33,7 @@ A
 entry may proxy to an upstream, serve a directory, or split the path with
 .IR routes ;
 per-IP request and connection limits, upstream health checks and an
-experimental raw TCP forwarder
+raw TCP forwarder
 .RB ( [[stream]] )
 are also available.
 .PP

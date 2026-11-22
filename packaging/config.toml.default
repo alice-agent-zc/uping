@@ -19,6 +19,7 @@ https = 8443
 
 # uping's own CA. Clients install /var/lib/uping/internal/ca/root.crt once.
 [internal]
+domain   = "localhost"          # the only zone this CA signs
 ca_dir   = "/var/lib/uping/internal/ca"
 cert_dir = "/var/lib/uping/internal"
 

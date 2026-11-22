@@ -57,7 +57,7 @@ assets = [
     ["target/release/uping", "usr/bin/", "755"],
     ["packaging/uping.service", "usr/lib/systemd/system/", "644"],
     ["packaging/uping.tmpfiles.conf", "usr/lib/tmpfiles.d/uping.conf", "644"],
-    ["packaging/config.toml.example", "usr/share/uping/config.toml.example", "644"],
+    ["config.toml.example", "usr/share/uping/config.toml.example", "644"],
     ["packaging/config.toml.default", "usr/share/uping/config.toml.default", "644"],
     ["packaging/www/index.html", "usr/share/uping/www/index.html", "644"],
     ["packaging/uping.8", "usr/share/man/man8/uping.8", "644"],

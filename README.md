@@ -21,8 +21,8 @@ restart for a config change.
 - ✅ Live config swap on `SIGHUP`
 - ✅ `.deb` for Debian/Ubuntu: `dpkg -i` creates the user, a working default on
   loopback, `man uping`, and enables the service
-- ⚠️ `[[stream]]` raw TCP forwarding is **experimental** — the mail/database
-  relay. `routes` is HTTP path routing, not the mail feature.
+- ✅ `[[stream]]` raw TCP forwarding — the mail/database relay. `routes` is
+  HTTP path routing, not the mail feature.
 
 Not here: changing listeners or `[[stream]]` without a restart, load balancing,
 upstream mutual TLS, DNS-01, and wildcard SANs (SNI resolution is exact).
@@ -47,8 +47,10 @@ cp config.toml.example config.toml
 $EDITOR config.toml
 ```
 
-The examples assume a checkout at `~/uping`, with `config.toml` at its root.
-Certificates and the ACME account live under `~/uping/cert`.
+The example targets the packaged system deployment (`/etc/uping/config.toml`,
+state under `/var/lib/uping`). For a `~/uping` checkout, replace
+`/var/lib/uping` with the checkout directory: certificates and the ACME account
+then live under `~/uping/cert`.
 
 ## Build and run with setcap
 
@@ -309,14 +311,19 @@ failed-authorization budget.
 
 ### `[internal]` — uping's own CA
 
-`keys = "internal"` no longer depends on any CA server. On first start uping
-generates a root pair under `ca_dir` and signs each domain's leaf itself; a leaf
-is renewed locally before it expires and swapped into the live listener without
-a restart. Nothing is fetched, so there is no http-01, no port 80 and no
-requirement that the CA resolve or reach the host.
+`keys = "internal"` depends on no CA server. It signs **one zone** — `domain` —
+and nothing outside it: `domain = "internal.rao-nagos.pf"` issues that name and
+any subdomain of it (`dsh.internal.rao-nagos.pf`,
+`terminal.internal.rao-nagos.pf`, …). A server whose `domain` is outside the
+zone is a config error, and issuance refuses it again at the last moment. On
+first start uping generates a root pair under `ca_dir` and signs each leaf
+itself; a leaf is renewed locally before it expires and swapped into the live
+listener without a restart. Nothing is fetched, so there is no http-01, no port
+80 and no requirement that the CA resolve or reach the host.
 
 | Field | Default | Meaning |
 |---|---|---|
+| `domain` | `""` | the only zone this CA signs; required by any `keys = "internal"` |
 | `ca_dir` | `"cert/internal/ca"` | `root.crt` (0644) + `root.key` (0600) |
 | `cert_dir` | `"cert/internal"` | `<cert_dir>/<domain>/{fullchain,privkey}.pem` |
 | `common_name` | `"uping local CA"` | root subject CN; not a hostname |
@@ -325,23 +332,60 @@ requirement that the CA resolve or reach the host.
 | `leaf_days` | `397` | leaf lifetime, clamped to `1..=825` |
 | `renew_before_days` | `30` | renew a leaf with fewer days left |
 | `key_type` | `"ed25519"` | `ed25519`, `p256` or `rsa2048` |
-| `serve_root` | `""` | plain HTTP address that publishes `/root.crt`; empty means off |
+| `serve_root` | `""` | HTTPS URL publishing `/root.crt`; empty means off |
+
+The package configuration uses the standard paths:
+
+```toml
+[internal]
+domain     = "internal.rao-nagos.pf"
+ca_dir     = "/var/lib/uping/internal/ca"
+cert_dir   = "/var/lib/uping/internal"
+serve_root = "https://internal.rao-nagos.pf:9000"
+
+[[server]]
+domain       = "dsh.internal.rao-nagos.pf"
+keys         = "internal"
+https_listen = "10.8.0.1"          # the rupa VPN address
+serve_http   = false               # no :80 at all, no http-01 to answer
+upstream     = "127.0.0.1:7681"
+```
 
 The files use the ACME names, in their own subtree, so nothing an ACME run
 already wrote is read or overwritten:
 
 ```text
-~/uping/cert/internal/ca/root.crt                       0644  <- install on clients
-~/uping/cert/internal/ca/root.key                       0600
-~/uping/cert/internal/app.vpn.rao-nagos.pf/fullchain.pem
-~/uping/cert/internal/app.vpn.rao-nagos.pf/privkey.pem  0600
+/var/lib/uping/internal/ca/root.crt                              0644  <- clients
+/var/lib/uping/internal/ca/root.key                              0600
+/var/lib/uping/internal/dsh.internal.rao-nagos.pf/fullchain.pem
+/var/lib/uping/internal/dsh.internal.rao-nagos.pf/privkey.pem    0600
 ```
 
 The root is created once and never regenerated behind your back. If only one of
 `root.crt` / `root.key` survives, startup logs the pair as inconsistent and
 skips those domains, rather than minting a root every client would reject
 (remove both files to deliberately create a new CA). `alt_names = [...]` on a
-server adds SANs to the same leaf.
+server adds SANs to the same leaf, and they must be inside the zone too.
+
+#### Publishing the root over HTTPS
+
+`serve_root` is a URL inside the zone, not an address. uping gives that host a
+leaf from the same CA — so `https://internal.rao-nagos.pf:9000` presents a
+certificate chaining to the very root it serves — resolves the host (normally
+to the rupa VPN address) and binds that address and port. A client fetches the
+root once:
+
+```sh
+curl -k https://internal.rao-nagos.pf:9000/root.crt \
+  | sudo tee /usr/local/share/ca-certificates/uping-internal.crt
+sudo update-ca-certificates
+```
+
+`-k` is needed exactly because the root is what would make that name trusted;
+after this one fetch the same URL verifies normally. `http://` is refused:
+publishing a trust anchor in clear text hands it to anyone on the path. Binding
+is best-effort — a host that does not resolve yet (the tunnel is down) is logged
+and skipped, and every other listener keeps running.
 
 #### How the certificates are made
 
@@ -357,25 +401,11 @@ The released binary carries OpenSSL statically: `pingora-openssl` enables
 `openssl/vendored`, so libcrypto is compiled into the executable (the Linux
 build reports OpenSSL 3.6.3 and `ldd` shows no `libssl`). Installing uping is
 still one binary and one config file; building it needs a C toolchain, CMake
-and Perl for that vendored OpenSSL build, but no system `libssl-dev` and no
-step-ca.
+and Perl for that vendored OpenSSL build, but no system `libssl-dev`.
 
-On each client, once:
-
-```sh
-curl -o /usr/local/share/ca-certificates/uping-local-ca.crt \
-  http://10.8.0.1:9000/root.crt
-sudo update-ca-certificates
-```
-
-`serve_root` publishes that one file over plain HTTP on the address you name —
-typically the rupa VPN address. It is best-effort: an address that does not
-exist yet (the tunnel is not up) is logged and skipped, and every other listener
-keeps running.
-
-The check the old `[acme.internal]` profile could not avoid still exists: the
-**client** has to install the root once. What disappears is the second daemon —
-no step-ca, no account, no ACME directory, no port 80.
+The remaining manual step is the same one a private ACME CA imposed: each
+client installs the root once. What disappears is the daemon — no step-ca, no
+account, no ACME directory, no port 80.
 
 ## `[[server]]` — every shape
 
@@ -501,21 +531,22 @@ them yourself (certbot, an ACME client, a paid CA, …) and send `SIGHUP`.
 
 ```toml
 [internal]
-serve_root = "10.8.0.1:9000"   # optional: publish /root.crt over plain HTTP
+domain     = "internal.rao-nagos.pf"        # the only zone this CA signs
+serve_root = "https://internal.rao-nagos.pf:9000"
 
 [[server]]
-domain       = "site1.internal.rao-nagos.pf"
+domain       = "dsh.internal.rao-nagos.pf"
 keys         = "internal"
-alt_names    = ["vpn.rao-nagos.pf"]
-upstream     = "127.0.0.1:8080"
-https_listen = "10.8.0.1"      # the rupa VPN address
-serve_http   = false           # no :80 at all, and no http-01 to answer
+alt_names    = ["terminal.internal.rao-nagos.pf"]
+upstream     = "127.0.0.1:7681"
+https_listen = "10.8.0.1"                   # the rupa VPN address
+serve_http   = false                        # no :80 at all, no http-01 to answer
 ```
 
-This is automatic leaf issuance and renewal with no CA server on the network.
-The **client** trusts the root once (fetch it from `serve_root`, or copy
-`cert/internal/ca/root.crt`); the leaves rotate underneath that trust. The name
-may exist only in your internal DNS. See [Private names, rupa and
+This is automatic leaf issuance and renewal with no CA server on the network,
+limited to the zone you name. The **client** trusts the root once (fetch it from
+`serve_root`, or copy `ca/root.crt`); the leaves rotate underneath that trust.
+The names may exist only in your internal DNS. See [Private names, rupa and
 DNS](#private-names-rupa-and-dns).
 
 ### 10. Explicit `keys = "auto"`
@@ -568,7 +599,7 @@ optionally override where the pair is written.
 | `listen`, `upstream` | required |
 | `connect_timeout_ms` | `5000`, clamped to `100..=30000` |
 
-## `[[stream]]` — experimental raw TCP
+## `[[stream]]` — raw TCP forwarding
 
 ```toml
 [[stream]]
@@ -623,20 +654,23 @@ installation.
 
 For `keys = "internal"`:
 
-1. Let uping create `cert/internal/ca/root.crt` on first start.
-2. Publish it with `serve_root = "10.8.0.1:9000"`, or copy the file out of band.
+1. Set `[internal] domain` to the zone, e.g. `internal.rao-nagos.pf`; uping
+   creates `ca/root.crt` there on first start.
+2. Publish it with `serve_root = "https://internal.rao-nagos.pf:9000"`, or copy
+   the file out of band.
 3. Install that root once on each client.
-4. Add one `[[server]]` per name with `keys = "internal"`; one root covers all of
-   them, and each leaf renews automatically.
+4. Add one `[[server]]` per name inside the zone with `keys = "internal"`; one
+   root covers all of them, and each leaf renews automatically.
 
 The certificate is for the **name**, not the IP. The A record may point to
 `10.8.0.1`; the client resolves the name, connects to the private IP, and
 trusts the leaf because it trusts uping's root. No IP SAN is needed.
 
-`.localhost` is special and not suitable for remote clients. A subdomain you own,
-such as `site1.internal.rao-nagos.pf` or `vpn.rao-nagos.pf`, is the least
-surprising choice. `alt_names` lets one leaf cover the bare and the `www` name;
-a wildcard SAN is refused because SNI resolution is an exact match.
+`.localhost` is special and not suitable for remote clients. Use a subdomain you
+own as the zone, such as `internal.rao-nagos.pf`, then any name inside it
+(`dsh.internal.rao-nagos.pf`, `terminal.internal.rao-nagos.pf`). `alt_names`
+lets one leaf cover several names in that zone; a wildcard SAN is refused
+because SNI resolution is an exact match.
 
 ## `uping --dns-zone`
 

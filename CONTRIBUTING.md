@@ -74,12 +74,12 @@ src/
   sighup.rs        # SIGHUP -> swap routes/certs/limits/domains
   tls.rs           # SNI resolver; renewals replace entries live
   acme.rs          # account, http-01 orders, storage, renewal thread
-  internal_ca.rs   # keys = "internal": local root, leaf issuance, /root.crt
+  internal_ca.rs   # keys = "internal": zone-scoped CA, leaves, TLS root endpoint
   static_files.rs  # safe path resolution + streamed files
   health.rs        # upstream probes, 503 when a backend is down
   limits.rs        # per-IP, per-domain rate + connection limiters
   proxy.rs         # HTTPS proxy, HTTP redirect + ACME challenge path
-  stream.rs        # experimental raw TCP forwarder
+  stream.rs        # raw TCP forwarder
 tests/
   config_check.rs  # bad-config corpus and --check
   (internal_ca.rs)  # root/leaf generation, SANs, reuse, half-root refusal
@@ -180,11 +180,21 @@ require a restart and are reported as such.
 ### Local CA
 
 `keys = "internal"` never talks to a network. `internal_ca.rs` generates the root
-on first use, signs a leaf per domain (Ed25519 by default, `alt_names` in the
-SAN list), and renews it before expiry on the same hourly loop as ACME. Files are
-written atomically (`.<name>.tmp-<pid>` then rename) with `0644` for the chain and
-`0600` for the key. A missing half of the root pair is refused rather than
-regenerated: a new root would strand every client that installed the old one.
+on first use and signs leaves for one zone only, `[internal] domain`: a name
+outside it is rejected when the config loads and again at issuance, so the CA
+cannot accidentally vouch for someone else's name. Ed25519 by default,
+`alt_names` in the SAN list, renewed before expiry on the same hourly loop as
+ACME. Files are written atomically (`.<name>.tmp-<pid>` then rename) with `0644`
+for the chain and `0600` for the key. A missing half of the root pair is refused
+rather than regenerated: a new root would strand every client that installed the
+old one.
+
+`serve_root` is a URL, not an address: the endpoint's host gets a leaf from the
+same CA, so it presents a certificate chaining to the root it serves. The
+listener resolves the host (normally the VPN address), binds the first address
+that accepts it (IPv4 first), and serves only `GET|HEAD /root.crt` over TLS.
+Resolution and binding are best-effort: a host that is not up yet is a warning,
+like any other listener.
 
 Generation is in-process through the `openssl` crate — the same libcrypto the
 proxy already uses for TLS. No shell command, no `step-ca`, no `certbot`, no
@@ -196,8 +206,8 @@ OpenSSL signs the message itself and rejects a digest there — while P-256 and
 RSA use SHA-256. `rcgen` was not pulled in: it would be a second X.509
 implementation for no gain, and OpenSSL is already linked and already required
 by pingora's dynamic SNI callbacks.
-`serve_root` publishes `root.crt` on a plain-HTTP socket; binding it is
-best-effort, because the VPN address may arrive after uping starts.
+Resolution and binding are best-effort, because the VPN address may arrive
+after uping starts.
 
 ### Failure isolation
 
@@ -211,8 +221,10 @@ down with it.
 ### Streams
 
 `[[stream]]` is a `ServerApp` listener that copies bytes both ways and forwards
-half-close. It is experimental: keep that label in config, docs and
-error messages.
+half-close. It is stable since v0.4: what it does is one listener per entry, no
+TLS termination, and the upstream owns the protocol. `tests/stream_e2e.rs`
+drives the compiled binary for the raw forward, the half-close drain, a dead
+upstream and a `0.0.0.0` bind.
 
 ## Running it locally
 
@@ -271,7 +283,7 @@ packaging/uping.tmpfiles.conf   creates /var/lib/uping, owner uping, mode 0750
 packaging/uping.8               man page; cargo-deb installs it gzipped as
                                 /usr/share/man/man8/uping.8.gz
 packaging/config.toml.default   the working default installed on a fresh install
-packaging/config.toml.example   commented template, absolute paths under /var/lib
+config.toml.example              commented template (shipped as /usr/share/uping/...)
 packaging/www/index.html        the page the default serves on https://localhost:8443
 packaging/README.Debian         install, paths, upgrade and purge notes
 packaging/debian/postinst       user, data dir, default config, enable and start
@@ -401,4 +413,5 @@ an existing tag. The tag must match `Cargo.toml`'s version.
 - Config changes update the README (defaults and examples) and
   `config.toml.example`. `config.toml` itself is git-ignored: it is the local,
   machine-specific copy.
-- Anything touching `[[stream]]` keeps it labelled experimental.
+- `[[stream]]` is stable since v0.4; changing its config shape is a normal
+  breaking-change decision, not an experiment.
