@@ -4101,6 +4101,19 @@ upstream = "127.0.0.1:8080"
     }
 
     #[test]
+    fn the_shipped_example_stays_valid() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("config.toml.example");
+        let cfg = Config::load(&path).expect("config.toml.example must stay a valid config");
+        assert_eq!(cfg.servers.len(), 2);
+        assert_eq!(cfg.servers[0].domain, "www.rao-nagos.pf");
+        assert_eq!(cfg.servers[1].domain, "dsh.internal.rao-nagos.pf");
+        assert_eq!(cfg.internal.domain, "internal.rao-nagos.pf");
+        // It is also a valid `--dump-config` source.
+        let dump = cfg.to_toml().expect("the example must serialize");
+        toml::from_str::<toml::Value>(&dump).expect("the dump must parse back");
+    }
+
+    #[test]
     fn routes_stay_inside_their_server() {
         let path = write_temp(
             "route-forms.toml",
