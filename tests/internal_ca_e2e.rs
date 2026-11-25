@@ -150,11 +150,17 @@ fn a_local_leaf_is_trusted_by_its_root_and_a_broken_server_is_only_a_warning() {
     let (status, text) = curl_with_root(https, "app.localhost", "/", &ca_cert);
     assert_eq!(status, "200", "{text}");
     assert!(text.ends_with("internal-backend"), "{text}");
+    // The default subject layout of the CLI is not stable across OpenSSL
+    // releases: 3.0 prints `O = rao-nagos` and 3.5 prints `O=rao-nagos`, so
+    // reading the default form made this test pass locally and fail on the
+    // older runner. RFC2253 is the machine-readable form and does not change.
     let (subject_status, subject) = Command::new("openssl")
         .args([
             "x509",
             "-noout",
             "-subject",
+            "-nameopt",
+            "RFC2253",
             "-in",
             &leaf_dir.join("fullchain.pem").display().to_string(),
         ])
