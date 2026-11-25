@@ -2559,6 +2559,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "bytes",
+ "clap",
  "env_logger",
  "http",
  "instant-acme",

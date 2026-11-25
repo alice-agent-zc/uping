@@ -24,6 +24,7 @@ use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+use clap::Parser;
 use log::{info, warn};
 use pingora::apps::HttpServerOptions;
 use pingora::listeners::tls::TlsSettings;
@@ -41,65 +42,34 @@ use crate::sighup::{Allowed, Reloader};
 use crate::stream::StreamForwarder;
 use crate::tls::SniResolver;
 
-const USAGE: &str = "usage: uping [config.toml] [--check|--dry-run|--dns-zone|--dump-config]";
-
-/// A parsed command line: one optional config path and one flag.
-struct Args {
+/// uping — a tiny TOML-configured reverse proxy.
+#[derive(Debug, Parser)]
+#[command(
+    name = "uping",
+    version,
+    about = "A tiny TOML-configured reverse proxy",
+    long_about = None
+)]
+struct Cli {
+    /// Path to the TOML configuration file.
+    #[arg(value_name = "CONFIG", default_value = "config.toml")]
     path: String,
+
+    /// Validate the configuration strictly and exit.
+    #[arg(
+        long,
+        visible_alias = "dry-run",
+        conflicts_with_all = ["dns_zone", "dump_config"]
+    )]
     check: bool,
+
+    /// Print hosts(5) records for the configured domains and exit.
+    #[arg(long, conflicts_with_all = ["check", "dump_config"])]
     dns_zone: bool,
+
+    /// Print the effective configuration, defaults included, and exit.
+    #[arg(long, conflicts_with_all = ["check", "dns_zone"])]
     dump_config: bool,
-}
-
-/// Hand-parsed: two shapes and one flag do not justify a dependency, and a
-/// parser is itself a thing that can reject a valid invocation.
-///
-/// Both `uping --check [path]` and `uping [path] --check` are accepted, and the
-/// same goes for `--dns-zone`.
-fn parse_args(raw: impl Iterator<Item = String>) -> Result<Args> {
-    let mut path: Option<String> = None;
-    let mut check = false;
-    let mut dns_zone = false;
-    let mut dump_config = false;
-
-    for arg in raw {
-        match arg.as_str() {
-            "--check" | "--dry-run" => check = true,
-            "--dns-zone" => dns_zone = true,
-            "--dump-config" => dump_config = true,
-            "-h" | "--help" => {
-                println!("{USAGE}");
-                std::process::exit(0);
-            }
-            other if other.starts_with('-') => {
-                anyhow::bail!("unknown option `{other}`; {USAGE}")
-            }
-            other => {
-                if path.replace(other.to_string()).is_some() {
-                    anyhow::bail!(
-                        "unexpected argument `{other}`: at most one config path; {USAGE}"
-                    );
-                }
-            }
-        }
-    }
-
-    let chosen = [check, dns_zone, dump_config]
-        .iter()
-        .filter(|on| **on)
-        .count();
-    if chosen > 1 {
-        anyhow::bail!(
-            "`--check`, `--dns-zone` and `--dump-config` are different outputs; pick one"
-        );
-    }
-
-    Ok(Args {
-        path: path.unwrap_or_else(|| "config.toml".into()),
-        check,
-        dns_zone,
-        dump_config,
-    })
 }
 
 /// Run [`check_config`] and exit: `0` with one line on stdout, `1` with the
@@ -238,7 +208,7 @@ fn check_config(path: &str) -> Result<String> {
 }
 
 fn main() -> Result<()> {
-    let args = parse_args(std::env::args().skip(1))?;
+    let args = Cli::parse();
     if args.check {
         run_check(&args.path);
     }
@@ -647,8 +617,8 @@ mod tests {
         }
     }
 
-    fn args(raw: &[&str]) -> Result<Args> {
-        parse_args(raw.iter().map(|s| s.to_string()))
+    fn args(raw: &[&str]) -> Result<Cli, clap::Error> {
+        Cli::try_parse_from(std::iter::once("uping").chain(raw.iter().copied()))
     }
 
     #[test]
@@ -658,6 +628,13 @@ mod tests {
             assert!(parsed.check);
             assert_eq!(parsed.path, "a.toml");
         }
+    }
+
+    #[test]
+    fn the_dry_run_alias_selects_the_same_mode() {
+        let parsed = args(&["--dry-run", "a.toml"]).unwrap();
+        assert!(parsed.check);
+        assert_eq!(parsed.path, "a.toml");
     }
 
     #[test]

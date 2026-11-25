@@ -35,6 +35,8 @@ mime_guess = "2"
 openssl = "0.10"
 # SIGHUP -> live config swap.
 signal-hook = "0.3"
+# CLI parsing: one positional config path, three mutually exclusive outputs.
+clap = { version = "4", features = ["derive"] }
 # Listening-socket probe before pingora binds: same SO_REUSEADDR as its own
 # listener, so "this address does not exist yet" is caught before a panic.
 socket2 = "0.6"

@@ -90,6 +90,9 @@ fn dns_zone_refuses_a_wildcard_listener() {
 fn check_and_dns_zone_cannot_be_combined() {
     let path = write("both.toml", TWO);
     let out = run(&path, &["--check", "--dns-zone"]);
-    assert_eq!(out.status.code(), Some(1), "{:?}", out);
-    assert!(String::from_utf8_lossy(&out.stderr).contains("pick one"));
+    // clap reports a usage error: exit 2, both flags named.
+    assert_eq!(out.status.code(), Some(2), "{:?}", out);
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("cannot be used with"), "{err}");
+    assert!(out.stdout.is_empty(), "{:?}", out.stdout);
 }

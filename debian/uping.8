@@ -43,8 +43,16 @@ The configuration is read once at startup and again on
 Relative paths in it resolve against the directory that holds the file.
 .SH OPTIONS
 .TP
+.I CONFIG
+Path to the configuration file. Defaults to
+.I config.toml
+in the working directory.
+.TP
 .BI \-h ", " \-\-help
-Print the usage line and exit.
+Print the help text and exit.
+.TP
+.BR \-V ", " \-\-version
+Print the version and exit.
 .TP
 .BR \-\-check ", " \-\-dry\-run
 Validate
