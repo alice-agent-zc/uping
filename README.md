@@ -144,15 +144,18 @@ sudo dpkg -i target/debian/uping_*.deb
 ```
 
 That is the whole install. The post-installation script creates the
-unprivileged `uping` user and group, `/var/lib/uping`, a **working default**
-`/etc/uping/config.toml` (loopback only, a static page on
-`https://localhost:8443` signed by uping's own CA), installs `man uping`, and
-enables and starts `uping.service`. Nothing has to be created by hand.
+unprivileged `uping` user and group (no home directory, no login shell),
+`/var/lib/uping`, a **working default** `/etc/uping/config.toml` (loopback only,
+a `localhost` certificate from uping's own CA, a placeholder upstream), installs
+`man uping`, and enables and starts `uping.service`. Nothing has to be created
+by hand.
 
 ```sh
 man uping
 systemctl status uping
-sudo curl --cacert /var/lib/uping/internal/ca/root.crt https://localhost:8443/
+sudo curl -sS --cacert /var/lib/uping/internal/ca/root.crt \
+  -o /dev/null -w '%{http_code}\n' https://localhost:8443/
+# 502 until you configure a real upstream — the TLS handshake is what works.
 ```
 
 Point it at your domains when you are ready:
@@ -177,9 +180,8 @@ line instead; the package then depends on glibc 2.36 rather than 2.38.
 |---|---|
 | `/usr/bin/uping` | the binary |
 | `/usr/lib/systemd/system/uping.service` | unit, ambient capability, no `setcap` |
-| `/usr/lib/tmpfiles.d/uping.conf` | creates `/var/lib/uping` |
 | `/usr/share/man/man8/uping.8.gz` | `man uping` |
-| `/usr/share/uping/` | default and example config, static landing page |
+| `/usr/share/uping/` | default and example configuration |
 | `/usr/share/doc/uping/` | README, README.Debian, copyright |
 | `/etc/uping/config.toml` | your configuration |
 | `/var/lib/uping/` | CA, leaves, writable state |

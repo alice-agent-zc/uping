@@ -39,10 +39,9 @@ signal-hook = "0.3"
 # listener, so "this address does not exist yet" is caught before a panic.
 socket2 = "0.6"
 
-# Debian package metadata. The packaging files (unit, tmpfiles, maintainer
-# scripts, configs, man page, static page) live under `packaging/`. Build the
-# binary inside the release's glibc before `cargo deb --no-build`; CONTRIBUTING
-# has the exact container command.
+# Debian package metadata. The package sources (unit, maintainer scripts,
+# configs, man page) live under `debian/`. Build the binary inside the release's
+# glibc before `cargo deb --no-build`; CONTRIBUTING has the exact command.
 [package.metadata.deb]
 maintainer = "tetuaoro <65575727+tetuaoro@users.noreply.github.com>"
 copyright = "2026, tetuaoro"
@@ -52,15 +51,13 @@ depends = "$auto"
 recommends = "systemd"
 section = "net"
 priority = "optional"
-maintainer-scripts = "packaging/debian"
+maintainer-scripts = "debian"
 assets = [
     ["target/release/uping", "usr/bin/", "755"],
-    ["packaging/uping.service", "usr/lib/systemd/system/", "644"],
-    ["packaging/uping.tmpfiles.conf", "usr/lib/tmpfiles.d/uping.conf", "644"],
+    ["debian/uping.service", "usr/lib/systemd/system/", "644"],
     ["config.toml.example", "usr/share/uping/config.toml.example", "644"],
-    ["packaging/config.toml.default", "usr/share/uping/config.toml.default", "644"],
-    ["packaging/www/index.html", "usr/share/uping/www/index.html", "644"],
-    ["packaging/uping.8", "usr/share/man/man8/uping.8", "644"],
-    ["packaging/README.Debian", "usr/share/doc/uping/README.Debian", "644"],
+    ["debian/config.toml.default", "usr/share/uping/config.toml.default", "644"],
+    ["debian/uping.8", "usr/share/man/man8/uping.8", "644"],
+    ["debian/README.Debian", "usr/share/doc/uping/README.Debian", "644"],
     ["README.md", "usr/share/doc/uping/README.md", "644"],
 ]

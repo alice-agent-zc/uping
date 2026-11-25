@@ -1,11 +1,11 @@
 # uping — default configuration installed by the Debian package.
 #
-# It is deliberately harmless: loopback only, a static page on
-# https://localhost:8443, and a certificate from uping's own CA (no ACME, no
-# network). It exists so that `dpkg -i` leaves a working service you can look
-# at before you have decided on any domain.
+# This is a placeholder, deliberately harmless: loopback only, and a local-CA
+# certificate for `localhost`, so the service starts and proves TLS without
+# binding :80/:443 or contacting an ACME server. Nothing listens on
+# 127.0.0.1:9, so requests answer 502 until you point the upstream at a real
+# service. Replace it with your domains:
 #
-# Replace this file with your own when you are ready:
 #   sudo editor /etc/uping/config.toml
 #   sudo -u uping /usr/bin/uping --check /etc/uping/config.toml
 #   sudo systemctl restart uping
@@ -19,12 +19,13 @@ https = 8443
 
 # uping's own CA. Clients install /var/lib/uping/internal/ca/root.crt once.
 [internal]
-domain   = "localhost"          # the only zone this CA signs
+domain   = "localhost"
 ca_dir   = "/var/lib/uping/internal/ca"
 cert_dir = "/var/lib/uping/internal"
 
 [[server]]
 domain     = "localhost"
 keys       = "internal"
-root       = "/usr/share/uping/www"
 serve_http = false
+health     = false
+upstream   = "127.0.0.1:9"

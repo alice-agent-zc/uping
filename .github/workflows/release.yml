@@ -13,7 +13,7 @@ run-name: release ${{ github.event.inputs.tag || github.ref_name }}
 # Asset layout:
 #   uping-<target>.tar.gz         uping, config.toml.example, uping.service, uping.8
 #   uping-<target>.tar.gz.sha256  bare "<hash>  <file>" from sha256sum
-#   uping_<version>_amd64.deb     system package (binary, unit, tmpfiles, docs)
+#   uping_<version>_amd64.deb     system package (binary, unit, man, docs)
 on:
   push:
     tags: ["v*"]
@@ -80,7 +80,7 @@ jobs:
           strip dist/uping
           cp config.toml.example dist/config.toml.example
           cp uping.service dist/uping.service
-          cp packaging/uping.8 dist/uping.8
+          cp debian/uping.8 dist/uping.8
           # tar -C dist writes the archive beside the workflow's cwd, so the
           # checksum is taken there too.
           tar -C dist -czf "uping-$TARGET.tar.gz" \

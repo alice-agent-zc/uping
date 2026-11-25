@@ -16,13 +16,15 @@ That is the whole install. The post-installation script:
 * enables and starts `uping.service`.
 
 The default is deliberately harmless: it listens on `127.0.0.1:8080` and
-`127.0.0.1:8443`, serves the static page `/usr/share/uping/www/index.html` on
-`https://localhost:8443`, and signs that certificate with uping's own CA. No
-network access, no ACME, no public port. Check it:
+`127.0.0.1:8443`, obtains a `localhost` certificate from uping's own CA, and
+points at a placeholder upstream. No network access, no ACME, no public port.
+The service starts and the TLS handshake works; requests answer `502` until an
+upstream is configured. Check it:
 
     man uping
     systemctl status uping
-    sudo curl --cacert /var/lib/uping/internal/ca/root.crt https://localhost:8443/
+    curl -sS --cacert /var/lib/uping/internal/ca/root.crt \
+      -o /dev/null -w '%{http_code}\n' https://localhost:8443/
 
 ## Moving to your domains
 
@@ -66,11 +68,9 @@ holds nothing else. There is no `setcap` to re-apply after an upgrade.
 
     /usr/bin/uping                                  the binary
     /usr/lib/systemd/system/uping.service           the system unit
-    /usr/lib/tmpfiles.d/uping.conf                  creates /var/lib/uping
     /usr/share/man/man8/uping.8.gz                  man uping
     /usr/share/uping/config.toml.default            the installed default
     /usr/share/uping/config.toml.example            commented template
-    /usr/share/uping/www/                           the default landing page
     /usr/share/doc/uping/                           README.md, README.Debian, copyright
     /etc/uping/config.toml                          your configuration
     /var/lib/uping/                                 CA, leaves, writable state

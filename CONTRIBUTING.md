@@ -274,37 +274,35 @@ Use one shape per host for a given port.
 
 ## Debian package
 
-`cargo deb` reads `[package.metadata.deb]` from `Cargo.toml`. The files it
-installs live in `packaging/`:
+`cargo deb` reads `[package.metadata.deb]` from `Cargo.toml`. The package
+sources live in `debian/`, the standard Debian location:
 
 ```
-packaging/uping.service         system unit: User=uping, ambient bind capability
-packaging/uping.tmpfiles.conf   creates /var/lib/uping, owner uping, mode 0750
-packaging/uping.8               man page; cargo-deb installs it gzipped as
-                                /usr/share/man/man8/uping.8.gz
-packaging/config.toml.default   the working default installed on a fresh install
-config.toml.example              commented template (shipped as /usr/share/uping/...)
-packaging/www/index.html        the page the default serves on https://localhost:8443
-packaging/README.Debian         install, paths, upgrade and purge notes
-packaging/debian/postinst       user, data dir, default config, enable and start
-packaging/debian/prerm          stops the unit on remove
-packaging/debian/postrm         disables the unit; keeps /etc and /var/lib
+debian/uping.service        system unit: User=uping, ambient bind capability
+debian/uping.8              man page; cargo-deb installs it gzipped as
+                            /usr/share/man/man8/uping.8.gz
+debian/config.toml.default  placeholder default, copied only when absent
+debian/README.Debian        install, paths, upgrade and purge notes
+debian/postinst             user, data dir, default config, enable and start
+debian/prerm                stops the unit on remove
+debian/postrm               disables the unit; keeps /etc and /var/lib
+config.toml.example         commented template (shipped as /usr/share/uping/...)
 ```
 
-The `packaging/debian/` maintainer scripts are the only shell in the tree. That
-is not a choice: dpkg runs those files itself, and they are what makes `dpkg -i`
-create the user, the default configuration and the enabled service. Everything
-else (build, test, release) is plain commands in this document.
+The `debian/` maintainer scripts are the only shell in the tree. That is not a
+choice: dpkg runs those files itself, and they are what makes `dpkg -i` create
+the user, the default configuration and the enabled service. Everything else
+(build, test, release) is plain commands in this document.
 
 Four rules shape it:
 
 * **`dpkg -i` is the whole install.** The postinst creates the user and group
   (`adduser` if present, `useradd`/`groupadd` otherwise — minimal containers
-  have neither adduser nor systemd-tmpfiles), the data directory, a working
-  default configuration, then enables and starts the unit. It distinguishes a
-  fresh install from an upgrade with `$2` (empty on a fresh install): a fresh
-  install starts the default, an upgrade only `try-restart`s a unit that is
-  already enabled, so a service the admin disabled stays disabled.
+  have neither), `/var/lib/uping`, a default configuration, then enables and
+  starts the unit. It distinguishes a fresh install from an upgrade with `$2`
+  (empty on a fresh install): a fresh install starts the default, an upgrade
+  only `try-restart`s a unit that is already enabled, so a service the admin
+  disabled stays disabled.
 * **An existing configuration is never replaced.** The package does not ship
   `/etc/uping/config.toml` in its archive; the postinst copies
   `config.toml.default` there only when the file is absent. There is no
@@ -319,10 +317,14 @@ Four rules shape it:
   `/usr/share/man/man8/` and is simply absent on images that exclude man pages;
   `man uping` is the standard path, not a promise that every image has it.
 
-The default config is loopback-only on purpose: `127.0.0.1:8080`/`:8443`, a
-static page from `/usr/share/uping/www`, and a `localhost` leaf from the local
-CA. Installing a package must not bind `:80`/`:443`, contact an ACME server, or
-compete with a webserver that is already running.
+The service user follows the Debian convention: system account, no home
+directory (`/nonexistent`), no login shell, and `/var/lib/uping` as the only
+writable path. The default config is loopback-only on purpose:
+`127.0.0.1:8080`/`:8443`, a `localhost` leaf from the local CA, and a
+placeholder upstream on `127.0.0.1:9` with health checks off, so the unit
+starts and proves TLS without binding `:80`/`:443`, contacting an ACME server,
+or competing with a webserver that is already running. It answers `502` until
+an upstream is configured.
 
 The `.deb` must be built where the target glibc lives: this host's is newer
 than the release runner's, so the compile happens inside the release image and
@@ -358,8 +360,9 @@ docker run --rm -v "$PWD/target/debian:/debs:ro" ubuntu:24.04 sh -euc '
 
 That covers the parts that only exist after dpkg ran: the user and group, the
 data directory, the default `/etc/uping/config.toml` with a passing `--check`,
-the man page in the archive, and a purge that keeps the CA. To watch the
-installed default serve its page, add `curl` and run:
+the man page in the archive, and a purge that keeps the CA. To prove the
+installed default serves TLS with its own CA, add `curl` and check the handshake
+(the placeholder upstream answers `502`):
 
 ```sh
 docker run --rm -v "$PWD/target/debian:/debs:ro" ubuntu:24.04 sh -euc '
@@ -367,9 +370,10 @@ docker run --rm -v "$PWD/target/debian:/debs:ro" ubuntu:24.04 sh -euc '
     apt-get install -y -qq --no-install-recommends /debs/uping_*.deb curl
     runuser -u uping -- /usr/bin/uping /etc/uping/config.toml &
     sleep 2
-    curl -fsS --resolve localhost:8443:127.0.0.1 \
-        --cacert /var/lib/uping/internal/ca/root.crt https://localhost:8443/ \
-        | grep "uping is running"'
+    code=$(curl -sS --resolve localhost:8443:127.0.0.1 \
+        --cacert /var/lib/uping/internal/ca/root.crt \
+        -o /dev/null -w "%{http_code}" https://localhost:8443/)
+    test "$code" = 502'
 ```
 
 For a wider baseline, use `debian:12` instead of `ubuntu:24.04` in the build
