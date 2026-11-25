@@ -14,5 +14,5 @@ cert/
 # pull` from conflicting with the running deployment.
 config.toml
 
-# Debian packages built by packaging/build-deb.sh.
+# Debian packages built by `cargo deb`.
 *.deb
