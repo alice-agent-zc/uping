@@ -14,6 +14,9 @@ run-name: release ${{ github.event.inputs.tag || github.ref_name }}
 #   uping-<target>.tar.gz         uping, config.toml.example, uping.8
 #   uping-<target>.tar.gz.sha256  bare "<hash>  <file>" from sha256sum
 #   uping_<version>_amd64.deb     system package (binary, unit, man, docs)
+#   uping_amd64.deb               the same package under a version-less name,
+#   uping_amd64.deb.sha256        so install.sh can fetch "latest" by URL
+#   install.sh                    the curl installer from this tag
 on:
   push:
     tags: ["v*"]
@@ -105,6 +108,9 @@ jobs:
           gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 \
             || gh release create "$TAG" --repo "$GITHUB_REPOSITORY" \
                  --title "uping $TAG" --generate-notes
+          deb=$(ls target/debian/uping_*_amd64.deb)
+          cp "$deb" uping_amd64.deb
+          sha256sum uping_amd64.deb > uping_amd64.deb.sha256
           gh release upload "$TAG" --repo "$GITHUB_REPOSITORY" --clobber \
             uping-"$TARGET".tar.gz uping-"$TARGET".tar.gz.sha256 \
-            target/debian/uping_*.deb
+            "$deb" uping_amd64.deb uping_amd64.deb.sha256 install.sh

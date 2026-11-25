@@ -1,0 +1,10 @@
+# The product is Rust. These files are shell, YAML, TOML or roff because the
+# platform needs them, not because they are the code base: keep GitHub's
+# language bar at 100% Rust.
+*.sh linguist-detectable=false
+*.yml linguist-detectable=false
+*.toml linguist-detectable=false
+*.8 linguist-detectable=false
+debian/postinst linguist-detectable=false
+debian/prerm linguist-detectable=false
+debian/postrm linguist-detectable=false

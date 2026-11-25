@@ -304,12 +304,16 @@ debian/postinst             user, data dir, default config, enable and start
 debian/prerm                stops the unit on remove
 debian/postrm               disables the unit; keeps /etc and /var/lib
 config.toml.example         commented template (shipped as /usr/share/uping/...)
+install.sh                  the curl installer: fetch, verify, apt/dpkg install
 ```
 
-The `debian/` maintainer scripts are the only shell in the tree. That is not a
-choice: dpkg runs those files itself, and they are what makes `dpkg -i` create
-the user, the default configuration and the enabled service. Everything else
-(build, test, release) is plain commands in this document.
+`install.sh` and the `debian/` maintainer scripts are the only shell in the
+tree. dpkg runs the maintainer scripts itself, and they are what makes
+`dpkg -i` create the user, the default configuration and the enabled service;
+`install.sh` is the user-facing entry point for a release. `.gitattributes`
+marks the installer, the maintainer scripts, the CI YAML, the config TOML and
+the man page `linguist-detectable=false`, so GitHub reports the repository as
+100% Rust. Everything else (build, test, release) is plain commands here.
 
 Four rules shape it:
 
@@ -411,10 +415,11 @@ git push origin v0.4.0
 Two workflows run on `v*` tags:
 
 - `.github/workflows/release.yml` — builds the Linux binary, runs the tests,
-  packages `uping-<target>.tar.gz` + `.sha256` and the
-  `uping_<version>_amd64.deb`, and creates/updates the GitHub release. It uses
-  the built-in `GITHUB_TOKEN`; `permissions: contents: write` is already set, so
-  there is no secret to add.
+  packages `uping-<target>.tar.gz` + `.sha256`, `uping_<version>_amd64.deb`,
+  and a version-less `uping_amd64.deb` + `.sha256` for `install.sh` to fetch
+  under `releases/latest/download/`, then uploads `install.sh` from the tag too.
+  It uses the built-in `GITHUB_TOKEN`; `permissions: contents: write` is
+  already set, so there is no secret to add.
 - `.github/workflows/crates.yml` — publishes the crate to crates.io. It needs
   **`CARGO_REGISTRY_TOKEN`**, holding a crates.io API token scoped to `uping`.
   Put it in the GitHub Environment named **`crates.io`** (Settings →

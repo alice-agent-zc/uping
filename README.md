@@ -151,6 +151,22 @@ resolver.
 
 ## Debian package
 
+### From a published release
+
+GitHub builds the `.deb` on every `v*` tag and attaches it to the release. The
+installer fetches `uping_amd64.deb`, verifies its published sha256, and installs
+it with `apt` or `dpkg`:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/raonagos/uping/main/install.sh | sudo sh
+```
+
+Pin a release with `... | sudo sh -s -- --version v0.4.0`. It installs the same
+package described below: the service user, `/var/lib/uping`, a loopback default
+configuration, `man uping`, and the unit.
+
+### Build it yourself
+
 The repository also builds a `.deb` for the system deployment, and installing
 it is one command:
 
