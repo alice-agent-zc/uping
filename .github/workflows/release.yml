@@ -11,7 +11,7 @@ run-name: release ${{ github.event.inputs.tag || github.ref_name }}
 # deliberate: it can replace a published asset.
 #
 # Asset layout:
-#   uping-<target>.tar.gz         uping, config.toml.example, uping.service, uping.8
+#   uping-<target>.tar.gz         uping, config.toml.example, uping.8
 #   uping-<target>.tar.gz.sha256  bare "<hash>  <file>" from sha256sum
 #   uping_<version>_amd64.deb     system package (binary, unit, man, docs)
 on:
@@ -79,12 +79,11 @@ jobs:
           cp target/"$TARGET"/release/uping dist/uping
           strip dist/uping
           cp config.toml.example dist/config.toml.example
-          cp uping.service dist/uping.service
           cp debian/uping.8 dist/uping.8
           # tar -C dist writes the archive beside the workflow's cwd, so the
           # checksum is taken there too.
           tar -C dist -czf "uping-$TARGET.tar.gz" \
-            uping config.toml.example uping.service uping.8
+            uping config.toml.example uping.8
           sha256sum "uping-$TARGET.tar.gz" > "uping-$TARGET.tar.gz.sha256"
           ls -l uping-"$TARGET".tar.gz*
           cat uping-"$TARGET".tar.gz.sha256

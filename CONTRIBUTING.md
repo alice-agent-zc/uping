@@ -93,7 +93,6 @@ tests/
   sighup_e2e.rs    # SIGHUP, bad config, listener warning
   static_e2e.rs    # static serving through the real binary
   stream_e2e.rs    # raw TCP through the real binary
-uping.service      # user unit for a ~/uping checkout
 ```
 
 ### Config
@@ -284,9 +283,9 @@ Two supported shapes, same binary:
 * **The `~/uping` checkout**, for a single-user host or a development machine:
   `target/release/uping` with `config.toml` and `cert/` beside it. The binary
   carries `CAP_NET_BIND_SERVICE` via `setcap`, which a rebuild drops, so
-  re-apply it. `uping.service` in the repository root is the user unit for this
-  shape; it can order itself after `rupa.service` when both run in the same
-  user manager.
+  re-apply it. No unit is shipped for this shape: run it in the foreground, or
+  write your own user unit (the package's unit is the supported service
+  deployment).
 
 Use one shape per host for a given port.
 

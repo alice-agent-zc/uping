@@ -108,9 +108,10 @@ sudo setcap 'cap_net_bind_service=+ep' target/release/uping
 ```
 
 The capability lives on the binary and is lost on every rebuild; re-apply
-`setcap` after `cargo build --release`. The repository ships
-[`uping.service`](uping.service), a user unit for this `~/uping` checkout; it
-can order itself after `rupa.service` when both run in the same user manager.
+`setcap` after `cargo build --release`. For a service that starts at boot, use
+the Debian package below: it ships the system unit with the capability baked
+into the unit, so there is no `setcap` to re-apply. The checkout is a
+foreground process, or a unit of your own.
 For build/test notes, architecture and the release procedure, see
 **[CONTRIBUTING.md](CONTRIBUTING.md)**.
 
