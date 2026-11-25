@@ -1,0 +1,143 @@
+.\" uping(8) — manual page for the Debian package.
+.TH UPING 8 "2026-11-22" "uping 0.4.0" "System Administration"
+.SH NAME
+uping \- TOML-configured reverse proxy with automatic HTTPS, static files and raw TCP forwarding
+.SH SYNOPSIS
+.B uping
+.RI [ CONFIG ]
+.RB [ \-\-check | \-\-dry\-run | \-\-dns\-zone | \-\-dump\-config ]
+.SH DESCRIPTION
+.B uping
+terminates TLS for one or more domains and forwards each of them to a local
+backend or a directory of files. One HTTPS listener answers every configured
+name by SNI, and plain HTTP is redirected to it; a domain can also get its own
+listener with
+.IR https_listen .
+.PP
+Certificates come from one of three places, chosen per domain with
+.IR keys :
+public ACME such as Let's Encrypt
+.RB ( auto ),
+uping's own certificate authority
+.RB ( internal ),
+which generates a root and an intermediate on first start, has the intermediate
+sign only
+.I [internal] domain
+and its subdomains with no network access at all, and can publish the root at
+the
+.I [internal] serve_root
+URL; or two PEM files you provide
+.RB ( manual ).
+.PP
+A
+.I [[server]]
+entry may proxy to an upstream, serve a directory, or split the path with
+.IR routes ;
+per-IP request and connection limits, upstream health checks and an
+raw TCP forwarder
+.RB ( [[stream]] )
+are also available.
+.PP
+The configuration is read once at startup and again on
+.BR SIGHUP .
+Relative paths in it resolve against the directory that holds the file.
+.SH OPTIONS
+.TP
+.I CONFIG
+Path to the configuration file. Defaults to
+.I config.toml
+in the working directory.
+.TP
+.BI \-h ", " \-\-help
+Print the help text and exit.
+.TP
+.BR \-V ", " \-\-version
+Print the version and exit.
+.TP
+.BR \-\-check ", " \-\-dry\-run
+Validate
+.I CONFIG
+strictly, the way a review would, and exit. Nothing is bound, nothing is written and no
+certificate is requested: a domain whose certificate is still missing is
+reported as pending, not as an error. Exit status 0 means the file would load.
+.TP
+.B \-\-dump\-config
+Print the effective configuration as TOML, defaults included, then exit. Entries
+that a start would skip are reported as warnings on standard error, so this is
+also a diagnosis of a valid but misconfigured file.
+.TP
+.B \-\-dns\-zone
+Print
+.BR hosts (5)
+records, one line per configured domain and address family, for the private
+resolver of a VPN setup. A wildcard listen address is refused, because a record
+must name a real address. Nothing is written.
+.SH FILES
+.TP
+.I /etc/uping/config.toml
+The system configuration. The package installs a loopback-only default when the
+file does not exist and never overwrites it afterwards.
+.TP
+.I /var/lib/uping
+Writable state owned by the
+.I uping
+user: the local CA and the generated leaves.
+.TP
+.I /usr/share/uping/config.toml.example
+A commented template with the public, private and static shapes.
+.TP
+.I /usr/share/doc/uping/
+The user manual
+.RI ( README.md )
+and the package notes
+.RI ( README.Debian ).
+.SH SIGNALS
+.TP
+.B SIGHUP
+Re-read the configuration and apply what can change without rebinding: domains,
+upstreams, static roots, routes, limits, health settings, certificates and the
+domains each listener answers. An invalid file is logged and the running
+configuration is kept. Changes to
+.IR [listen] ,
+.IR https_listen ,
+.IR [[stream]] ,
+.I [acme]
+or
+.I [internal]
+need a restart.
+.TP
+.B SIGTERM ", " SIGINT
+Stop serving and exit.
+.SH SERVICE
+The package ships a system unit that runs as the unprivileged
+.I uping
+user with an ambient
+.B CAP_NET_BIND_SERVICE
+capability:
+.PP
+.RS 4
+systemctl enable \-\-now uping
+.br
+systemctl reload uping
+.br
+systemctl restart uping
+.RE
+.SH EXIT STATUS
+.TP
+.B 0
+Normal shutdown, or a successful
+.BR \-\-check ,
+.B \-\-dns\-zone
+or
+.B \-\-dump\-config
+run.
+.TP
+.B 1
+The configuration could not be read, parsed or validated, or the service could
+not start.
+.SH SEE ALSO
+.BR systemd.service (5),
+.BR hosts (5)
+.PP
+The full configuration reference is the README shipped in
+.IR /usr/share/doc/uping/ .

@@ -13,7 +13,11 @@ uping is a single Rust binary. Building it needs:
 - **CMake.** The HTTP stack pins `flate2` to the `zlib-ng` backend, and
   `libz-ng-sys` builds that backend with CMake. Without `cmake` on `PATH` the
   build stops several crates deep, with an error that never mentions CMake.
-- OpenSSL development headers (`libssl-dev` on Debian/Ubuntu).
+- **Perl.** `pingora-openssl` enables `openssl/vendored`, so `openssl-sys`
+  compiles OpenSSL from its C sources during the build (Perl's `Configure`
+  plus the C toolchain). System `libssl-dev` headers are not needed, and the
+  resulting binary links libcrypto statically: `ldd` on the Linux build shows
+  only libc, libm and libgcc.
 
 TLS is on the **OpenSSL** backend deliberately: dynamic per-SNI certificate
 selection — one listener, many domains — only exists for OpenSSL/BoringSSL in
@@ -52,6 +56,10 @@ The suite needs no root, no network and no certificate checked into the tree:
   :80 and still works on :443;
 - `--dns-zone` (`tests/dns_zone_e2e.rs`): records, a wildcard refusal, and the
   `--check` conflict;
+- the local CA (`src/internal_ca.rs` unit tests): an Ed25519 root and leaf that
+  chains, `alt_names` in the same leaf, a second run that reuses the pair, a
+  pair signed by another root replaced, a half root pair refused, and `/root.crt`
+  over HTTP;
 - a SIGHUP config-swap test: new root, invalid TOML, listener change;
 - end-to-end static serving and raw TCP forwarding.
 
@@ -66,13 +74,15 @@ src/
   sighup.rs        # SIGHUP -> swap routes/certs/limits/domains
   tls.rs           # SNI resolver; renewals replace entries live
   acme.rs          # account, http-01 orders, storage, renewal thread
+  internal_ca.rs   # keys = "internal": zone-scoped CA, leaves, TLS root endpoint
   static_files.rs  # safe path resolution + streamed files
   health.rs        # upstream probes, 503 when a backend is down
   limits.rs        # per-IP, per-domain rate + connection limiters
   proxy.rs         # HTTPS proxy, HTTP redirect + ACME challenge path
-  stream.rs        # experimental raw TCP forwarder
+  stream.rs        # raw TCP forwarder
 tests/
   config_check.rs  # bad-config corpus and --check
+  (internal_ca.rs)  # root/leaf generation, SANs, reuse, half-root refusal
   acme_e2e.rs      # fake ACME CA over TLS, real first start
   route_e2e.rs     # routes inside their server
   listen_e2e.rs    # a per-server listener and its 421 isolation
@@ -83,7 +93,6 @@ tests/
   sighup_e2e.rs    # SIGHUP, bad config, listener warning
   static_e2e.rs    # static serving through the real binary
   stream_e2e.rs    # raw TCP through the real binary
-uping.service      # user unit for a ~/uping checkout
 ```
 
 ### Config
@@ -131,19 +140,17 @@ The HTTP challenge listener follows an ACME server's explicit
 `Config::http_addrs`. That is what lets a private site on the rupa VPN answer
 http-01 on `10.8.0.1:80` without a second address setting.
 
-Startup issuance is best effort: `obtain_missing` returns whether every order
-succeeded, and a failure is logged rather than returned as an error. Only
-failing to bind the temporary `:80` listener aborts startup. A failed startup
+Startup issuance is best effort: `obtain_missing` returns whether every pair
+was obtained, and a failure is logged rather than returned as an error — even a
+temporary `:80` listener that cannot bind is now a warning. A failed startup
 order delays the renewal thread's first pass by an hour; a clean start checks
 after 30 seconds. This is deliberate: an exited process under a supervisor
 would be restarted every few seconds and exhaust the failed-authorization rate
 limit. Do not turn an order failure back into a fatal startup error.
 
-Two profiles exist: the public `[acme]` directory and the private
-`[acme.internal]` directory. The account file is hashed by directory URL, so
-public and private CAs never share one. `ca_bundle` is the trust anchor for
-uping's connection to the ACME server; client trust is separate and is the
-operator's responsibility.
+The local CA has no account and no directory. `ca_bundle` (when `[acme]` uses a
+custom server) is the trust anchor for uping's connection to the ACME server;
+client trust is separate and is the operator's responsibility.
 
 ### Limits
 
@@ -166,34 +173,94 @@ unresolved address. A down backend is answered with a static `503` page and
 The `SIGHUP` handler re-reads the same file and validates the whole candidate
 before touching live state. Routes, limits, health, `[tls] fallback_cert`, manual
 certificates and listener domain sets are applied live. `[listen]`,
-`https_listen`/`https_listen6`, `[[stream]]`, `[acme]` and `[acme.internal]`
+`https_listen`/`https_listen6`, `[[stream]]`, `[acme]` and `[internal]`
 require a restart and are reported as such.
+
+### Local CA
+
+`keys = "internal"` never talks to a network. `internal_ca.rs` builds a
+two-level PKI: a root signs an intermediate, the intermediate signs the leaves.
+Clients install the root only; the server sends `leaf + intermediate`. Ed25519
+by default, `alt_names` in the SAN list, renewed before expiry on the same
+hourly loop as ACME. Files are written atomically (`.<name>.tmp-<pid>` then
+rename) with `0644` for certificates and `0600` for keys.
+
+The CA signs one zone only, `[internal] domain`: a name outside it is rejected
+when the config loads and again at issuance, so the CA cannot accidentally
+vouch for someone else's name. An intermediate that is due is rotated when the
+root key is present; after the first start `root.key` may be moved offline,
+because leaf issuance only needs `intermediate.key`. A root without an
+intermediate (an early v0.4 tree) gets one created under it, so the root the
+clients installed stays valid. A missing half of the root pair, or of the
+intermediate pair, is refused rather than silently regenerated: a new root
+would strand every client.
+
+`serve_root` is a URL, not an address: the endpoint's host gets a leaf from the
+same CA, so it presents a certificate chaining to the root it serves. The
+listener resolves the host (normally the VPN address), binds the first address
+that accepts it (IPv4 first), and serves only `GET|HEAD /root.crt` over TLS.
+Resolution and binding are best-effort: a host that is not up yet is a warning,
+like any other listener.
+
+Generation is in-process through the `openssl` crate — the same libcrypto the
+proxy already uses for TLS. No shell command, no `step-ca`, no `certbot`, no
+ACME client. `PKey::generate_ed25519` is the default; `EcKey::generate` covers
+P-256 and `Rsa::generate` RSA-2048. An `X509Builder` sets CN plus the configured
+identity fields (O, OU, C, ST, L, emailAddress — omitted when empty), the SAN
+list, critical Basic Constraints (`CA:TRUE, pathlen:1` root, `pathlen:0`
+intermediate, `CA:FALSE` leaf), Key Usage, the `serverAuth` EKU on leaves, and
+Subject/Authority Key Identifiers. Ed25519 is signed with
+`MessageDigest::null()` — OpenSSL signs the message itself and rejects a digest
+there — while P-256 and RSA use SHA-256. `rcgen` was not pulled in: it would be
+a second X.509 implementation for no gain, and OpenSSL is already linked and
+already required by pingora's dynamic SNI callbacks.
+Resolution and binding are best-effort, because the VPN address may arrive
+after uping starts.
+
+### Lenient load and `--dump-config`
+
+`Config::load` is strict and is what `--check` uses. A running process uses
+`Config::load_lenient`, which returns the usable configuration plus a list of
+warnings: a server, route or stream that cannot be validated is dropped, a
+duplicate domain is dropped after the first, listener groups that would bind
+conflicting sockets are reduced to the first one (identical listeners merge),
+and optional global fields are repaired (health values clamped, `[acme]` reset,
+`[internal]` sanitized). Two servers sharing an upstream, or the exact same
+listener, are not conflicts.
+
+Structural failures stay fatal because nothing can be guessed: TOML syntax, a
+`[listen]` with no usable address, or no usable entry left after the skips.
+`main` logs every warning as `config: ...`; a SIGHUP reload does the same and
+applies the reduced configuration. `Config::to_toml` serializes the effective
+configuration (defaults included) and backs `--dump-config`; the tests assert
+that the dump parses back as TOML.
+
+### Failure isolation
+
+A domain is not the process. A missing manual pair, an unwritable CA directory,
+a CA that refuses an order and a listener address that does not exist yet are all
+`log::warn` and skip that domain or socket; the other domains keep serving. The
+listener probe in `main.rs` mirrors pingora's own socket (`SO_REUSEADDR`) because
+pingora panics on a failed bind, which would take every listener of that service
+down with it.
 
 ### Streams
 
 `[[stream]]` is a `ServerApp` listener that copies bytes both ways and forwards
-half-close. It is experimental: keep that label in config, docs and
-error messages.
+half-close. It is stable since v0.4: what it does is one listener per entry, no
+TLS termination, and the upstream owns the protocol. `tests/stream_e2e.rs`
+drives the compiled binary for the raw forward, the half-close drain, a dead
+upstream and a `0.0.0.0` bind.
 
 ## Running it locally
 
 `test.config.toml` listens on `127.0.0.1:8088`/`:8443` and proxies to
-`127.0.0.1:8080`. It expects a `test.local` pair in `certs/`:
+`127.0.0.1:8080`. `keys = "internal"` makes uping create its own CA and leaf
+under `cert/internal/` on first start, so there is nothing to generate first:
 
 ```sh
-mkdir -p certs
-openssl req -x509 -newkey rsa:2048 -nodes -days 365 \
-  -keyout certs/test.local.key \
-  -out certs/test.local.crt \
-  -subj "/CN=test.local" \
-  -addext "subjectAltName=DNS:test.local"
-```
-
-Then, in one terminal a throwaway backend and in another uping:
-
-```sh
-python3 -m http.server 8080
-cargo run -- test.config.toml
+python3 -m http.server 8080        # in one terminal
+cargo run -- test.config.toml      # in another
 ```
 
 ```sh
@@ -201,15 +268,139 @@ curl -k  --resolve test.local:8443:127.0.0.1 https://test.local:8443/
 curl -i  --resolve test.local:8088:127.0.0.1 http://test.local:8088/   # 301
 ```
 
-`-k` for the self-signed cert, `--resolve` because `test.local` is not in DNS
-(the handshake needs an SNI hostname).
+`-k` because the leaf is signed by the local CA (trust
+`cert/internal/ca/root.crt` to drop it), `--resolve` because `test.local` is not
+in DNS (the handshake needs an SNI hostname).
 
 ## Deployment
 
-Production is the `~/uping` checkout: `target/release/uping` with `config.toml`
-and `cert/` beside it. The binary carries `CAP_NET_BIND_SERVICE` via `setcap`,
-so the process stays an ordinary user. `uping.service` is the user unit; it can
-order itself after `rupa.service` when both run in the same user manager.
+Two supported shapes, same binary:
+
+* **The Debian package** (next section) for the standard directories:
+  `/usr/bin/uping`, `/etc/uping/config.toml`, `/var/lib/uping`, a system unit
+  with an ambient bind capability. `dpkg -i` also creates the service user and
+  a working loopback default.
+* **The `~/uping` checkout**, for a single-user host or a development machine:
+  `target/release/uping` with `config.toml` and `cert/` beside it. The binary
+  carries `CAP_NET_BIND_SERVICE` via `setcap`, which a rebuild drops, so
+  re-apply it. No unit is shipped for this shape: run it in the foreground, or
+  write your own user unit (the package's unit is the supported service
+  deployment).
+
+Use one shape per host for a given port.
+
+## Debian package
+
+`cargo deb` reads `[package.metadata.deb]` from `Cargo.toml`. The package
+sources live in `debian/`, the standard Debian location:
+
+```
+debian/uping.service        system unit: User=uping, ambient bind capability
+debian/uping.8              man page; cargo-deb installs it gzipped as
+                            /usr/share/man/man8/uping.8.gz
+debian/config.toml.default  placeholder default, copied only when absent
+debian/README.Debian        install, paths, upgrade and purge notes
+debian/postinst             user, data dir, default config, enable and start
+debian/prerm                stops the unit on remove
+debian/postrm               disables the unit; keeps /etc and /var/lib
+config.toml.example         commented template (shipped as /usr/share/uping/...)
+install.sh                  the curl installer: fetch, verify, apt/dpkg install
+```
+
+`install.sh` and the `debian/` maintainer scripts are the only shell in the
+tree. dpkg runs the maintainer scripts itself, and they are what makes
+`dpkg -i` create the user, the default configuration and the enabled service;
+`install.sh` is the user-facing entry point for a release. `.gitattributes`
+marks the installer, the maintainer scripts, the CI YAML, the config TOML and
+the man page `linguist-detectable=false`, so GitHub reports the repository as
+100% Rust. Everything else (build, test, release) is plain commands here.
+
+Four rules shape it:
+
+* **`dpkg -i` is the whole install.** The postinst creates the user and group
+  (`adduser` if present, `useradd`/`groupadd` otherwise — minimal containers
+  have neither), `/var/lib/uping`, a default configuration, then enables and
+  starts the unit. It distinguishes a fresh install from an upgrade with `$2`
+  (empty on a fresh install): a fresh install starts the default, an upgrade
+  only `try-restart`s a unit that is already enabled, so a service the admin
+  disabled stays disabled.
+* **An existing configuration is never replaced.** The package does not ship
+  `/etc/uping/config.toml` in its archive; the postinst copies
+  `config.toml.default` there only when the file is absent. There is no
+  conffile prompt, and a reinstall cannot clobber a real configuration.
+* **No `setcap`.** The unit carries `AmbientCapabilities=CAP_NET_BIND_SERVICE`
+  and a bounding set with nothing else, so the capability survives binary
+  upgrades — unlike an xattr on the file, which a rebuild silently drops.
+* **Functional files are not under `/usr/share/doc` or `/usr/share/man`.**
+  Ubuntu and Debian ship dpkg path excludes that drop both trees (only
+  `copyright` survives under doc), so the default and example configs live in
+  `/usr/share/uping/`. The man page is installed in the standard
+  `/usr/share/man/man8/` and is simply absent on images that exclude man pages;
+  `man uping` is the standard path, not a promise that every image has it.
+
+The service user follows the Debian convention: system account, no home
+directory (`/nonexistent`), no login shell, and `/var/lib/uping` as the only
+writable path. The default config is loopback-only on purpose:
+`127.0.0.1:8080`/`:8443`, a `localhost` leaf from the local CA, and a
+placeholder upstream on `127.0.0.1:9` with health checks off, so the unit
+starts and proves TLS without binding `:80`/`:443`, contacting an ACME server,
+or competing with a webserver that is already running. It answers `502` until
+an upstream is configured.
+
+The `.deb` must be built where the target glibc lives: this host's is newer
+than the release runner's, so the compile happens inside the release image and
+`cargo deb --no-build` runs on the host afterwards.
+
+```sh
+docker run --rm -v "$PWD:/src" -w /src \
+    -e CARGO_HOME=/src/target/deb-cargo \
+    -e RUSTUP_HOME=/src/target/deb-cargo/rustup \
+    -e CARGO_BUILD_JOBS=2 ubuntu:24.04 sh -euc '
+        apt-get update -qq
+        apt-get install -y -qq ca-certificates curl build-essential cmake perl
+        curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs \
+            | sh -s -- -y --profile minimal --default-toolchain 1.100.0
+        . "$CARGO_HOME/env"
+        cargo build --release --locked --target x86_64-unknown-linux-gnu'
+cargo deb --no-build --target x86_64-unknown-linux-gnu
+dpkg-deb -c target/debian/uping_*.deb      # file list and modes
+dpkg-deb -I target/debian/uping_*.deb      # control fields
+```
+
+Test the package in the image it targets, not on the build host:
+
+```sh
+docker run --rm -v "$PWD/target/debian:/debs:ro" ubuntu:24.04 sh -euc '
+    apt-get update -qq
+    apt-get install -y -qq --no-install-recommends /debs/uping_*.deb
+    id uping && test -f /etc/uping/config.toml
+    runuser -u uping -- /usr/bin/uping --check /etc/uping/config.toml
+    dpkg-deb -c /debs/uping_*.deb | grep -q usr/share/man/man8/uping.8.gz
+    dpkg -P uping >/dev/null && test -f /etc/uping/config.toml'
+```
+
+That covers the parts that only exist after dpkg ran: the user and group, the
+data directory, the default `/etc/uping/config.toml` with a passing `--check`,
+the man page in the archive, and a purge that keeps the CA. To prove the
+installed default serves TLS with its own CA, add `curl` and check the handshake
+(the placeholder upstream answers `502`):
+
+```sh
+docker run --rm -v "$PWD/target/debian:/debs:ro" ubuntu:24.04 sh -euc '
+    apt-get update -qq
+    apt-get install -y -qq --no-install-recommends /debs/uping_*.deb curl
+    runuser -u uping -- /usr/bin/uping /etc/uping/config.toml &
+    sleep 2
+    code=$(curl -sS --resolve localhost:8443:127.0.0.1 \
+        --cacert /var/lib/uping/internal/ca/root.crt \
+        -o /dev/null -w "%{http_code}" https://localhost:8443/)
+    test "$code" = 502'
+```
+
+For a wider baseline, use `debian:12` instead of `ubuntu:24.04` in the build
+command: the package then depends on glibc 2.36 rather than 2.38. The release
+workflow uses `ubuntu:24.04` for both the tarball and the package so the two
+assets agree.
 
 ## Release
 
@@ -217,16 +408,18 @@ Publishing is tag-driven. A tag names the exact commit that becomes the
 release, so the asset and the crate cannot drift from the source:
 
 ```sh
-git tag v0.3.2
-git push origin v0.3.2
+git tag v0.4.0
+git push origin v0.4.0
 ```
 
 Two workflows run on `v*` tags:
 
 - `.github/workflows/release.yml` — builds the Linux binary, runs the tests,
-  packages `uping-<target>.tar.gz` + `.sha256`, and creates/updates the GitHub
-  release. It uses the built-in `GITHUB_TOKEN`; `permissions: contents: write`
-  is already set, so there is no secret to add.
+  packages `uping-<target>.tar.gz` + `.sha256`, `uping_<version>_amd64.deb`,
+  and a version-less `uping_amd64.deb` + `.sha256` for `install.sh` to fetch
+  under `releases/latest/download/`, then uploads `install.sh` from the tag too.
+  It uses the built-in `GITHUB_TOKEN`; `permissions: contents: write` is
+  already set, so there is no secret to add.
 - `.github/workflows/crates.yml` — publishes the crate to crates.io. It needs
   **`CARGO_REGISTRY_TOKEN`**, holding a crates.io API token scoped to `uping`.
   Put it in the GitHub Environment named **`crates.io`** (Settings →
@@ -247,4 +440,5 @@ an existing tag. The tag must match `Cargo.toml`'s version.
 - Config changes update the README (defaults and examples) and
   `config.toml.example`. `config.toml` itself is git-ignored: it is the local,
   machine-specific copy.
-- Anything touching `[[stream]]` keeps it labelled experimental.
+- `[[stream]]` is stable since v0.4; changing its config shape is a normal
+  breaking-change decision, not an experiment.

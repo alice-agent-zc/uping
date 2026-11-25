@@ -1,15 +1,17 @@
 # uping
 
 A tiny, TOML-configured reverse proxy. Point a domain at a local service, let
-uping obtain the certificate, done. It also serves a directory without a
-backend, works over IPv4 and IPv6, and applies a new config on `SIGHUP` — no
-restart for a config change.
+uping obtain the certificate — from Let's Encrypt or from its own CA, with no
+external daemon — and it is done. It also serves a directory without a backend,
+works over IPv4 and IPv6, and applies a new config on `SIGHUP` without a
+restart.
 
-## Status — v0.3.2
+## Status — v0.4.0
 
 - ✅ HTTPS reverse proxy with SNI, one certificate per domain
-- ✅ Let's Encrypt (`keys = "auto"`) and private ACME CAs, including step-ca
-  (`keys = "internal"`)
+- ✅ Let's Encrypt (`keys = "auto"`), and `keys = "internal"`: uping's own CA,
+  scoped to one zone, Ed25519 by default, root published over HTTPS at
+  `serve_root`
 - ✅ Static files (`root`) and path routing (`routes = [...]`)
 - ✅ One `[listen]` for the host, plus per-domain `https_listen` / `https_listen6`
 - ✅ Private sites on a VPN address, `serve_http = false`, and `uping --dns-zone`
@@ -19,11 +21,54 @@ restart for a config change.
 - ✅ Upstream health checks (`503` at once when a backend dies), per-domain
   intervals, and HTTPS to the backend with a private CA, SNI and verify opt-out
 - ✅ Live config swap on `SIGHUP`
-- ⚠️ `[[stream]]` raw TCP forwarding is **experimental** — the mail/database
-  relay. `routes` is HTTP path routing, not the mail feature.
+- ✅ `--dump-config` prints the effective TOML, defaults included; a start skips
+  invalid or conflicting entries with a warning instead of dying
+- ✅ `.deb` for Debian/Ubuntu: `dpkg -i` creates the user, a working default on
+  loopback, `man uping`, and enables the service
+- ✅ `[[stream]]` raw TCP forwarding — the mail/database relay. `routes` is
+  HTTP path routing, not the mail feature.
 
 Not here: changing listeners or `[[stream]]` without a restart, load balancing,
-upstream mutual TLS, DNS-01.
+upstream mutual TLS, DNS-01, and wildcard SANs (SNI resolution is exact).
+
+## Inspecting the effective configuration
+
+`--dump-config` prints the TOML a start would actually use, every default
+included:
+
+```sh
+uping --dump-config /etc/uping/config.toml
+```
+
+It is the fastest way to see what a valid file really means: `[tls]
+fallback_cert`, the `[health]` intervals, `[limits]` budgets, `[acme]
+renew_before_days`, the local CA's `intermediate_days`, and the key mode the
+server inferred.
+
+A start is deliberately lenient. A `[[server]]`, a route or a `[[stream]]` that
+cannot be used is skipped with a `warn` in the log and the rest serves: a
+duplicate domain, a conflicting listener, a route without a leading `/`, an
+unusable certificate mode, an out-of-range `[health]` value (clamped) or a bad
+optional `[internal]` field (ignored) do not stop the process. Two servers may
+share the same upstream, and two servers may even share the exact same listener
+— they are merged into one group.
+
+`--check` is the strict companion: it refuses the same file with the precise
+error, which is what CI and review use. Structural problems remain fatal in
+both modes: TOML syntax, a `[listen]` that names no usable address, or a file
+with no usable entry left.
+
+### Upgrading from v0.3
+
+* `[acme.internal]` and `keys = "step-ca"` are gone. `keys = "internal"` now
+  selects uping's own CA, configured by `[internal]`: remove the old table and
+  set `domain` (the one zone it signs), `ca_dir` and `cert_dir`.
+* `[internal] serve_root` is an HTTPS URL (`https://internal.example.com:9000`),
+  not an address; the root is served over TLS at `/root.crt`.
+* `[[stream]]` is stable; its configuration is unchanged.
+* `[[server]]` and `routes` shapes are unchanged. ACME certificates under
+  `[acme] cert_dir` are untouched; local leaves live under `[internal]
+  cert_dir`.
 
 ## Quick start
 
@@ -45,8 +90,10 @@ cp config.toml.example config.toml
 $EDITOR config.toml
 ```
 
-The examples assume a checkout at `~/uping`, with `config.toml` at its root.
-Certificates and the ACME account live under `~/uping/cert`.
+The example targets the packaged system deployment (`/etc/uping/config.toml`,
+state under `/var/lib/uping`). For a `~/uping` checkout, replace
+`/var/lib/uping` with the checkout directory: certificates and the ACME account
+then live under `~/uping/cert`.
 
 ## Build and run with setcap
 
@@ -61,9 +108,10 @@ sudo setcap 'cap_net_bind_service=+ep' target/release/uping
 ```
 
 The capability lives on the binary and is lost on every rebuild; re-apply
-`setcap` after `cargo build --release`. The repository ships
-[`uping.service`](uping.service), a user unit for this `~/uping` checkout; it
-can order itself after `rupa.service` when both run in the same user manager.
+`setcap` after `cargo build --release`. For a service that starts at boot, use
+the Debian package below: it ships the system unit with the capability baked
+into the unit, so there is no `setcap` to re-apply. The checkout is a
+foreground process, or a unit of your own.
 For build/test notes, architecture and the release procedure, see
 **[CONTRIBUTING.md](CONTRIBUTING.md)**.
 
@@ -92,7 +140,7 @@ pkill -HUP -x uping
 
 The new file is validated first; an invalid file changes nothing. Changes to
 `[listen]`, `https_listen`/`https_listen6`, `[[stream]]`, `[acme]` or
-`[acme.internal]` need a restart instead: restart it through your user service
+`[internal]` need a restart instead: restart it through your user service
 manager.
 
 To upgrade, rebuild and re-apply `setcap`; the configuration and `cert/` stay
@@ -100,6 +148,89 @@ in place.
 
 `./target/release/uping --dns-zone config.toml` prints hosts records for a VPN
 resolver.
+
+## Debian package
+
+### From a published release
+
+GitHub builds the `.deb` on every `v*` tag and attaches it to the release. The
+installer fetches `uping_amd64.deb`, verifies its published sha256, and installs
+it with `apt` or `dpkg`:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/raonagos/uping/main/install.sh | sudo sh
+```
+
+Pin a release with `... | sudo sh -s -- --version v0.4.0`. It installs the same
+package described below: the service user, `/var/lib/uping`, a loopback default
+configuration, `man uping`, and the unit.
+
+### Build it yourself
+
+The repository also builds a `.deb` for the system deployment, and installing
+it is one command:
+
+```sh
+# Build in the release's glibc: the host's is newer, and a binary linked
+# against it would not run on the target. The container keeps its toolchain
+# and crate cache under target/deb-cargo, which is git-ignored.
+docker run --rm -v "$PWD:/src" -w /src \
+    -e CARGO_HOME=/src/target/deb-cargo \
+    -e RUSTUP_HOME=/src/target/deb-cargo/rustup \
+    -e CARGO_BUILD_JOBS=2 ubuntu:24.04 sh -euc '
+        apt-get update -qq
+        apt-get install -y -qq ca-certificates curl build-essential cmake perl
+        curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs \
+            | sh -s -- -y --profile minimal --default-toolchain 1.100.0
+        . "$CARGO_HOME/env"
+        cargo build --release --locked --target x86_64-unknown-linux-gnu'
+cargo deb --no-build --target x86_64-unknown-linux-gnu
+
+sudo dpkg -i target/debian/uping_*.deb
+```
+
+That is the whole install. The post-installation script creates the
+unprivileged `uping` user and group (no home directory, no login shell),
+`/var/lib/uping`, a **working default** `/etc/uping/config.toml` (loopback only,
+a `localhost` certificate from uping's own CA, a placeholder upstream), installs
+`man uping`, and enables and starts `uping.service`. Nothing has to be created
+by hand.
+
+```sh
+man uping
+systemctl status uping
+sudo curl -sS --cacert /var/lib/uping/internal/ca/root.crt \
+  -o /dev/null -w '%{http_code}\n' https://localhost:8443/
+# 502 until you configure a real upstream — the TLS handshake is what works.
+```
+
+Point it at your domains when you are ready:
+
+```sh
+sudo editor /etc/uping/config.toml
+sudo -u uping /usr/bin/uping --check /etc/uping/config.toml
+sudo systemctl restart uping
+```
+
+The package never overwrites a `/etc/uping/config.toml` that is already there:
+the default is written only when the file is absent, on install and on upgrade.
+`/var/lib/uping` holds the local CA and the leaves, and `apt purge` keeps both
+it and `/etc/uping` on purpose, because deleting the CA would silently untrust
+every client.
+
+The container is what makes the binary portable: it compiles in the release's
+glibc (Ubuntu 24.04). For an older baseline, put `debian:12` on that docker
+line instead; the package then depends on glibc 2.36 rather than 2.38.
+
+| Path | Contents |
+|---|---|
+| `/usr/bin/uping` | the binary |
+| `/usr/lib/systemd/system/uping.service` | unit, ambient capability, no `setcap` |
+| `/usr/share/man/man8/uping.8.gz` | `man uping` |
+| `/usr/share/uping/` | default and example configuration |
+| `/usr/share/doc/uping/` | README, README.Debian, copyright |
+| `/etc/uping/config.toml` | your configuration |
+| `/var/lib/uping/` | CA, leaves, writable state |
 
 ## Paths
 
@@ -240,109 +371,137 @@ challenge. A failed startup order is retried after one hour (not seconds), so a
 rejection cannot turn into a restart loop that burns the CA's
 failed-authorization budget.
 
-### `[acme.internal]` — private ACME CA (step-ca)
+### `[internal]` — uping's own CA
 
-`keys = "internal"` (alias `"step-ca"`) selects this profile. It still uses
-**http-01**: the private CA must resolve the domain and reach the host on port
-80, and `serve_http = true` is required. `staging` does not apply to this
-profile. Accounts are stored per directory URL, so public and private CAs never
-share one.
+`keys = "internal"` depends on no CA server. It signs **one zone** — `domain` —
+and nothing outside it: `domain = "internal.rao-nagos.pf"` issues that name and
+any subdomain of it (`dsh.internal.rao-nagos.pf`,
+`terminal.internal.rao-nagos.pf`, …). A server whose `domain` is outside the
+zone is a config error, and issuance refuses it again at the last moment. On
+first start uping generates a root pair under `ca_dir` and signs each leaf
+itself; a leaf is renewed locally before it expires and swapped into the live
+listener without a restart. Nothing is fetched, so there is no http-01, no port
+80 and no requirement that the CA resolve or reach the host.
 
 | Field | Default | Meaning |
 |---|---|---|
-| `directory` | required | The provisioner's ACME directory URL |
-| `ca_bundle` | inherits `[acme] ca_bundle` | PEM root that signs the ACME server |
+| `domain` | `""` | the only zone this CA signs; required by any `keys = "internal"` |
+| `ca_dir` | `"cert/internal/ca"` | root and intermediate pairs |
+| `cert_dir` | `"cert/internal"` | `<cert_dir>/<domain>/{fullchain,privkey}.pem` |
+| `common_name` | `""` | root subject CN; empty derives `uping <zone> Root CA` |
+| `organization` | `""` | subject O |
+| `organizational_unit` | `""` | subject OU |
+| `country` | `""` | subject C, exactly two letters |
+| `state` | `""` | subject ST |
+| `locality` | `""` | subject L |
+| `email` | `""` | subject `emailAddress`; informational |
+| `ca_days` | `3650` | root lifetime, clamped to `leaf_days..=7300` |
+| `intermediate_days` | `1825` | intermediate lifetime, clamped to `1..=ca_days` |
+| `leaf_days` | `397` | leaf lifetime, clamped to `1..=825` |
+| `renew_before_days` | `30` | renew a leaf with fewer days left |
+| `key_type` | `"ed25519"` | `ed25519`, `p256` or `rsa2048` |
+| `serve_root` | `""` | HTTPS URL publishing `/root.crt`; empty means off |
 
-uping does **not** initialize step-ca, create its root CA, or generate a client
-certificate. You install step-ca once, then give uping two things: the
-provisioner's ACME directory URL and the root certificate that signs the ACME
-server's TLS certificate.
+The package configuration uses the standard paths:
 
-#### Set up step-ca once
+```toml
+[internal]
+domain     = "internal.rao-nagos.pf"
+ca_dir     = "/var/lib/uping/internal/ca"
+cert_dir   = "/var/lib/uping/internal"
+serve_root = "https://internal.rao-nagos.pf:9000"
 
-1. Initialize the CA on the step-ca host. At the deployment-type prompt choose
-   **Standalone**: `Linked` adds Smallstep cloud configuration/reporting and
-   `Hosted` is Smallstep's managed CA. For a CA you run yourself on rupa,
-   Standalone is the right choice. `--acme` creates the ACME provisioner:
+[[server]]
+domain       = "dsh.internal.rao-nagos.pf"
+keys         = "internal"
+https_listen = "10.8.0.1"          # the rupa VPN address
+serve_http   = false               # no :80 at all, no http-01 to answer
+upstream     = "127.0.0.1:7681"
+```
 
-   ```sh
-   sudo step ca init --deployment-type standalone --acme
-   ```
+Optional identity shown in the certificates (all default to empty, so nothing
+breaks if you skip them):
 
-   Without `--acme`, add the provisioner after step-ca is running:
+```toml
+[internal]
+organization         = "rao-nagos"
+organizational_unit  = "Infrastructure"
+country              = "PF"
+state                = "Windward Islands"
+locality             = "Papeete"
+email                = "ops@rao-nagos.pf"
+intermediate_days    = 1825
+```
 
-   ```sh
-   sudo step ca provisioner add acme --type ACME
-   ```
 
-   The directory URL for a provisioner named `acme` is
-   `https://<ca-host>/acme/acme/directory`; adjust the path for another
-   provisioner name.
+It is a real two-level PKI: a **root** (the only certificate clients install)
+signs an **intermediate**, which signs the leaves. The server sends
+`leaf + intermediate`; the root never travels. The subject of every certificate
+is CN plus whichever identity fields are set — empty fields are simply omitted,
+so a default configuration produces a clean certificate. Only the leaf CN is a
+hostname; the root and intermediate CNs derive from the zone
+(`uping internal.rao-nagos.pf Root CA`, `... Intermediate CA`) unless
+`common_name` overrides the root's.
 
-   This creates the root and intermediate CA — often
-   `/root/.step/certs/root_ca.crt` and `intermediate_ca.crt` when run with
-   `sudo` — plus the CA configuration.
+The files use the ACME names, in their own subtree, so nothing an ACME run
+already wrote is read or overwritten:
 
-2. Start step-ca and check the provisioner once it is reachable:
+```text
+/var/lib/uping/internal/ca/root.crt                              0644  <- clients
+/var/lib/uping/internal/ca/root.key                              0600  optional
+/var/lib/uping/internal/ca/intermediate.crt                      0644
+/var/lib/uping/internal/ca/intermediate.key                      0600
+/var/lib/uping/internal/dsh.internal.rao-nagos.pf/fullchain.pem        leaf + CA
+/var/lib/uping/internal/dsh.internal.rao-nagos.pf/privkey.pem    0600
+```
 
-   ```sh
-   sudo step ca provisioner list
-   ```
+The root is created once and never regenerated behind your back. Once the
+intermediate exists, `root.key` can be moved offline: leaf renewals only need
+`intermediate.key`, and an intermediate that is due is rotated automatically
+when the root key is present (with a warning when it is not). If a root from an
+early v0.4 tree exists without an intermediate, the intermediate is created
+under it — clients keep the root they already trust. `alt_names = [...]` on a
+server adds SANs to the same leaf, and they must be inside the zone too.
 
-3. Copy the **root** certificate — the public certificate only, never the root
-   private key — somewhere uping can read:
+#### Publishing the root over HTTPS
 
-   ```sh
-   sudo install -m644 "$(sudo step path)/certs/root_ca.crt" "$HOME/uping/cert/step-ca-root.pem"
-   ```
+`serve_root` is a URL inside the zone, not an address. uping gives that host a
+leaf from the same CA — so `https://internal.rao-nagos.pf:9000` presents a
+certificate chaining to the very root it serves — resolves the host (normally
+to the rupa VPN address) and binds that address and port. A client fetches the
+root once:
 
-   `sudo step ca init` writes under `/root/.step`, so use `sudo step path` here,
-   not the unprivileged user's path. If step-ca runs as a dedicated user,
-   initialize as that user (or pass `--root`/`--key`) so it can read the keys.
+```sh
+curl -k https://internal.rao-nagos.pf:9000/root.crt \
+  | sudo tee /usr/local/share/ca-certificates/uping-internal.crt
+sudo update-ca-certificates
+```
 
-   Do **not** copy `intermediate_ca.crt` alone in place of the root: it is a
-   chain certificate, not the long-lived trust anchor. step-ca normally sends
-   its intermediate during the TLS handshake; if it does not, concatenate
-   `root_ca.crt` and `intermediate_ca.crt` into the bundle.
+`-k` is needed exactly because the root is what would make that name trusted;
+after this one fetch the same URL verifies normally. `http://` is refused:
+publishing a trust anchor in clear text hands it to anyone on the path. Binding
+is best-effort — a host that does not resolve yet (the tunnel is down) is logged
+and skipped, and every other listener keeps running.
 
-4. Point uping at the directory and that root:
+#### How the certificates are made
 
-   ```toml
-   [acme.internal]                    # [acme.step-ca] is an accepted alias
-   directory = "https://step-ca.internal/acme/acme/directory"
-   ca_bundle = "cert/step-ca-root.pem"
-   ```
+No external tool, no daemon, no package to install. uping calls the **OpenSSL
+library it already links for TLS**, through the `openssl` Rust crate: the same
+process generates the key pair (`PKey::generate_ed25519`, or EC/RSA according to
+`key_type`), builds the X.509 structures (subject, SANs, basic constraints, key
+usage, `serverAuth` EKU), signs them and writes the PEM files. Nothing is
+shelled out — there is no call to the `openssl` command, to `step`, to `certbot`
+or to any CA.
 
-   `ca_bundle` is the trust anchor for uping → ACME server. It is **not** a
-   client certificate and **not** the leaf certificate for your domain. If the
-   ACME endpoint has a publicly trusted certificate, `ca_bundle` may be empty;
-   with step-ca's own certificate, point it at the root.
+The released binary carries OpenSSL statically: `pingora-openssl` enables
+`openssl/vendored`, so libcrypto is compiled into the executable (the Linux
+build reports OpenSSL 3.6.3 and `ldd` shows no `libssl`). Installing uping is
+still one binary and one config file; building it needs a C toolchain, CMake
+and Perl for that vendored OpenSSL build, but no system `libssl-dev`.
 
-5. Use the private profile on the server:
-
-   ```toml
-   [[server]]
-   domain       = "site1.internal.rao-nagos.pf"
-   keys         = "internal"
-   upstream     = "127.0.0.1:8080"
-   https_listen = "10.8.0.1"      # the rupa VPN address
-   # serve_http = true (default): http-01 answers on 10.8.0.1:80
-   ```
-
-   uping creates the ACME account and the leaf certificate automatically:
-
-   ```text
-   ~/uping/cert/acme-account-<hash>.json
-   ~/uping/cert/site1.internal.rao-nagos.pf/fullchain.pem
-   ~/uping/cert/site1.internal.rao-nagos.pf/privkey.pem
-   ```
-
-**Important:** `ca_bundle` is only the trust anchor for uping → ACME server. It
-is **not** pushed to clients. Clients must trust the step-ca **root** themselves
-(install `root_ca.crt` once in the OS/browser/MDM). Without that, the issued
-certificate is not trusted, no matter what uping does. Do not put the root
-private key or a manually generated leaf certificate in uping's `cert_dir`:
-uping writes the leaf itself.
+The remaining manual step is the same one a private ACME CA imposed: each
+client installs the root once. What disappears is the daemon — no step-ca, no
+account, no ACME directory, no port 80.
 
 ## `[[server]]` — every shape
 
@@ -421,8 +580,9 @@ serve_http = false
 ```
 
 `serve_http = false` removes the domain from port 80: a request for it there is
-`404`, not a redirect. It is refused with any ACME mode because http-01 needs
-port 80; use `keys = "manual"` (or a private ACME CA that can reach :80).
+`404`, not a redirect. It is refused with an ACME mode because http-01 needs
+port 80; use `keys = "internal"` (uping's own CA) or `keys = "manual"` with an
+externally issued pair.
 
 ### 6. HTTPS to the backend
 
@@ -461,28 +621,28 @@ upstream = "127.0.0.1:8080"
 ```
 
 Both paths are required. uping reads them at startup and on `SIGHUP`; renew
-them yourself (certbot, step-ca, a paid CA, …) and send `SIGHUP`.
+them yourself (certbot, an ACME client, a paid CA, …) and send `SIGHUP`.
 
-### 9. Private site with step-ca
+### 9. Private site with the local CA
 
 ```toml
-[acme.internal]
-directory = "https://step-ca.internal/acme/acme/directory"
-ca_bundle = "cert/step-ca-root.pem"
+[internal]
+domain     = "internal.rao-nagos.pf"        # the only zone this CA signs
+serve_root = "https://internal.rao-nagos.pf:9000"
 
 [[server]]
-domain       = "site1.internal.rao-nagos.pf"
+domain       = "dsh.internal.rao-nagos.pf"
 keys         = "internal"
-upstream     = "127.0.0.1:8080"
-https_listen = "10.8.0.1"       # the rupa VPN address
-# serve_http = true (default): step-ca validates via http-01
+alt_names    = ["terminal.internal.rao-nagos.pf"]
+upstream     = "127.0.0.1:7681"
+https_listen = "10.8.0.1"                   # the rupa VPN address
+serve_http   = false                        # no :80 at all, no http-01 to answer
 ```
 
-This is automatic leaf issuance and renewal, but the **client** must trust the
-step-ca root. You install that root once per client; you do not install each
-leaf. The private CA can validate a name that only exists in your internal DNS:
-no public zone change is required, provided step-ca can resolve the name and
-reach the host on port 80. See [Private names, rupa and
+This is automatic leaf issuance and renewal with no CA server on the network,
+limited to the zone you name. The **client** trusts the root once (fetch it from
+`serve_root`, or copy `ca/root.crt`); the leaves rotate underneath that trust.
+The names may exist only in your internal DNS. See [Private names, rupa and
 DNS](#private-names-rupa-and-dns).
 
 ### 10. Explicit `keys = "auto"`
@@ -502,8 +662,9 @@ optionally override where the pair is written.
 | `[[server]]` field | Default |
 |---|---|
 | `domain` | required |
-| `keys` | `auto` without key paths; `manual` with both |
-| `pub_key`, `priv_key` | `""` (manual requires both) |
+| `keys` | `auto` without key paths; `manual` with both; `internal` for a local leaf |
+| `pub_key`, `priv_key` | `""` (manual requires both; refused with `internal`) |
+| `alt_names` | `[]` (extra SANs, `internal` only) |
 | `upstream`, `root` | `""` (exactly one required) |
 | `https_listen`, `https_listen6` | `""` (use the global HTTPS group) |
 | `serve_http` | `true` |
@@ -534,7 +695,7 @@ optionally override where the pair is written.
 | `listen`, `upstream` | required |
 | `connect_timeout_ms` | `5000`, clamped to `100..=30000` |
 
-## `[[stream]]` — experimental raw TCP
+## `[[stream]]` — raw TCP forwarding
 
 ```toml
 [[stream]]
@@ -572,14 +733,14 @@ uping --dns-zone config.toml
 
 ### Trust model for private names
 
-`keys = "internal"` means "use this private ACME CA", not "make a private name
-publicly trusted". The possible combinations are:
+`keys = "internal"` means "uping signs this name itself", not "this private name
+becomes publicly trusted". The possible combinations are:
 
 | Goal | Public DNS | Root on clients | uping |
 |---|---|---|---|
 | Public name, public trust | A record + port 80 | no (public root) | `keys = "auto"` |
 | Public name, DNS-01 | TXT record; A may be private | no | not implemented; external ACME client + `keys = "manual"` |
-| Private name, automatic leaf | no (internal DNS) | **yes** (step-ca root) | `keys = "internal"` |
+| Private name, automatic leaf | no (internal DNS) | **yes** (`root.crt`) | `keys = "internal"` |
 | Fully manual | no | yes | `keys = "manual"` |
 
 A publicly trusted root will not sign `.internal`, `.localhost`, unqualified
@@ -587,25 +748,25 @@ names or private IPs. A public CA only signs names it can validate publicly.
 There is no setup that gives public trust + private DNS + zero client
 installation.
 
-For step-ca:
+For `keys = "internal"`:
 
-1. Run step-ca on (or reachable from) the rupa network, with a root CA; see
-   [Set up step-ca once](#set-up-step-ca-once).
-2. Configure its ACME provisioner and its DNS so it resolves the private names
-   (the internal resolver, or `/etc/hosts`).
-3. Keep `serve_http = true` so http-01 can answer on port 80.
-4. Install the step-ca **root** once on each client.
-5. Add one `[[server]]` per name with `keys = "internal"`; one root covers all
-   of them, and each leaf renews automatically.
+1. Set `[internal] domain` to the zone, e.g. `internal.rao-nagos.pf`; uping
+   creates `ca/root.crt` there on first start.
+2. Publish it with `serve_root = "https://internal.rao-nagos.pf:9000"`, or copy
+   the file out of band.
+3. Install that root once on each client.
+4. Add one `[[server]]` per name inside the zone with `keys = "internal"`; one
+   root covers all of them, and each leaf renews automatically.
 
 The certificate is for the **name**, not the IP. The A record may point to
 `10.8.0.1`; the client resolves the name, connects to the private IP, and
-trusts the leaf because it trusts the step-ca root. No IP SAN is needed.
+trusts the leaf because it trusts uping's root. No IP SAN is needed.
 
-`.localhost` is special and not suitable for remote clients. `.internal` works
-if the private CA's policy allows it. A subdomain you own, such as
-`site1.internal.rao-nagos.pf` or `vpn.rao-nagos.pf`, is the least surprising
-choice.
+`.localhost` is special and not suitable for remote clients. Use a subdomain you
+own as the zone, such as `internal.rao-nagos.pf`, then any name inside it
+(`dsh.internal.rao-nagos.pf`, `terminal.internal.rao-nagos.pf`). `alt_names`
+lets one leaf cover several names in that zone; a wildcard SAN is refused
+because SNI resolution is an exact match.
 
 ## `uping --dns-zone`
 

@@ -1,8 +1,7 @@
 //! Raw TCP forwarding — the `[[stream]]` listener.
 //!
-//! **Experimental in v0.3.** This is the mail/database relay people asked for,
-//! but its configuration and semantics may still change. Do not build a
-//! production dependency on it yet without pinning the version.
+//! This is the mail/database relay people asked for: stable since v0.4, one
+//! listener per entry, no TLS termination, the upstream owns the protocol.
 //!
 //! One `[[stream]]` entry binds one port and pipes every byte to one upstream,
 //! with no parsing, no TLS termination and no idle timeout. That is what a mail

@@ -1,0 +1,30 @@
+# uping — system unit for the Debian package.
+#
+# The process runs as the unprivileged `uping` user. The one privileged
+# operation, binding :80/:443, comes from an ambient capability on this unit,
+# so there is no setcap to re-apply when the binary is upgraded.
+[Unit]
+Description=uping reverse proxy
+Documentation=https://github.com/raonagos/uping/blob/main/README.md
+After=network-online.target
+Wants=network-online.target
+# The package ships no configuration; starting without one would only loop.
+ConditionPathExists=/etc/uping/config.toml
+
+[Service]
+Type=simple
+User=uping
+Group=uping
+WorkingDirectory=/var/lib/uping
+ExecStart=/usr/bin/uping /etc/uping/config.toml
+ExecReload=/bin/kill -HUP $MAINPID
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+NoNewPrivileges=true
+PrivateTmp=true
+Restart=on-failure
+RestartSec=10
+Environment=RUST_LOG=info
+
+[Install]
+WantedBy=multi-user.target

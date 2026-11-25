@@ -1,15 +1,16 @@
 //! uping — a tiny TOML-configured reverse proxy.
 //!
-//! v0.3 reads a config, obtains or loads one certificate per domain, serves
+//! v0.4 reads a config, obtains or loads one certificate per domain, serves
 //! HTTPS (SNI) on the global and per-domain listeners, redirects plain HTTP to
 //! HTTPS, and keeps a lid on abusive clients. A `[[server]]` or route may also
 //! serve a directory directly (`root`), forward to a TLS backend, and is probed
 //! for liveness so a dead backend is a fast `503`. `[[stream]]` raw TCP
-//! forwarding is experimental.
+//! forwarding is stable.
 
 mod acme;
 mod config;
 mod health;
+mod internal_ca;
 mod limits;
 mod proxy;
 mod sighup;
@@ -23,6 +24,7 @@ use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+use clap::Parser;
 use log::{info, warn};
 use pingora::apps::HttpServerOptions;
 use pingora::listeners::tls::TlsSettings;
@@ -40,55 +42,34 @@ use crate::sighup::{Allowed, Reloader};
 use crate::stream::StreamForwarder;
 use crate::tls::SniResolver;
 
-const USAGE: &str = "usage: uping [config.toml] [--check|--dry-run|--dns-zone]";
-
-/// A parsed command line: one optional config path and one flag.
-struct Args {
+/// uping — a tiny TOML-configured reverse proxy.
+#[derive(Debug, Parser)]
+#[command(
+    name = "uping",
+    version,
+    about = "A tiny TOML-configured reverse proxy",
+    long_about = None
+)]
+struct Cli {
+    /// Path to the TOML configuration file.
+    #[arg(value_name = "CONFIG", default_value = "config.toml")]
     path: String,
+
+    /// Validate the configuration strictly and exit.
+    #[arg(
+        long,
+        visible_alias = "dry-run",
+        conflicts_with_all = ["dns_zone", "dump_config"]
+    )]
     check: bool,
+
+    /// Print hosts(5) records for the configured domains and exit.
+    #[arg(long, conflicts_with_all = ["check", "dump_config"])]
     dns_zone: bool,
-}
 
-/// Hand-parsed: two shapes and one flag do not justify a dependency, and a
-/// parser is itself a thing that can reject a valid invocation.
-///
-/// Both `uping --check [path]` and `uping [path] --check` are accepted, and the
-/// same goes for `--dns-zone`.
-fn parse_args(raw: impl Iterator<Item = String>) -> Result<Args> {
-    let mut path: Option<String> = None;
-    let mut check = false;
-    let mut dns_zone = false;
-
-    for arg in raw {
-        match arg.as_str() {
-            "--check" | "--dry-run" => check = true,
-            "--dns-zone" => dns_zone = true,
-            "-h" | "--help" => {
-                println!("{USAGE}");
-                std::process::exit(0);
-            }
-            other if other.starts_with('-') => {
-                anyhow::bail!("unknown option `{other}`; {USAGE}")
-            }
-            other => {
-                if path.replace(other.to_string()).is_some() {
-                    anyhow::bail!(
-                        "unexpected argument `{other}`: at most one config path; {USAGE}"
-                    );
-                }
-            }
-        }
-    }
-
-    if check && dns_zone {
-        anyhow::bail!("`--check` and `--dns-zone` are different outputs; pick one");
-    }
-
-    Ok(Args {
-        path: path.unwrap_or_else(|| "config.toml".into()),
-        check,
-        dns_zone,
-    })
+    /// Print the effective configuration, defaults included, and exit.
+    #[arg(long, conflicts_with_all = ["check", "dns_zone"])]
+    dump_config: bool,
 }
 
 /// Run [`check_config`] and exit: `0` with one line on stdout, `1` with the
@@ -123,6 +104,34 @@ fn run_dns_zone(path: &str) -> ! {
             std::process::exit(1)
         }
     }
+}
+
+/// Print the effective configuration and exit.
+///
+/// The point is the defaults: every field the start would use, including the
+/// ones the file leaves out or clamps, so a "valid but wrong" configuration is
+/// visible instead of guessed.
+fn run_dump_config(path: &str) -> ! {
+    match dump_config(path) {
+        Ok((text, warnings)) => {
+            for warning in warnings {
+                eprintln!("warning: {warning}");
+            }
+            print!("{text}");
+            std::process::exit(0)
+        }
+        Err(e) => {
+            eprintln!("error: {e:#}");
+            std::process::exit(1)
+        }
+    }
+}
+
+fn dump_config(path: &str) -> Result<(String, Vec<String>)> {
+    let loaded = Config::load_lenient(path)
+        .with_context(|| format!("loading configuration from `{path}`"))?;
+    let text = loaded.config.to_toml()?;
+    Ok((text, loaded.warnings))
 }
 
 fn dns_zone(path: &str) -> Result<String> {
@@ -192,26 +201,33 @@ fn check_config(path: &str) -> Result<String> {
 
     let routes = RouteTable::from_config(&cfg)?.route_count();
     Ok(format!(
-        "ok: {} [[server]], {} [[stream]], {routes} route(s), {pending} certificate(s) to request · {path}",
+        "ok: {} [[server]], {} [[stream]], {routes} route(s), {pending} certificate(s) to obtain · {path}",
         cfg.servers.len(),
         cfg.streams.len()
     ))
 }
 
 fn main() -> Result<()> {
-    let args = parse_args(std::env::args().skip(1))?;
+    let args = Cli::parse();
     if args.check {
         run_check(&args.path);
     }
     if args.dns_zone {
         run_dns_zone(&args.path);
     }
+    if args.dump_config {
+        run_dump_config(&args.path);
+    }
 
     env_logger::init();
 
     let config_path = args.path;
-    let cfg = Config::load(&config_path)
+    let loaded = Config::load_lenient(&config_path)
         .with_context(|| format!("loading configuration from `{config_path}`"))?;
+    for warning in &loaded.warnings {
+        warn!("config: {warning}");
+    }
+    let cfg = loaded.config;
 
     // domain -> targets; the outer lock lets a reload swap the whole table.
     let live_routes = Arc::new(RwLock::new(Arc::new(RouteTable::from_config(&cfg)?)));
@@ -240,7 +256,9 @@ fn main() -> Result<()> {
     // Load manual pairs and count the `auto` ones that do not exist yet. Both
     // are empty when there is no `[[server]]`, but the SIGHUP handler below
     // still has to exist: the default action for an unhandled SIGHUP is exit.
-    let (resolver, pending) = SniResolver::from_config(&cfg).context("loading TLS certificates")?;
+    // Lossy on purpose: a domain whose certificate cannot be read is logged and
+    // skipped, the rest of the config still starts. `--check` stays strict.
+    let (resolver, pending) = SniResolver::from_config_lossy(&cfg);
     let challenges = ChallengeStore::new();
     let certs = Arc::new(CertManager::new(&cfg, resolver.clone(), challenges.clone()));
     // The renewal thread and the reload thread share this list: a domain added
@@ -263,14 +281,29 @@ fn main() -> Result<()> {
         .iter()
         .map(|addr| addr.to_string())
         .collect();
-    let acme_complete = certs
-        .obtain_missing(&pending, &http_addrs)
-        .context("preparing TLS certificates")?;
+    // A failure here is a warning, not a startup error: the VPN address may not
+    // exist yet, a CA may be down, and the process must still serve what it can.
+    let acme_complete = match certs.obtain_missing(&pending, &http_addrs) {
+        Ok(done) => done,
+        Err(e) => {
+            warn!(
+                "certificates: startup issuance could not run ({e:#}); starting with \
+                 what is on disk and retrying in one hour"
+            );
+            false
+        }
+    };
     if !acme_complete {
         warn!(
-            "acme: some certificates are still missing; starting without them and \
-             retrying in one hour (those domains fail the TLS handshake until then)"
+            "certificates: some are still missing; starting without them and retrying \
+             in one hour (those domains fail the TLS handshake until then)"
         );
+    }
+
+    // Publish the local CA root on its plain-HTTP address, when one is set.
+    // Same rule: an address that does not exist yet is a warning.
+    if let Err(e) = certs.internal_handle().spawn_root_server() {
+        warn!("internal CA: root certificate not published: {e:#}");
     }
 
     // Shared between the :80 and :443 listeners, so one client cannot use two
@@ -284,7 +317,23 @@ fn main() -> Result<()> {
     // `listen`/`listen6` really answers only there. All services share one
     // route table and one certificate resolver; each one carries the set of
     // domains it is allowed to serve.
-    let https_groups = cfg.https_groups().context("grouping the HTTPS listeners")?;
+    let mut https_groups = cfg.https_groups().context("grouping the HTTPS listeners")?;
+    // Pingora panics on a failed bind, and one address takes its whole service
+    // down with it. Probe first and skip only the socket that is not there, so
+    // `https_listen = "10.8.0.1"` on a host whose tunnel is not up yet leaves
+    // the other domains served.
+    for group in &mut https_groups {
+        let wanted = group.addrs.len();
+        group.addrs = keep_bindable(std::mem::take(&mut group.addrs), "HTTPS");
+        if group.addrs.is_empty() && wanted > 0 {
+            warn!(
+                "HTTPS: no listener for {} (every address was unavailable); those \
+                 domains will not serve TLS until a restart",
+                group.domains.join(", ")
+            );
+        }
+    }
+    https_groups.retain(|g| !g.addrs.is_empty());
     let mut allow_lists: Vec<(GroupKey, Allowed)> = Vec::new();
 
     if cfg.servers.is_empty() {
@@ -333,11 +382,20 @@ fn main() -> Result<()> {
         .server_options(server_options)
         .build();
         http_service.set_connection_filter(conn_filter);
-        for addr in &http_addrs {
-            http_service.add_tcp(addr);
+        let http_bound = keep_bindable(
+            http_addrs
+                .iter()
+                .filter_map(|addr| addr.parse().ok())
+                .collect(),
+            "HTTP",
+        );
+        for addr in &http_bound {
+            http_service.add_tcp(&addr.to_string());
             info!("HTTP listening on {addr} (redirecting to HTTPS)");
         }
-        server.add_service(http_service);
+        if !http_bound.is_empty() {
+            server.add_service(http_service);
+        }
     }
 
     // A clean start renews a due pair 30s after pingora owns `:80`; a failed
@@ -371,16 +429,25 @@ fn main() -> Result<()> {
     health.clone().spawn(live_routes.clone());
     info!("SIGHUP applies a new config");
 
-    // --- Raw TCP streams (experimental in v0.3) ---
+    // --- Raw TCP streams ---
     // One listener per [[stream]]. The upstream is whatever holds the port on
     // loopback; uping neither starts nor watches it.
-    if !cfg.streams.is_empty() {
-        warn!(
-            "[[stream]] is experimental: its config, behaviour and support may change \
-             before it is declared stable"
-        );
-    }
-    for s in &cfg.streams {
+    for s in cfg.streams.iter().filter(|s| {
+        match s.listen.parse::<std::net::SocketAddr>() {
+            Ok(addr) => match bindable(addr) {
+                Ok(()) => true,
+                Err(e) => {
+                    warn!(
+                        "stream {}: `{}` is not available ({e}); skipping that forwarder",
+                        s.label(),
+                        s.listen
+                    );
+                    false
+                }
+            },
+            Err(_) => true, // validated already; let the service report it
+        }
+    }) {
         let forwarder = StreamForwarder::new(s);
         info!(
             "stream {} listening on {} -> {}",
@@ -466,6 +533,39 @@ fn is_privileged(addr: &std::net::SocketAddr) -> bool {
     addr.port() < 1024
 }
 
+/// Can this address be bound right now?
+///
+/// Mirrors the socket pingora creates (a TCP socket with `SO_REUSEADDR`) so the
+/// answer is the one the real listener would get. Binding and dropping is safe:
+/// no connection is accepted.
+fn bindable(addr: std::net::SocketAddr) -> std::io::Result<()> {
+    let socket = socket2::Socket::new(
+        socket2::Domain::for_address(addr),
+        socket2::Type::STREAM,
+        Some(socket2::Protocol::TCP),
+    )?;
+    socket.set_reuse_address(true)?;
+    socket.bind(&addr.into())?;
+    Ok(())
+}
+
+/// Drop the addresses that cannot be bound, saying which and why. A missing
+/// address (the VPN interface is not up) must not take the other listeners of
+/// the same service down with it.
+fn keep_bindable(addrs: Vec<std::net::SocketAddr>, what: &str) -> Vec<std::net::SocketAddr> {
+    let mut kept = Vec::with_capacity(addrs.len());
+    for addr in addrs {
+        match bindable(addr) {
+            Ok(()) => kept.push(addr),
+            Err(e) => warn!(
+                "{what}: {addr} is not available ({e}); skipping that listener, the \
+                 others keep running"
+            ),
+        }
+    }
+    kept
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -483,6 +583,7 @@ mod tests {
             keys: None,
             pub_key: "certs/test.local.crt".to_string(),
             priv_key: "certs/test.local.key".to_string(),
+            alt_names: Vec::new(),
             upstream: upstream.to_string(),
             upstream_tls: false,
             upstream_sni: String::new(),
@@ -503,6 +604,7 @@ mod tests {
             tls: Default::default(),
             health: Default::default(),
             acme: Default::default(),
+            internal: Default::default(),
             servers,
             streams: Vec::new(),
         }
@@ -515,8 +617,8 @@ mod tests {
         }
     }
 
-    fn args(raw: &[&str]) -> Result<Args> {
-        parse_args(raw.iter().map(|s| s.to_string()))
+    fn args(raw: &[&str]) -> Result<Cli, clap::Error> {
+        Cli::try_parse_from(std::iter::once("uping").chain(raw.iter().copied()))
     }
 
     #[test]
@@ -526,6 +628,13 @@ mod tests {
             assert!(parsed.check);
             assert_eq!(parsed.path, "a.toml");
         }
+    }
+
+    #[test]
+    fn the_dry_run_alias_selects_the_same_mode() {
+        let parsed = args(&["--dry-run", "a.toml"]).unwrap();
+        assert!(parsed.check);
+        assert_eq!(parsed.path, "a.toml");
     }
 
     #[test]
@@ -555,6 +664,16 @@ mod tests {
     #[test]
     fn check_and_dns_zone_are_mutually_exclusive() {
         assert!(args(&["--check", "--dns-zone", "a.toml"]).is_err());
+        assert!(args(&["--check", "--dump-config", "a.toml"]).is_err());
+        assert!(args(&["--dump-config", "--dns-zone", "a.toml"]).is_err());
+    }
+
+    #[test]
+    fn the_dump_config_flag_is_parsed() {
+        let parsed = args(&["--dump-config", "a.toml"]).unwrap();
+        assert!(parsed.dump_config);
+        assert!(!parsed.check);
+        assert_eq!(parsed.path, "a.toml");
     }
 
     #[test]

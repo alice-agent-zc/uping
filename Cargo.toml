@@ -1,8 +1,8 @@
 [package]
 name = "uping"
-version = "0.3.2"
+version = "0.4.0"
 edition = "2021"
-description = "A tiny TOML-configured reverse proxy with automatic HTTPS (ACME), static files and raw TCP forwarding."
+description = "A tiny TOML-configured reverse proxy with automatic HTTPS (ACME or a local CA), static files and raw TCP forwarding."
 license = "Apache-2.0"
 authors = ["tetuaoro <65575727+tetuaoro@users.noreply.github.com>"]
 repository = "https://github.com/raonagos/uping"
@@ -35,3 +35,37 @@ mime_guess = "2"
 openssl = "0.10"
 # SIGHUP -> live config swap.
 signal-hook = "0.3"
+# CLI parsing: one positional config path, three mutually exclusive outputs.
+clap = { version = "4", features = ["derive"] }
+# Listening-socket probe before pingora binds: same SO_REUSEADDR as its own
+# listener, so "this address does not exist yet" is caught before a panic.
+socket2 = "0.6"
+
+# Debian package metadata. The package sources (unit, maintainer scripts,
+# configs, man page) live under `debian/`. Build the binary inside the release's
+# glibc before `cargo deb --no-build`; CONTRIBUTING has the exact command.
+[package.metadata.deb]
+maintainer = "tetuaoro <65575727+tetuaoro@users.noreply.github.com>"
+copyright = "2026, tetuaoro"
+license-file = ["LICENSE", "4"]
+extended-description = "uping terminates TLS with SNI for one or more domains and forwards each to a local backend: static files, path routing, per-IP request and connection limits, upstream health checks and raw TCP forwarding. Certificates come from public ACME, from manual files, or from uping's own local CA, which needs no ACME server. This package installs the system deployment: /usr/bin/uping, a systemd unit carrying CAP_NET_BIND_SERVICE, and /var/lib/uping for keys and leaves. The archive carries no /etc/uping/config.toml, so an existing configuration is never touched: the postinst installs a loopback-only default only when the file is absent; see README.Debian for the first start."
+depends = "$auto"
+recommends = "systemd"
+section = "net"
+priority = "optional"
+maintainer-scripts = "debian"
+# Two config files, two jobs, deliberately not merged:
+#  - debian/config.toml.default is the minimal, loopback-only file the postinst
+#    installs when /etc/uping/config.toml is absent. It must be safe to start
+#    on any machine (no :80/:443, no ACME, a localhost leaf).
+#  - config.toml.example is the full reference shipped as documentation. It
+#    binds real ports, names a real zone and would contact ACME if installed.
+assets = [
+    ["target/release/uping", "usr/bin/", "755"],
+    ["debian/uping.service", "usr/lib/systemd/system/", "644"],
+    ["config.toml.example", "usr/share/uping/config.toml.example", "644"],
+    ["debian/config.toml.default", "usr/share/uping/config.toml.default", "644"],
+    ["debian/uping.8", "usr/share/man/man8/uping.8", "644"],
+    ["debian/README.Debian", "usr/share/doc/uping/README.Debian", "644"],
+    ["README.md", "usr/share/doc/uping/README.md", "644"],
+]

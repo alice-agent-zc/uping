@@ -1,0 +1,31 @@
+# uping — default configuration installed by the Debian package.
+#
+# This is a placeholder, deliberately harmless: loopback only, and a local-CA
+# certificate for `localhost`, so the service starts and proves TLS without
+# binding :80/:443 or contacting an ACME server. Nothing listens on
+# 127.0.0.1:9, so requests answer 502 until you point the upstream at a real
+# service. Replace it with your domains:
+#
+#   sudo editor /etc/uping/config.toml
+#   sudo -u uping /usr/bin/uping --check /etc/uping/config.toml
+#   sudo systemctl restart uping
+#
+# The commented template is /usr/share/uping/config.toml.example.
+
+[listen]
+ipv4  = "127.0.0.1"
+http  = 8080
+https = 8443
+
+# uping's own CA. Clients install /var/lib/uping/internal/ca/root.crt once.
+[internal]
+domain   = "localhost"
+ca_dir   = "/var/lib/uping/internal/ca"
+cert_dir = "/var/lib/uping/internal"
+
+[[server]]
+domain     = "localhost"
+keys       = "internal"
+serve_http = false
+health     = false
+upstream   = "127.0.0.1:9"

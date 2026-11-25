@@ -39,6 +39,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
 use crate::config::{Acme as AcmeConfig, AcmeProfile, Config, Server};
+use crate::internal_ca::LocalCa;
 use crate::tls::SniResolver;
 
 /// Challenge tokens currently expected, token -> key authorization.
@@ -93,6 +94,8 @@ pub struct CertManager {
     acme: AcmeConfig,
     root_dir: PathBuf,
     cert_dir: PathBuf,
+    /// `keys = "internal"`: uping's own CA, no network.
+    internal: LocalCa,
     resolver: SniResolver,
     challenges: ChallengeStore,
     /// One ACME order at a time. A renewal and a reload can both find work for
@@ -106,10 +109,16 @@ impl CertManager {
             acme: cfg.acme.clone(),
             root_dir: cfg.root_dir.clone(),
             cert_dir: cfg.cert_dir(),
+            internal: LocalCa::new(cfg, resolver.clone()),
             resolver,
             challenges,
             issue_lock: Arc::new(tokio::sync::Mutex::new(())),
         }
+    }
+
+    /// The local CA, so `main` can publish `root.crt` without a second owner.
+    pub fn internal_handle(&self) -> &LocalCa {
+        &self.internal
     }
 
     /// The certificate and key files for one server. Mirrors
@@ -121,6 +130,8 @@ impl CertManager {
                 resolve(&self.root_dir, &server.pub_key),
                 resolve(&self.root_dir, &server.priv_key),
             )
+        } else if server.key_mode().is_local_ca() {
+            self.internal.leaf_paths(server)
         } else {
             let dir = self
                 .cert_dir
@@ -145,6 +156,18 @@ impl CertManager {
             return Ok(true);
         }
 
+        // Local leaves need no socket and no network; they are issued first so
+        // an unreachable ACME CA cannot delay them.
+        let (local, acme): (Vec<Server>, Vec<Server>) = pending
+            .iter()
+            .cloned()
+            .partition(|s| s.key_mode().is_local_ca());
+        let mut all_obtained = self.internal.ensure_all(&local);
+
+        if acme.is_empty() {
+            return Ok(all_obtained);
+        }
+
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -152,9 +175,8 @@ impl CertManager {
 
         runtime.block_on(async {
             let listener = ChallengeServer::bind(http_addrs, self.challenges.clone()).await?;
-            let mut all_obtained = true;
 
-            for s in pending {
+            for s in &acme {
                 let profile = match self.acme.profile(s.key_mode()) {
                     Ok(profile) => profile,
                     Err(e) => {
@@ -186,6 +208,15 @@ impl CertManager {
         if pending.is_empty() {
             return;
         }
+        let (local, acme): (Vec<Server>, Vec<Server>) = pending
+            .iter()
+            .cloned()
+            .partition(|s| s.key_mode().is_local_ca());
+        self.internal.ensure_all(&local);
+        if acme.is_empty() {
+            return;
+        }
+
         let runtime = match tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -198,7 +229,7 @@ impl CertManager {
         };
 
         runtime.block_on(async {
-            for s in pending {
+            for s in &acme {
                 let profile = match self.acme.profile(s.key_mode()) {
                     Ok(profile) => profile,
                     Err(e) => {
@@ -263,6 +294,17 @@ impl CertManager {
 
     async fn renew_due(&self, servers: &[Server]) {
         for s in servers {
+            // A local leaf is a file read and, when due, a local signature. It
+            // needs no runtime and no socket; `ensure` decides from the file.
+            if s.key_mode().is_local_ca() {
+                if let Err(e) = self.internal.ensure(s) {
+                    warn!(
+                        "internal CA: renewal for {} failed (will retry in an hour): {e:#}",
+                        s.domain
+                    );
+                }
+                continue;
+            }
             if !s.key_mode().is_acme() {
                 continue;
             }
@@ -627,7 +669,7 @@ fn headers_complete(buf: &[u8]) -> bool {
 }
 
 /// Is `pem` due for renewal? `days` is the window before expiry.
-fn cert_is_due(pem: &[u8], days: u64) -> Result<bool> {
+pub(crate) fn cert_is_due(pem: &[u8], days: u64) -> Result<bool> {
     use openssl::asn1::Asn1Time;
     use openssl::x509::X509;
 

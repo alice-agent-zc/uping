@@ -2554,11 +2554,12 @@ checksum = "8ecb6da28b8a351d773b68d5825ac39017e680750f980f3a1a85cd8dd28a47c1"
 
 [[package]]
 name = "uping"
-version = "0.3.2"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "async-trait",
  "bytes",
+ "clap",
  "env_logger",
  "http",
  "instant-acme",
@@ -2571,6 +2572,7 @@ dependencies = [
  "serde",
  "serde_json",
  "signal-hook",
+ "socket2",
  "tokio",
  "toml",
 ]

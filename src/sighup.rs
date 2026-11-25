@@ -12,9 +12,9 @@
 //!
 //! A bad config is logged and the running config stays untouched: a typo must
 //! not take the proxy down. Listeners and `[[stream]]` forwarders cannot be
-//! added to a running Pingora service, and `[acme]` is owned by the renewal
-//! thread; those changes are reported as requiring a restart while the rest of
-//! the config is applied.
+//! added to a running Pingora service, and `[acme]`/`[internal]` are owned by
+//! the renewal thread; those changes are reported as requiring a restart while
+//! the rest of the config is applied.
 
 use std::collections::HashSet;
 use std::net::SocketAddr;
@@ -41,6 +41,7 @@ struct Pinned {
     groups: Vec<GroupKey>,
     streams: Vec<(String, String, u64)>,
     acme: String,
+    internal: String,
 }
 
 impl Pinned {
@@ -54,6 +55,7 @@ impl Pinned {
                 .map(|s| (s.listen.clone(), s.upstream.clone(), s.connect_timeout_ms))
                 .collect(),
             acme: format!("{:?}", cfg.acme),
+            internal: format!("{:?}", cfg.internal),
         })
     }
 }
@@ -175,8 +177,12 @@ impl Reloader {
     }
 
     fn try_reload(&self) -> Result<()> {
-        let new = Config::load(&self.path)
+        let loaded = Config::load_lenient(&self.path)
             .with_context(|| format!("reading `{}`", self.path.display()))?;
+        for warning in &loaded.warnings {
+            warn!("reload: {warning}");
+        }
+        let new = loaded.config;
         let next = Pinned::of(&new)?;
         let running = self.pinned.clone();
 
@@ -185,6 +191,9 @@ impl Reloader {
         // place and read them from another, so refuse the whole reload.
         if running.acme != next.acme {
             anyhow::bail!("`[acme]` changes require a restart of the service");
+        }
+        if running.internal != next.internal {
+            anyhow::bail!("`[internal]` changes require a restart of the service");
         }
         if running.http != next.http {
             warn!(

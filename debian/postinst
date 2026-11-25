@@ -1,0 +1,67 @@
+#!/bin/sh
+set -e
+
+CONFIG=/etc/uping/config.toml
+DEFAULT=/usr/share/uping/config.toml.default
+
+# The unit runs as this unprivileged system user: no home directory, no login
+# shell, and /var/lib/uping as the only writable state (the local CA and the
+# generated leaves).
+#
+# `adduser` is a Debian convenience, not a base package (minimal containers do
+# not have it), so fall back to shadow's `useradd`/`groupadd` and declare no
+# extra dependency for what is two syscalls' worth of work.
+if ! getent group uping >/dev/null 2>&1; then
+    if command -v addgroup >/dev/null 2>&1; then
+        addgroup --system uping >/dev/null
+    else
+        groupadd --system uping
+    fi
+fi
+if ! getent passwd uping >/dev/null 2>&1; then
+    if command -v adduser >/dev/null 2>&1; then
+        adduser --system --ingroup uping --home /nonexistent --no-create-home \
+            --shell /usr/sbin/nologin --gecos "uping reverse proxy" uping >/dev/null
+    else
+        useradd --system --gid uping --home-dir /nonexistent \
+            --shell /usr/sbin/nologin --no-create-home \
+            --comment "uping reverse proxy" uping
+    fi
+fi
+
+# Writable state (CA, leaves), owned by the service user. `/etc` stays for
+# configuration; `/nonexistent` is the account's home by convention.
+install -d -o uping -g uping -m 0750 /var/lib/uping
+
+# Install a working default only when there is no configuration yet. This is
+# the whole promise of `dpkg -i`: nothing has to be created by hand, and a
+# configuration that already exists is never touched.
+if [ ! -e "$CONFIG" ]; then
+    install -d -o root -g uping -m 0750 /etc/uping
+    install -o root -g uping -m 0640 "$DEFAULT" "$CONFIG"
+    cat >&2 <<'MESSAGE'
+uping: installed a loopback-only default in /etc/uping/config.toml
+  It answers 502 on https://localhost:8443 with a certificate from uping's own
+  CA until you point the upstream at a real service. Check the TLS handshake:
+    curl -sS --cacert /var/lib/uping/internal/ca/root.crt \
+      -o /dev/null -w '%{http_code}\n' https://localhost:8443/
+    man uping
+  Then replace that file with your domains and run:
+    sudo -u uping /usr/bin/uping --check /etc/uping/config.toml
+    sudo systemctl restart uping
+MESSAGE
+fi
+
+if [ -d /run/systemd/system ]; then
+    systemctl daemon-reload >/dev/null 2>&1 || true
+    if [ -z "${2:-}" ]; then
+        # First install (dpkg passes the previous version, empty on a fresh
+        # install): start the default. It only binds loopback.
+        systemctl enable --now uping.service >/dev/null 2>&1 || true
+    elif systemctl is-enabled uping.service >/dev/null 2>&1; then
+        # Upgrade: pick up the new binary, but leave a disabled service alone.
+        systemctl try-restart uping.service >/dev/null 2>&1 || true
+    fi
+fi
+
+exit 0

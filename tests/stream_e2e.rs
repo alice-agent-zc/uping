@@ -103,7 +103,19 @@ fn echo_with_drain(listener: TcpListener) -> std::thread::JoinHandle<()> {
 }
 
 fn client(addr: SocketAddr) -> TcpStream {
-    let s = TcpStream::connect(addr).unwrap();
+    // The log line announcing the listener can land a few milliseconds before
+    // pingora's accept loop owns the socket; retry instead of racing it.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let s = loop {
+        match TcpStream::connect(addr) {
+            Ok(s) => break s,
+            Err(e) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(20));
+                let _ = e;
+            }
+            Err(e) => panic!("connecting to {addr}: {e}"),
+        }
+    };
     s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
     s.set_write_timeout(Some(Duration::from_secs(10))).unwrap();
     let _ = s.set_nodelay(true);
