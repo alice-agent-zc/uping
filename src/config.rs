@@ -68,10 +68,10 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 /// Top level configuration.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
     /// Directory the config file lives in. Every relative path in the file —
@@ -116,6 +116,14 @@ pub struct Config {
     pub streams: Vec<Stream>,
 }
 
+/// The result of a lenient load: the configuration a start would use, plus the
+/// entries that were skipped or repaired and why.
+#[derive(Debug)]
+pub struct LoadedConfig {
+    pub config: Config,
+    pub warnings: Vec<String>,
+}
+
 /// Where uping binds, globally.
 ///
 /// `ipv4` is one IPv4 address (default `0.0.0.0`). `ipv6` is one IPv6 address,
@@ -126,7 +134,7 @@ pub struct Config {
 /// A host that owns several addresses lists them on the `[[server]]` entries
 /// that need them with `https_listen` / `https_listen6`. The HTTP listener
 /// also follows an ACME server onto that address; see [`Config::http_addrs`].
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Listen {
     #[serde(default = "default_ipv4")]
@@ -389,7 +397,7 @@ impl Config {
 /// backend is answered with `503` immediately instead of waiting for a connect
 /// timeout. `interval_ms = 0` disables the active probe; the address is still
 /// resolved at startup and on reload.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Health {
     #[serde(default = "default_health_interval_ms")]
@@ -452,7 +460,7 @@ impl Health {
 }
 
 /// `health = false`, `health = true`, or `health = { ... }`.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(untagged)]
 pub enum HealthOverride {
     Enabled(bool),
@@ -466,7 +474,7 @@ impl Default for HealthOverride {
 }
 
 /// A partial `[health]` table on a server or route.
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct HealthFields {
     #[serde(default)]
@@ -537,7 +545,7 @@ impl Route {
 /// API through untouched, while still capping what a single source can do.
 /// A single-IP flood of tens of thousands of requests per second is stopped;
 /// a burst of a few hundred is not.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Limits {
     /// Sustained HTTP requests per second from one client IP, across all
@@ -570,7 +578,7 @@ impl Default for Limits {
 /// optional: omitted ones keep the `[limits]` value. `per_ip_conns_per_sec` is
 /// accepted only to explain why it cannot work here — it is enforced at TCP
 /// accept time, before the `Host` header exists.
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct LimitsOverride {
     #[serde(default)]
@@ -610,7 +618,7 @@ fn default_max_body_bytes() -> usize {
 }
 
 /// TLS behaviour.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Tls {
     /// When a client sends no SNI, or an SNI that matches no `[[server]]`, serve
@@ -636,7 +644,7 @@ fn default_true() -> bool {
 }
 
 /// How a domain's certificate is obtained.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum KeyMode {
     /// Request and renew through the default ACME directory (Let's Encrypt, or
@@ -666,7 +674,7 @@ impl KeyMode {
 }
 
 /// Let's Encrypt / ACME settings.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Acme {
     /// Contact address sent to the CA. Optional — the CA accepts an empty
@@ -704,7 +712,7 @@ pub struct Acme {
 }
 
 /// Which key algorithm the local CA uses for the root and the leaves.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum KeyKind {
     /// Ed25519: small, fast, no parameters, and every current TLS stack
@@ -722,7 +730,7 @@ pub enum KeyKind {
 /// Unlike `[acme]`, nothing here leaves the host: the root is generated once
 /// and the leaves are signed locally. Clients trust the root once — the same
 /// install step a private ACME CA required, without the extra daemon.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Internal {
     /// The zone this CA signs: `internal.rao-nagos.pf` signs that name and any
@@ -914,7 +922,7 @@ fn default_index() -> String {
 }
 
 /// A single reverse-proxied domain.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Server {
     /// The public domain name, e.g. `www.rao-nagos.pf`. Matched
@@ -1041,7 +1049,7 @@ impl Server {
 }
 
 /// One path-prefix route of one server (`routes = [...]`).
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Route {
     /// Path prefix, e.g. `/mcp` or `/assets/`.
@@ -1100,7 +1108,7 @@ impl Route {
 /// Bound once at startup and never re-resolved: whatever the client sends is
 /// copied to `upstream` and back, byte for byte. This is what a mail port needs
 /// — the TLS inside the stream belongs to the mail server, not to uping.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Stream {
     /// Log label. Falls back to the `listen` address when empty.
@@ -1202,8 +1210,9 @@ impl Config {
     }
 
     /// Read and parse a TOML config file.
-    pub fn load(path: impl AsRef<Path>) -> Result<Self> {
-        let path = path.as_ref();
+    /// Parse the file and normalize what validation and routing must agree on
+    /// (trimmed domains, paths, listener strings). No validation yet.
+    fn read(path: &Path) -> Result<Self> {
         let raw = std::fs::read_to_string(path)
             .with_context(|| format!("reading config file `{}`", path.display()))?;
         let value: toml::Value = toml::from_str(&raw)
@@ -1218,20 +1227,7 @@ impl Config {
             .try_into()
             .with_context(|| format!("parsing TOML in `{}`", path.display()))?;
         cfg.root_dir = absolute_parent(path)?;
-
-        if cfg.is_empty() {
-            anyhow::bail!(
-                "no [[server]] or [[stream]] entries found in `{}`",
-                path.display()
-            );
-        }
-        validate_listen(&cfg.listen)?;
-        let health_defaults = cfg.health.effective();
-        validate_health(&health_defaults, "`[health]`")?;
-        let mut seen = std::collections::HashSet::new();
         for s in &mut cfg.servers {
-            // The same trimmed value must be what routing stores, not just
-            // what validation looks at.
             s.domain = s.domain.trim().trim_end_matches('.').to_string();
             s.index = s.index.trim().to_string();
             s.https_listen = s.https_listen.trim().to_string();
@@ -1243,6 +1239,26 @@ impl Config {
                 r.path = r.path.trim().to_string();
                 r.index = r.index.trim().to_string();
             }
+        }
+        Ok(cfg)
+    }
+
+    /// Strict load: any invalid entry is an error. This is what `--check` and
+    /// `--dump-config`'s validation companion use.
+    pub fn load(path: impl AsRef<Path>) -> Result<Self> {
+        let path = path.as_ref();
+        let mut cfg = Self::read(path)?;
+        if cfg.is_empty() {
+            anyhow::bail!(
+                "no [[server]] or [[stream]] entries found in `{}`",
+                path.display()
+            );
+        }
+        validate_listen(&cfg.listen)?;
+        let health_defaults = cfg.health.effective();
+        validate_health(&health_defaults, "`[health]`")?;
+        let mut seen = std::collections::HashSet::new();
+        for s in &mut cfg.servers {
             let health = s.health.resolve(health_defaults);
             validate_health(&health, &format!("`{}`", s.domain))?;
             validate_server(s, &cfg.root_dir, cfg.listen.https, &cfg.acme, health)?;
@@ -1257,6 +1273,204 @@ impl Config {
         validate_streams(&mut cfg)?;
         validate_listeners(&cfg)?;
         Ok(cfg)
+    }
+
+    /// Lenient load for a running process: an entry that cannot be used is
+    /// logged and skipped, the rest starts. This is what `main` and a SIGHUP
+    /// reload use, and what `--dump-config` prints.
+    ///
+    /// Structural failures remain fatal because they cannot be guessed: TOML
+    /// syntax, a `[listen]` that names no usable address, or a file with no
+    /// usable entry left. Everything else degrades to a warning.
+    pub fn load_lenient(path: impl AsRef<Path>) -> Result<LoadedConfig> {
+        let path = path.as_ref();
+        let mut cfg = Self::read(path)?;
+        let mut warnings = Vec::new();
+        if cfg.is_empty() {
+            anyhow::bail!(
+                "no [[server]] or [[stream]] entries found in `{}`",
+                path.display()
+            );
+        }
+        validate_listen(&cfg.listen)?;
+
+        let health_defaults = clamp_health_global(&mut cfg.health, &mut warnings);
+        sanitize_acme(&mut cfg, &mut warnings);
+        sanitize_internal(&mut cfg, &mut warnings);
+
+        let mut kept = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for mut server in cfg.servers.drain(..) {
+            clamp_server_health(&mut server, &mut warnings);
+            if !server.serve_http && server.key_mode().is_acme() {
+                warnings.push(format!(
+                    "`{}` sets `serve_http = false` but uses an ACME key mode; the HTTP \
+                     listener is enabled so http-01 can answer",
+                    server.domain
+                ));
+                server.serve_http = true;
+            }
+            if server
+                .limits
+                .as_ref()
+                .and_then(|l| l.per_ip_conns_per_sec)
+                .is_some()
+            {
+                warnings.push(format!(
+                    "`{}`: `limits.per_ip_conns_per_sec` is host-wide and was ignored; \
+                     set it in `[limits]`",
+                    server.domain
+                ));
+                if let Some(limits) = server.limits.as_mut() {
+                    limits.per_ip_conns_per_sec = None;
+                }
+            }
+
+            let owner = format!("`{}`", server.domain);
+            let health = server.health.resolve(health_defaults);
+            let mut routes = Vec::new();
+            let mut prefixes = std::collections::HashSet::new();
+            for route in server.routes.drain(..) {
+                let where_ = format!("{owner} route `{}`", route.path.trim());
+                match validate_route(&route, &where_, &cfg.root_dir, health) {
+                    Ok(()) if prefixes.insert(route.prefix().to_string()) => routes.push(route),
+                    Ok(()) => warnings.push(format!(
+                        "{where_}: another route already uses `{}`; skipped",
+                        route.prefix()
+                    )),
+                    Err(e) => warnings.push(format!("{where_} was skipped: {e:#}")),
+                }
+            }
+            server.routes = routes;
+
+            match validate_server(&server, &cfg.root_dir, cfg.listen.https, &cfg.acme, health) {
+                Err(e) => warnings.push(format!("`{}` was skipped: {e:#}", server.domain)),
+                Ok(()) => {
+                    let domain = server.domain.to_ascii_lowercase();
+                    if !seen.insert(domain) {
+                        warnings.push(format!(
+                            "`{}` repeats an earlier [[server]] domain; skipped",
+                            server.domain
+                        ));
+                    } else if server.key_mode().is_local_ca()
+                        && (!in_zone(&server.domain, &cfg.internal.domain)
+                            || server
+                                .alt_names
+                                .iter()
+                                .any(|n| !in_zone(n, &cfg.internal.domain)))
+                    {
+                        warnings.push(format!(
+                            "`{}` is outside `[internal] domain` `{}`; skipped",
+                            server.domain, cfg.internal.domain
+                        ));
+                    } else {
+                        kept.push(server);
+                    }
+                }
+            }
+        }
+        cfg.servers = kept;
+
+        // Two servers cannot bind conflicting sockets, but sharing the exact
+        // same address is fine (they are served by one listener group). Keep
+        // the first, skip the later conflicting one: a duplicate listener is a
+        // configuration mistake, not a reason to lose the whole proxy.
+        let default_key = GroupKey {
+            v4: Some(SocketAddr::new(
+                IpAddr::V4(cfg.listen.ipv4_addr()?),
+                cfg.listen.https,
+            )),
+            v6: cfg
+                .listen
+                .ipv6_addr()?
+                .map(|ip| SocketAddr::new(IpAddr::V6(ip), cfg.listen.https)),
+        };
+        let mut accepted_keys: Vec<GroupKey> = Vec::new();
+        let mut listening = Vec::new();
+        for server in cfg.servers.drain(..) {
+            let (v4, v6) = server.binds(cfg.listen.https)?;
+            let key = if v4.is_none() && v6.is_none() {
+                default_key.clone()
+            } else {
+                GroupKey { v4, v6 }
+            };
+            if let Some(other) = accepted_keys
+                .iter()
+                .find(|other| group_keys_conflict(other, &key))
+            {
+                warnings.push(format!(
+                    "`{}` was skipped: its HTTPS listener {:?} conflicts with {:?}",
+                    server.domain,
+                    key.addrs(),
+                    other.addrs()
+                ));
+                continue;
+            }
+            if !accepted_keys.contains(&key) {
+                accepted_keys.push(key);
+            }
+            listening.push(server);
+        }
+        cfg.servers = listening;
+
+        let http = cfg.http_addrs()?;
+        let https = cfg.listen.https_addrs()?;
+        let mut streams = Vec::new();
+        let mut seen_streams: Vec<(SocketAddr, String)> = Vec::new();
+        for mut stream in cfg.streams.drain(..) {
+            let where_ = format!("[[stream]] `{}`", stream.label());
+            match validate_stream_entry(&mut stream) {
+                Err(e) => warnings.push(format!("{where_} was skipped: {e:#}")),
+                Ok(()) => {
+                    let listen: SocketAddr = stream.listen.parse().expect("validated above");
+                    if let Some(conflict) = http
+                        .iter()
+                        .chain(https.iter())
+                        .find(|a| addrs_conflict(&listen, a))
+                    {
+                        warnings.push(format!(
+                            "{where_} was skipped: `listen` {} clashes with {conflict}",
+                            stream.listen
+                        ));
+                        continue;
+                    }
+                    if let Some((_, other)) = seen_streams
+                        .iter()
+                        .find(|(a, _)| addrs_conflict(&listen, a))
+                    {
+                        warnings.push(format!(
+                            "{where_} was skipped: `listen` {} clashes with [[stream]] `{other}`",
+                            stream.listen
+                        ));
+                        continue;
+                    }
+                    seen_streams.push((listen, stream.label().to_string()));
+                    streams.push(stream);
+                }
+            }
+        }
+        cfg.streams = streams;
+
+        if cfg.is_empty() {
+            anyhow::bail!(
+                "no usable [[server]] or [[stream]] is left in `{}` after skipping the \
+                 invalid entries (see the warnings above)",
+                path.display()
+            );
+        }
+        if let Err(e) = validate_listeners(&cfg) {
+            warnings.push(format!("listener layout: {e:#}"));
+        }
+        Ok(LoadedConfig {
+            config: cfg,
+            warnings,
+        })
+    }
+    /// The effective configuration, defaults included, as TOML. Used by
+    /// `--dump-config`: it is what the next start would actually use, after
+    /// normalization and clamping.
+    pub fn to_toml(&self) -> Result<String> {
+        toml::to_string_pretty(self).context("serializing the effective configuration")
     }
 }
 
@@ -1760,6 +1974,155 @@ fn validate_health(health: &EffectiveHealth, owner: &str) -> Result<()> {
     Ok(())
 }
 
+/// Lenient mode clamps out-of-range health values instead of refusing the
+/// whole file: a probe interval of 1 ms would be a busy loop, not a typo worth
+/// losing the proxy over.
+fn clamp_interval(value: u64) -> u64 {
+    if value == 0 {
+        0
+    } else {
+        value.clamp(100, 3_600_000)
+    }
+}
+
+fn clamp_timeout(value: u64) -> u64 {
+    value.clamp(50, 30_000)
+}
+
+fn clamp_failures(value: usize) -> usize {
+    value.clamp(1, 100)
+}
+
+fn clamp_health_global(health: &mut Health, warnings: &mut Vec<String>) -> EffectiveHealth {
+    let before = (health.interval_ms, health.timeout_ms, health.failures);
+    health.interval_ms = clamp_interval(health.interval_ms);
+    health.timeout_ms = clamp_timeout(health.timeout_ms);
+    health.failures = clamp_failures(health.failures);
+    if before != (health.interval_ms, health.timeout_ms, health.failures) {
+        warnings.push(format!(
+            "`[health]` clamped to interval_ms = {}, timeout_ms = {}, failures = {}",
+            health.interval_ms, health.timeout_ms, health.failures
+        ));
+    }
+    health.effective()
+}
+
+fn clamp_health_fields(fields: &mut HealthFields) -> bool {
+    let before = (fields.interval_ms, fields.timeout_ms, fields.failures);
+    if let Some(interval) = fields.interval_ms.as_mut() {
+        *interval = clamp_interval(*interval);
+    }
+    if let Some(timeout) = fields.timeout_ms.as_mut() {
+        *timeout = clamp_timeout(*timeout);
+    }
+    if let Some(failures) = fields.failures.as_mut() {
+        *failures = clamp_failures(*failures);
+    }
+    before != (fields.interval_ms, fields.timeout_ms, fields.failures)
+}
+
+fn clamp_server_health(server: &mut Server, warnings: &mut Vec<String>) {
+    if let HealthOverride::Settings(fields) = &mut server.health {
+        if clamp_health_fields(fields) {
+            warnings.push(format!(
+                "`{}`: health settings clamped to their valid range",
+                server.domain
+            ));
+        }
+    }
+    for route in &mut server.routes {
+        if let HealthOverride::Settings(fields) = &mut route.health {
+            if clamp_health_fields(fields) {
+                warnings.push(format!(
+                    "`{}` route `{}`: health settings clamped to their valid range",
+                    server.domain,
+                    route.prefix()
+                ));
+            }
+        }
+    }
+}
+
+/// A `[acme]` that cannot be used falls back to the public defaults instead of
+/// blocking the start: the domains that need ACME will fail to get a leaf, and
+/// say so, but the other domains keep serving.
+fn sanitize_acme(cfg: &mut Config, warnings: &mut Vec<String>) {
+    cfg.acme.renew_before_days = cfg.acme.renew_before_days.clamp(1, 89);
+    if let Err(e) = validate_acme(&cfg.acme, &cfg.root_dir) {
+        warnings.push(format!("`[acme]` reset to the public defaults: {e:#}"));
+        cfg.acme.directory.clear();
+        cfg.acme.ca_bundle.clear();
+        if validate_acme(&cfg.acme, &cfg.root_dir).is_err() {
+            cfg.acme.email.clear();
+        }
+    }
+}
+
+/// The same for `[internal]`: bad optional fields are dropped, and if the table
+/// is unusable it is reset (the `keys = "internal"` servers are then skipped by
+/// the zone check, with their own warning).
+fn sanitize_internal(cfg: &mut Config, warnings: &mut Vec<String>) {
+    let root_dir = cfg.root_dir.clone();
+    let internal = &mut cfg.internal;
+    internal.domain = internal
+        .domain
+        .trim()
+        .trim_end_matches('.')
+        .to_ascii_lowercase();
+    if internal.domain.contains('/')
+        || internal.domain.contains(':')
+        || internal.domain.contains(char::is_whitespace)
+        || internal.domain.contains('*')
+    {
+        warnings.push(format!(
+            "`[internal] domain` `{}` is not a hostname; ignored",
+            internal.domain
+        ));
+        internal.domain.clear();
+    }
+    if internal.ca_dir.trim().is_empty() {
+        internal.ca_dir = default_internal_ca_dir();
+        warnings.push("`[internal] ca_dir` was empty; using the default".to_string());
+    }
+    if internal.cert_dir.trim().is_empty() {
+        internal.cert_dir = default_internal_cert_dir();
+        warnings.push("`[internal] cert_dir` was empty; using the default".to_string());
+    }
+    if !internal.country.trim().is_empty()
+        && (internal.country.trim().len() != 2
+            || !internal
+                .country
+                .trim()
+                .chars()
+                .all(|c| c.is_ascii_alphabetic()))
+    {
+        warnings.push(format!(
+            "`[internal] country` `{}` is not two letters; ignored",
+            internal.country
+        ));
+        internal.country.clear();
+    }
+    if !internal.email.trim().is_empty() && !internal.email.contains('@') {
+        warnings.push(format!(
+            "`[internal] email` `{}` is not an address; ignored",
+            internal.email
+        ));
+        internal.email.clear();
+    }
+    if !internal.serve_root.trim().is_empty() && parse_serve_root(&internal.serve_root).is_err() {
+        warnings.push(format!(
+            "`[internal] serve_root` `{}` is not an https URL; the root will not be \
+             published",
+            internal.serve_root
+        ));
+        internal.serve_root.clear();
+    }
+    if let Err(e) = validate_internal(internal, &root_dir) {
+        warnings.push(format!("`[internal]` reset: {e:#}"));
+        *internal = Internal::default();
+    }
+}
+
 /// Reject route tables that would be ambiguous or unusable at request time.
 fn validate_routes(
     routes: &[Route],
@@ -1768,26 +2131,35 @@ fn validate_routes(
     server_health: EffectiveHealth,
 ) -> Result<()> {
     let mut seen = std::collections::HashSet::new();
-
     for r in routes {
-        let path = r.path.trim();
-        let where_ = format!("{owner} route `{path}`");
-
-        validate_target(&r.upstream, &r.root, root_dir, &where_, r.upstream_tls())?;
-        validate_index(&r.index, &where_)?;
-        validate_health(&r.health.resolve(server_health), &where_)?;
-        if !path.starts_with('/') {
-            anyhow::bail!("{where_}: `path` must start with `/`");
-        }
-        if path.contains('?') || path.contains('#') {
-            anyhow::bail!("{where_}: `path` is a path prefix, not a URI");
-        }
-        if r.prefix() == "/" {
-            anyhow::bail!("{where_}: `/` is the catch-all, use the server's `upstream` or `root`");
-        }
+        let where_ = format!("{owner} route `{}`", r.path.trim());
         if !seen.insert(r.prefix().to_string()) {
             anyhow::bail!("{owner} has two routes for `{}`", r.prefix());
         }
+        validate_route(r, &where_, root_dir, server_health)?;
+    }
+    Ok(())
+}
+
+/// One route, without the duplicate-prefix check (the caller owns the set).
+fn validate_route(
+    r: &Route,
+    where_: &str,
+    root_dir: &Path,
+    server_health: EffectiveHealth,
+) -> Result<()> {
+    validate_target(&r.upstream, &r.root, root_dir, where_, r.upstream_tls())?;
+    validate_index(&r.index, where_)?;
+    validate_health(&r.health.resolve(server_health), where_)?;
+    let path = r.path.trim();
+    if !path.starts_with('/') {
+        anyhow::bail!("{where_}: `path` must start with `/`");
+    }
+    if path.contains('?') || path.contains('#') {
+        anyhow::bail!("{where_}: `path` is a path prefix, not a URI");
+    }
+    if r.prefix() == "/" {
+        anyhow::bail!("{where_}: `/` is the catch-all, use the server's `upstream` or `root`");
     }
     Ok(())
 }
@@ -1800,33 +2172,16 @@ fn validate_streams(cfg: &mut Config) -> Result<()> {
     let http = cfg.http_addrs()?;
     let https = cfg.listen.https_addrs()?;
     let bound = !cfg.servers.is_empty();
-
     let mut seen: Vec<(SocketAddr, String)> = Vec::new();
 
     for s in &mut cfg.streams {
+        validate_stream_entry(s)?;
         let where_ = format!("[[stream]] `{}`", s.label());
-
-        if s.listen.trim().is_empty() {
-            anyhow::bail!("{where_} has an empty `listen`");
-        }
-        if s.upstream.trim().is_empty() {
-            anyhow::bail!("{where_} has an empty `upstream`");
-        }
-        if s.listen.trim_start().starts_with('*') {
-            anyhow::bail!(
-                "{where_}: the `*` wildcard was removed; write `0.0.0.0:{}` instead",
-                s.listen.trim_start().trim_start_matches("*:")
-            );
-        }
-
-        let listen = parse_addr(&s.listen, &format!("{where_} `listen`"))?;
-        s.listen = listen.to_string();
-        validate_upstream(&s.upstream, &format!("{where_} `upstream`"))?;
-
+        let listen: SocketAddr = s.listen.parse().expect("validated above");
         if bound {
             for (what, addr) in [("`[listen] http`", &http), ("`[listen] https`", &https)] {
                 if addr.iter().any(|a| addrs_conflict(&listen, a)) {
-                    anyhow::bail!("{where_}: `listen` {} clashes with {what}", s.listen.trim(),);
+                    anyhow::bail!("{where_}: `listen` {} clashes with {what}", s.listen.trim());
                 }
             }
         }
@@ -1839,11 +2194,31 @@ fn validate_streams(cfg: &mut Config) -> Result<()> {
             }
         }
         seen.push((listen, s.label().to_string()));
-
-        s.connect_timeout_ms = s
-            .connect_timeout_ms
-            .clamp(MIN_STREAM_TIMEOUT_MS, MAX_STREAM_TIMEOUT_MS);
     }
+    Ok(())
+}
+
+/// One `[[stream]]` in isolation: addresses, wildcard removal, timeout clamp.
+fn validate_stream_entry(s: &mut Stream) -> Result<()> {
+    let where_ = format!("[[stream]] `{}`", s.label());
+    if s.listen.trim().is_empty() {
+        anyhow::bail!("{where_} has an empty `listen`");
+    }
+    if s.upstream.trim().is_empty() {
+        anyhow::bail!("{where_} has an empty `upstream`");
+    }
+    if s.listen.trim_start().starts_with('*') {
+        anyhow::bail!(
+            "{where_}: the `*` wildcard was removed; write `0.0.0.0:{}` instead",
+            s.listen.trim_start().trim_start_matches("*:")
+        );
+    }
+    let listen = parse_addr(&s.listen, &format!("{where_} `listen`"))?;
+    s.listen = listen.to_string();
+    validate_upstream(&s.upstream, &format!("{where_} `upstream`"))?;
+    s.connect_timeout_ms = s
+        .connect_timeout_ms
+        .clamp(MIN_STREAM_TIMEOUT_MS, MAX_STREAM_TIMEOUT_MS);
     Ok(())
 }
 
@@ -1970,6 +2345,18 @@ fn validate_upstream(raw: &str, what: &str) -> Result<()> {
 /// Linux binds `[::]` dual-stack, so it already owns every IPv4 address on that
 /// port. `0.0.0.0` and a concrete IPv6 address are two independent sockets and
 /// are left alone.
+/// Two listener groups clash when a socket of one conflicts with a socket of
+/// the other, unless they are the same group (then the servers share it).
+fn group_keys_conflict(a: &GroupKey, b: &GroupKey) -> bool {
+    if a == b {
+        return false;
+    }
+    let left = a.addrs();
+    let right = b.addrs();
+    left.iter()
+        .any(|x| right.iter().any(|y| addrs_conflict(x, y)))
+}
+
 fn addrs_conflict(a: &std::net::SocketAddr, b: &std::net::SocketAddr) -> bool {
     if a.port() != b.port() {
         return false;
@@ -3537,6 +3924,179 @@ upstream = "127.0.0.1:8080"
              upstream = \"127.0.0.1:8080\"\n",
         );
         assert_eq!(Config::load(&path).unwrap().internal.intermediate_days, 400);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn a_lenient_load_skips_conflicts_instead_of_failing() {
+        let path = write_temp(
+            "lenient.toml",
+            r#"
+[internal]
+domain = "internal.local"
+
+[[server]]
+domain = "one.internal.local"
+keys = "internal"
+upstream = "127.0.0.1:8080"
+
+[[server]]
+domain = "one.internal.local"
+keys = "internal"
+upstream = "127.0.0.1:8080"
+
+[[server]]
+domain = "two.internal.local"
+keys = "internal"
+https_listen = "127.0.0.1:9000"
+upstream = "127.0.0.1:8080"
+
+[[server]]
+domain = "three.internal.local"
+keys = "internal"
+https_listen = "0.0.0.0:9000"
+upstream = "127.0.0.1:8080"
+
+[[server]]
+domain = "bad.internal.local"
+keys = "internal"
+upstream = "127.0.0.1:8080"
+routes = [{ path = "nope", upstream = "127.0.0.1:8081" }]
+
+[[stream]]
+listen = "127.0.0.1:9001"
+upstream = "127.0.0.1:9002"
+
+[[stream]]
+listen = "127.0.0.1:9001"
+upstream = "127.0.0.1:9003"
+"#,
+        );
+        let loaded = Config::load_lenient(&path).unwrap();
+        assert_eq!(loaded.config.servers.len(), 3, "one, two and bad");
+        let bad = loaded
+            .config
+            .servers
+            .iter()
+            .find(|s| s.domain == "bad.internal.local")
+            .unwrap();
+        assert!(bad.routes.is_empty(), "the bad route is dropped");
+        assert_eq!(loaded.config.streams.len(), 1);
+        for needle in [
+            "repeats an earlier [[server]] domain",
+            "conflicts with",
+            "route `nope` was skipped",
+            "clashes with [[stream]]",
+        ] {
+            assert!(
+                loaded.warnings.iter().any(|w| w.contains(needle)),
+                "missing warning `{needle}`: {:?}",
+                loaded.warnings
+            );
+        }
+        // Strict validation still refuses the same file.
+        assert!(Config::load(&path).is_err());
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn two_servers_may_share_the_same_upstream() {
+        let path = write_temp(
+            "shared-upstream.toml",
+            r#"
+[[server]]
+domain = "a.local"
+upstream = "127.0.0.1:8080"
+
+[[server]]
+domain = "b.local"
+upstream = "127.0.0.1:8080"
+"#,
+        );
+        let loaded = Config::load_lenient(&path).unwrap();
+        assert_eq!(loaded.config.servers.len(), 2);
+        assert!(
+            loaded.warnings.is_empty(),
+            "a shared upstream is not a conflict: {:?}",
+            loaded.warnings
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn a_lenient_load_repairs_defaults_instead_of_refusing() {
+        let path = write_temp(
+            "lenient-repair.toml",
+            r#"
+[health]
+interval_ms = 1
+failures = 0
+
+[acme]
+directory = "not-a-url"
+
+[internal]
+domain = "internal.local"
+country = "France"
+
+[[server]]
+domain = "a.internal.local"
+keys = "auto"
+serve_http = false
+health = { timeout_ms = 1 }
+upstream = "127.0.0.1:8080"
+"#,
+        );
+        let loaded = Config::load_lenient(&path).unwrap();
+        assert_eq!(loaded.config.health.interval_ms, 100);
+        assert_eq!(loaded.config.health.failures, 1);
+        assert_eq!(loaded.config.internal.country, "");
+        assert_eq!(loaded.config.acme.directory, "");
+        assert!(loaded.config.servers[0].serve_http);
+        for needle in [
+            "`[health]` clamped",
+            "`[acme]` reset",
+            "`[internal] country`",
+            "`serve_http = false`",
+            "health settings clamped",
+        ] {
+            assert!(
+                loaded.warnings.iter().any(|w| w.contains(needle)),
+                "missing warning `{needle}`: {:?}",
+                loaded.warnings
+            );
+        }
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn a_lenient_load_with_nothing_usable_is_an_error() {
+        let path = write_temp("lenient-empty.toml", "[[server]]\ndomain = \"a.local\"\n");
+        let err = Config::load_lenient(&path).unwrap_err().to_string();
+        assert!(err.contains("no usable"), "{err}");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn the_dump_is_valid_toml_and_shows_the_defaults() {
+        let path = write_temp(
+            "dump.toml",
+            "[[server]]\ndomain = \"a.local\"\nupstream = \"127.0.0.1:8080\"\n",
+        );
+        let cfg = Config::load(&path).unwrap();
+        let text = cfg.to_toml().unwrap();
+        for needle in [
+            "per_ip_rps = 300",
+            "max_body_bytes = 10485760",
+            "fallback_cert = true",
+            "interval_ms = 5000",
+            "key_type = \"ed25519\"",
+            "renew_before_days = 30",
+            "upstream_verify = true",
+        ] {
+            assert!(text.contains(needle), "missing `{needle}` in:\n{text}");
+        }
+        toml::from_str::<toml::Value>(&text).expect("the dump must parse as TOML");
         let _ = std::fs::remove_file(path);
     }
 

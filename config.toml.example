@@ -5,6 +5,7 @@
 # from this file when you replace it with real names.
 #
 # Check:    sudo -u uping /usr/bin/uping --check /etc/uping/config.toml
+# Defaults: sudo -u uping /usr/bin/uping --dump-config /etc/uping/config.toml
 # Apply:    sudo systemctl reload uping      (SIGHUP; no connection drop)
 # Restart:  sudo systemctl restart uping     (new binary, [listen],
 #           https_listen/https_listen6, [acme], [internal] or [[stream]])

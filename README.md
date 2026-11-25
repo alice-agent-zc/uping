@@ -21,6 +21,8 @@ restart.
 - ✅ Upstream health checks (`503` at once when a backend dies), per-domain
   intervals, and HTTPS to the backend with a private CA, SNI and verify opt-out
 - ✅ Live config swap on `SIGHUP`
+- ✅ `--dump-config` prints the effective TOML, defaults included; a start skips
+  invalid or conflicting entries with a warning instead of dying
 - ✅ `.deb` for Debian/Ubuntu: `dpkg -i` creates the user, a working default on
   loopback, `man uping`, and enables the service
 - ✅ `[[stream]]` raw TCP forwarding — the mail/database relay. `routes` is
@@ -28,6 +30,33 @@ restart.
 
 Not here: changing listeners or `[[stream]]` without a restart, load balancing,
 upstream mutual TLS, DNS-01, and wildcard SANs (SNI resolution is exact).
+
+## Inspecting the effective configuration
+
+`--dump-config` prints the TOML a start would actually use, every default
+included:
+
+```sh
+uping --dump-config /etc/uping/config.toml
+```
+
+It is the fastest way to see what a valid file really means: `[tls]
+fallback_cert`, the `[health]` intervals, `[limits]` budgets, `[acme]
+renew_before_days`, the local CA's `intermediate_days`, and the key mode the
+server inferred.
+
+A start is deliberately lenient. A `[[server]]`, a route or a `[[stream]]` that
+cannot be used is skipped with a `warn` in the log and the rest serves: a
+duplicate domain, a conflicting listener, a route without a leading `/`, an
+unusable certificate mode, an out-of-range `[health]` value (clamped) or a bad
+optional `[internal]` field (ignored) do not stop the process. Two servers may
+share the same upstream, and two servers may even share the exact same listener
+— they are merged into one group.
+
+`--check` is the strict companion: it refuses the same file with the precise
+error, which is what CI and review use. Structural problems remain fatal in
+both modes: TOML syntax, a `[listen]` that names no usable address, or a file
+with no usable entry left.
 
 ### Upgrading from v0.3
 

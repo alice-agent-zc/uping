@@ -41,13 +41,14 @@ use crate::sighup::{Allowed, Reloader};
 use crate::stream::StreamForwarder;
 use crate::tls::SniResolver;
 
-const USAGE: &str = "usage: uping [config.toml] [--check|--dry-run|--dns-zone]";
+const USAGE: &str = "usage: uping [config.toml] [--check|--dry-run|--dns-zone|--dump-config]";
 
 /// A parsed command line: one optional config path and one flag.
 struct Args {
     path: String,
     check: bool,
     dns_zone: bool,
+    dump_config: bool,
 }
 
 /// Hand-parsed: two shapes and one flag do not justify a dependency, and a
@@ -59,11 +60,13 @@ fn parse_args(raw: impl Iterator<Item = String>) -> Result<Args> {
     let mut path: Option<String> = None;
     let mut check = false;
     let mut dns_zone = false;
+    let mut dump_config = false;
 
     for arg in raw {
         match arg.as_str() {
             "--check" | "--dry-run" => check = true,
             "--dns-zone" => dns_zone = true,
+            "--dump-config" => dump_config = true,
             "-h" | "--help" => {
                 println!("{USAGE}");
                 std::process::exit(0);
@@ -81,14 +84,21 @@ fn parse_args(raw: impl Iterator<Item = String>) -> Result<Args> {
         }
     }
 
-    if check && dns_zone {
-        anyhow::bail!("`--check` and `--dns-zone` are different outputs; pick one");
+    let chosen = [check, dns_zone, dump_config]
+        .iter()
+        .filter(|on| **on)
+        .count();
+    if chosen > 1 {
+        anyhow::bail!(
+            "`--check`, `--dns-zone` and `--dump-config` are different outputs; pick one"
+        );
     }
 
     Ok(Args {
         path: path.unwrap_or_else(|| "config.toml".into()),
         check,
         dns_zone,
+        dump_config,
     })
 }
 
@@ -124,6 +134,34 @@ fn run_dns_zone(path: &str) -> ! {
             std::process::exit(1)
         }
     }
+}
+
+/// Print the effective configuration and exit.
+///
+/// The point is the defaults: every field the start would use, including the
+/// ones the file leaves out or clamps, so a "valid but wrong" configuration is
+/// visible instead of guessed.
+fn run_dump_config(path: &str) -> ! {
+    match dump_config(path) {
+        Ok((text, warnings)) => {
+            for warning in warnings {
+                eprintln!("warning: {warning}");
+            }
+            print!("{text}");
+            std::process::exit(0)
+        }
+        Err(e) => {
+            eprintln!("error: {e:#}");
+            std::process::exit(1)
+        }
+    }
+}
+
+fn dump_config(path: &str) -> Result<(String, Vec<String>)> {
+    let loaded = Config::load_lenient(path)
+        .with_context(|| format!("loading configuration from `{path}`"))?;
+    let text = loaded.config.to_toml()?;
+    Ok((text, loaded.warnings))
 }
 
 fn dns_zone(path: &str) -> Result<String> {
@@ -207,12 +245,19 @@ fn main() -> Result<()> {
     if args.dns_zone {
         run_dns_zone(&args.path);
     }
+    if args.dump_config {
+        run_dump_config(&args.path);
+    }
 
     env_logger::init();
 
     let config_path = args.path;
-    let cfg = Config::load(&config_path)
+    let loaded = Config::load_lenient(&config_path)
         .with_context(|| format!("loading configuration from `{config_path}`"))?;
+    for warning in &loaded.warnings {
+        warn!("config: {warning}");
+    }
+    let cfg = loaded.config;
 
     // domain -> targets; the outer lock lets a reload swap the whole table.
     let live_routes = Arc::new(RwLock::new(Arc::new(RouteTable::from_config(&cfg)?)));
@@ -642,6 +687,16 @@ mod tests {
     #[test]
     fn check_and_dns_zone_are_mutually_exclusive() {
         assert!(args(&["--check", "--dns-zone", "a.toml"]).is_err());
+        assert!(args(&["--check", "--dump-config", "a.toml"]).is_err());
+        assert!(args(&["--dump-config", "--dns-zone", "a.toml"]).is_err());
+    }
+
+    #[test]
+    fn the_dump_config_flag_is_parsed() {
+        let parsed = args(&["--dump-config", "a.toml"]).unwrap();
+        assert!(parsed.dump_config);
+        assert!(!parsed.check);
+        assert_eq!(parsed.path, "a.toml");
     }
 
     #[test]

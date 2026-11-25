@@ -31,8 +31,13 @@ upstream is configured. Check it:
 Edit the configuration, validate it as the service user, then restart:
 
     sudo editor /etc/uping/config.toml
-    sudo -u uping /usr/bin/uping --check /etc/uping/config.toml
+    sudo -u uping /usr/bin/uping --check /etc/uping/config.toml        # strict
+    sudo -u uping /usr/bin/uping --dump-config /etc/uping/config.toml  # effective
     sudo systemctl restart uping
+
+`--dump-config` prints the TOML a start would use, defaults included. A start
+skips an unusable `[[server]]`, route or `[[stream]]` with a warning in
+`journalctl -u uping` instead of dying; `--check` refuses it.
 
 `/usr/share/uping/config.toml.example` is a commented template with public
 ACME, private local-CA and static shapes. Every relative path in the file is

@@ -177,8 +177,12 @@ impl Reloader {
     }
 
     fn try_reload(&self) -> Result<()> {
-        let new = Config::load(&self.path)
+        let loaded = Config::load_lenient(&self.path)
             .with_context(|| format!("reading `{}`", self.path.display()))?;
+        for warning in &loaded.warnings {
+            warn!("reload: {warning}");
+        }
+        let new = loaded.config;
         let next = Pinned::of(&new)?;
         let running = self.pinned.clone();
 

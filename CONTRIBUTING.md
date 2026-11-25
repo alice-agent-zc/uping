@@ -218,6 +218,24 @@ already required by pingora's dynamic SNI callbacks.
 Resolution and binding are best-effort, because the VPN address may arrive
 after uping starts.
 
+### Lenient load and `--dump-config`
+
+`Config::load` is strict and is what `--check` uses. A running process uses
+`Config::load_lenient`, which returns the usable configuration plus a list of
+warnings: a server, route or stream that cannot be validated is dropped, a
+duplicate domain is dropped after the first, listener groups that would bind
+conflicting sockets are reduced to the first one (identical listeners merge),
+and optional global fields are repaired (health values clamped, `[acme]` reset,
+`[internal]` sanitized). Two servers sharing an upstream, or the exact same
+listener, are not conflicts.
+
+Structural failures stay fatal because nothing can be guessed: TOML syntax, a
+`[listen]` with no usable address, or no usable entry left after the skips.
+`main` logs every warning as `config: ...`; a SIGHUP reload does the same and
+applies the reduced configuration. `Config::to_toml` serializes the effective
+configuration (defaults included) and backs `--dump-config`; the tests assert
+that the dump parses back as TOML.
+
 ### Failure isolation
 
 A domain is not the process. A missing manual pair, an unwritable CA directory,

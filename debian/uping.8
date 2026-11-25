@@ -5,7 +5,7 @@ uping \- TOML-configured reverse proxy with automatic HTTPS, static files and ra
 .SH SYNOPSIS
 .B uping
 .RI [ CONFIG ]
-.RB [ \-\-check | \-\-dry\-run | \-\-dns\-zone ]
+.RB [ \-\-check | \-\-dry\-run | \-\-dns\-zone | \-\-dump\-config ]
 .SH DESCRIPTION
 .B uping
 terminates TLS for one or more domains and forwards each of them to a local
@@ -49,9 +49,14 @@ Print the usage line and exit.
 .BR \-\-check ", " \-\-dry\-run
 Validate
 .I CONFIG
-the way a start would, and exit. Nothing is bound, nothing is written and no
+strictly, the way a review would, and exit. Nothing is bound, nothing is written and no
 certificate is requested: a domain whose certificate is still missing is
 reported as pending, not as an error. Exit status 0 means the file would load.
+.TP
+.B \-\-dump\-config
+Print the effective configuration as TOML, defaults included, then exit. Entries
+that a start would skip are reported as warnings on standard error, so this is
+also a diagnosis of a valid but misconfigured file.
 .TP
 .B \-\-dns\-zone
 Print
@@ -113,9 +118,10 @@ systemctl restart uping
 .TP
 .B 0
 Normal shutdown, or a successful
-.B \-\-check
-or
+.BR \-\-check ,
 .B \-\-dns\-zone
+or
+.B \-\-dump\-config
 run.
 .TP
 .B 1
